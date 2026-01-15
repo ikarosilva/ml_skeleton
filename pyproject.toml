@@ -1,0 +1,117 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "explr"
+version = "0.1.0"
+description = "Deep Learning Training Framework with MLflow and Hyperparameter Tuning"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "explr-dev", email = "explr-dev@example.com"}
+]
+keywords = [
+    "deep-learning",
+    "machine-learning",
+    "mlflow",
+    "optuna",
+    "ray-tune",
+    "pytorch",
+    "tensorflow",
+    "hyperparameter-tuning"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "mlflow>=2.10.0",
+    "optuna>=3.5.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.66.0",
+    "click>=8.1.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+pytorch = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+]
+tensorflow = [
+    "tensorflow>=2.15.0",
+]
+ray = [
+    "ray[tune]>=2.9.0",
+]
+all = [
+    "torch>=2.2.0",
+    "torchvision>=0.17.0",
+    "tensorflow>=2.15.0",
+    "ray[tune]>=2.9.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "black>=24.1.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+explr = "explr.runner.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/explr-org/explr"
+Documentation = "https://github.com/explr-org/explr#readme"
+Repository = "https://github.com/explr-org/explr"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["explr*"]
+
+[tool.black]
+line-length = 88
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.ruff]
+line-length = 88
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

@@ -1,0 +1,33 @@
+# Core ML Frameworks (CUDA 12.8 compatible for RTX 5090 Blackwell)
+# PyTorch 2.5+ required for Blackwell architecture support
+torch>=2.5.0
+torchvision>=0.20.0
+tensorflow>=2.18.0
+
+# Experiment Tracking
+mlflow>=2.10.0
+
+# Hyperparameter Tuning
+optuna>=3.5.0
+ray[tune]>=2.9.0
+
+# Configuration
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Data Processing
+numpy>=1.26.0
+pandas>=2.1.0
+scikit-learn>=1.4.0
+
+# Utilities
+tqdm>=4.66.0
+click>=8.1.0
+requests>=2.31.0
+
+# Development (optional)
+# pytest>=8.0.0
+# pytest-cov>=4.1.0
+# black>=24.1.0
+# ruff>=0.2.0
+# mypy>=1.8.0

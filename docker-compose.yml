@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  # MLflow Tracking Server
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.10.0
+    container_name: explr-mlflow
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlruns:/mlruns
+      - ./mlartifacts:/mlartifacts
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=sqlite:///mlruns/mlflow.db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlartifacts
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlruns/mlflow.db
+      --default-artifact-root /mlartifacts
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+    restart: unless-stopped
+
+  # Training environment
+  training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: explr-training
+    runtime: nvidia
+    shm_size: 50G
+    privileged: true
+    stdin_open: true
+    tty: true
+    ports:
+      - "8888:8888"  # Jupyter (optional)
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TF_ENABLE_ONEDNN_OPTS=0
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ~/git:/git
+      - ~/PycharmProjects:/projects
+      - ./:/workspace
+      - ./checkpoints:/workspace/checkpoints
+      - ./artifacts:/workspace/artifacts
+    depends_on:
+      - mlflow
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # Jupyter Lab (optional)
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: explr-jupyter
+    runtime: nvidia
+    shm_size: 50G
+    privileged: true
+    ports:
+      - "8888:8888"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TF_ENABLE_ONEDNN_OPTS=0
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ~/git:/git
+      - ~/PycharmProjects:/projects
+      - ./:/workspace
+    depends_on:
+      - mlflow
+    command: >
+      jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --allow-root
+      --NotebookApp.token=''
+    profiles:
+      - jupyter
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  default:
+    name: explr-network
+
+volumes:
+  mlruns:
+  mlartifacts:
+  checkpoints:
+  artifacts:
