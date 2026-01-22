@@ -492,16 +492,163 @@ Two-phase training pipeline:
 
 ### Quick Start
 
+#### Prerequisites
+
+1. **Install Dependencies**
+   ```bash
+   cd /git/ml_skeleton
+   pip install -e ".[pytorch]"
+   pip install torchaudio librosa tqdm pyyaml
+   ```
+
+2. **Configure Your Database Path**
+   Edit [configs/music_recommendation.yaml](configs/music_recommendation.yaml) and set:
+   ```yaml
+   music:
+     database_path: "/home/ikaro/Music/clementine.db"  # Your Clementine DB path
+   ```
+
+#### Full Training Pipeline
+
+**Option 1: Using the convenience script (Recommended)**
+
 ```bash
-# Stage 1: Train encoder
+# Make script executable (first time only)
+chmod +x run_music_pipeline.sh
+
+# Run entire pipeline (all 3 stages)
+./run_music_pipeline.sh all
+
+# Or run individual stages
+./run_music_pipeline.sh encoder      # Stage 1 only
+./run_music_pipeline.sh classifier   # Stage 2 only
+./run_music_pipeline.sh recommend    # Stage 3 only
+
+# Quick test with reduced epochs (for testing)
+./run_music_pipeline.sh quick
+```
+
+**Option 2: Running stages manually**
+
+Run all three stages in sequence:
+
+```bash
+# Stage 1: Train audio encoder (audio → embeddings)
+# This will:
+# - Load rated songs from Clementine DB
+# - Train 1D CNN encoder on 30-second audio clips
+# - Extract and store embeddings in embeddings.db
+# - Save best model to checkpoints/encoder_best.pt
 python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml
 
-# Stage 2: Train classifier
+# Stage 2: Train rating classifier (embeddings → ratings)
+# This will:
+# - Load pre-extracted embeddings
+# - Train MLP classifier to predict ratings
+# - Save best model to checkpoints/classifier_best.pt
 python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml
 
 # Stage 3: Generate recommendations
+# This will:
+# - Load unrated songs
+# - Predict ratings using trained models
+# - Generate top-N recommendations
+# - Save to recommendations.txt
 python examples/music_recommendation.py --stage recommend --config configs/music_recommendation.yaml
 ```
+
+#### Quick Test (Single Command)
+
+For testing, you can reduce epochs in the config:
+
+```bash
+# Edit config first (reduce epochs for quick test)
+# encoder.epochs: 5
+# classifier.epochs: 5
+
+# Then run all stages
+python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml && \
+python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml && \
+python examples/music_recommendation.py --stage recommend --config configs/music_recommendation.yaml
+```
+
+#### Monitor Training
+
+While training, you can monitor progress:
+
+```bash
+# In another terminal, start MLflow UI
+mlflow ui --host 0.0.0.0 --port 5000
+
+# Open browser: http://localhost:5000
+# View metrics, compare runs, and download artifacts
+```
+
+#### Expected Output
+
+```
+Stage 1 (Encoder):
+  ✓ Loads ~60K songs from Clementine DB
+  ✓ Trains for 50 epochs (~1-2 hours on RTX 5090)
+  ✓ Extracts embeddings for all songs
+  ✓ Saves to: checkpoints/encoder_best.pt, embeddings.db
+
+Stage 2 (Classifier):
+  ✓ Loads pre-extracted embeddings
+  ✓ Trains for 20 epochs (~10-15 minutes)
+  ✓ Reports MAE, correlation metrics
+  ✓ Saves to: checkpoints/classifier_best.pt
+
+Stage 3 (Recommendations):
+  ✓ Predicts ratings for unrated songs
+  ✓ Generates top-100 recommendations
+  ✓ Saves to: recommendations.txt
+```
+
+### Troubleshooting
+
+**Problem: "No rated songs found"**
+- Solution: Check your Clementine DB has rated songs (rating >= 0, not -1)
+- Run: `sqlite3 /home/ikaro/Music/clementine.db "SELECT COUNT(*) FROM songs WHERE rating >= 0;"`
+
+**Problem: "Audio files not found"**
+- Solution: Verify audio files exist at paths stored in Clementine DB
+- Clementine stores paths with `file://` prefix, the loader automatically handles this
+
+**Problem: "Out of memory during training"**
+- Solution: Reduce batch size in config:
+  ```yaml
+  encoder:
+    batch_size: 16  # Reduce from 32
+  classifier:
+    batch_size: 128  # Reduce from 256
+  ```
+
+**Problem: "Training is slow"**
+- Solution: Check multiprocessing settings:
+  ```yaml
+  music:
+    num_workers: null  # Uses 80% CPU cores (default)
+    dataloader_workers: 4  # Increase if CPU has many cores
+  ```
+
+**Problem: "No embeddings found for Stage 2"**
+- Solution: Make sure Stage 1 (encoder) completed successfully
+- Check: `ls -lh embeddings.db` (should be several MB)
+- Verify: Use embedding store stats in Stage 1 output
+
+**Problem: "Classifier not improving"**
+- Solution: Check embedding quality from Stage 1
+- Try different loss functions in Stage 1:
+  ```yaml
+  encoder:
+    loss_type: "supervised_contrastive"  # or "mse", "contrastive"
+  ```
+
+**Problem: "All recommendations have similar ratings"**
+- Solution: Train longer or tune hyperparameters
+- Check correlation metric in Stage 2 (should be > 0.3)
+- Consider using ensemble classifier
 
 ### Configuration
 
