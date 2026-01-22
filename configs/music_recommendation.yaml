@@ -1,0 +1,158 @@
+# Music Recommendation System Configuration
+# Two-phase training: Encoder (audio -> embeddings) + Classifier (embeddings -> ratings)
+
+name: "music_recommendation"
+description: "Music recommendation system with two-stage training"
+framework: "pytorch"
+
+tags:
+  project: "music_recommendation"
+  version: "1.0"
+  stage: "encoder"  # Change to "classifier" for Stage 2
+
+# Music-specific configuration
+music:
+  # Clementine database path
+  database_path: "/home/ikaro/Music/clementine.db"
+
+  # Embedding storage (SQLite)
+  embedding_db_path: "./embeddings.db"
+  model_version: "v1"  # Version identifier for embeddings
+
+  # Audio loading parameters
+  sample_rate: 22050  # Hz
+  audio_duration: 30.0  # seconds
+  center_crop: true  # Extract from center of song
+  max_duration: 900.0  # Skip files >15 minutes (filters live albums, DJ sets)
+
+  # Multiprocessing
+  num_workers: null  # null = 80% of CPU cores
+  dataloader_workers: 4  # Workers for DataLoader
+
+  # Speech detection filtering (optional)
+  speech_threshold: 0.5  # Filter songs with speech probability > threshold
+  speech_results_path: null  # Path to speech detection results (null = skip filtering)
+
+  # Dataset filtering
+  only_rated: true  # Only use rated songs for training
+  train_split: 0.8  # Train/val split ratio
+
+  # Multi-album support
+  use_multi_task: false  # If true, enables album classification loss
+  album_weight: 0.5  # Weight for album classification loss
+
+# Stage 1: Encoder training hyperparameters
+encoder:
+  # Model architecture
+  embedding_dim: 512
+  base_channels: 32  # For SimpleAudioEncoder
+
+  # Training
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+  # Optimizer
+  optimizer: "adam"  # adam, sgd, adamw
+  scheduler: "reduce_on_plateau"  # reduce_on_plateau, cosine, step, null
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+
+  # Loss function
+  loss_type: "supervised_contrastive"  # mse, contrastive, supervised_contrastive
+  contrastive_temperature: 0.5
+  rating_threshold: 0.2  # For supervised contrastive loss
+
+# Stage 2: Classifier training hyperparameters
+classifier:
+  # Model architecture
+  hidden_dims: [256, 128]
+  dropout: 0.3
+  use_batch_norm: false
+
+  # Training
+  epochs: 20
+  batch_size: 256
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+
+  # Optimizer
+  optimizer: "adam"
+  scheduler: "reduce_on_plateau"
+  scheduler_patience: 3
+  scheduler_factor: 0.5
+
+  # Loss function
+  loss_type: "mse"  # mse
+
+# MLflow configuration
+mlflow:
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "music_recommendation"
+  artifact_location: "./mlruns"
+  backend_store_uri: "sqlite:///mlflow.db"
+  auto_start: true
+
+# Hyperparameter tuning configuration (optional)
+tuning:
+  tuner_type: "optuna"
+  n_trials: 30
+  timeout: null
+
+  sampler: "TPESampler"
+  pruner: "MedianPruner"
+
+  # Search space for encoder
+  encoder_search_space:
+    parameters:
+      learning_rate:
+        type: "loguniform"
+        low: 0.00001
+        high: 0.01
+      batch_size:
+        type: "categorical"
+        choices: [16, 32, 64]
+      embedding_dim:
+        type: "categorical"
+        choices: [256, 512, 1024]
+      base_channels:
+        type: "categorical"
+        choices: [16, 32, 64]
+
+  # Search space for classifier
+  classifier_search_space:
+    parameters:
+      learning_rate:
+        type: "loguniform"
+        low: 0.00001
+        high: 0.001
+      batch_size:
+        type: "categorical"
+        choices: [128, 256, 512]
+      dropout:
+        type: "float"
+        low: 0.1
+        high: 0.5
+      hidden_dims:
+        type: "categorical"
+        choices: [[256, 128], [512, 256], [512, 256, 128]]
+
+# Reproducibility
+seed: 42
+deterministic: true
+
+# Device configuration
+device: "cuda"  # cuda, cpu, mps
+gpu_memory_limit_gb: 24  # Limit GPU memory usage
+
+# Paths
+checkpoint_dir: "./checkpoints"
+artifact_dir: "./artifacts"
+
+# Recommendation generation
+recommendations:
+  top_n: 100  # Number of songs to recommend
+  output_format: "xspf"  # xspf, json, csv
+  output_path: "./recommendations.xspf"
+  min_rating_threshold: 0.6  # Only recommend songs with predicted rating > threshold
