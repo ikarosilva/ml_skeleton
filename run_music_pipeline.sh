@@ -6,7 +6,7 @@
 #   ./run_music_pipeline.sh encoder          # Run Stage 1 only
 #   ./run_music_pipeline.sh classifier       # Run Stage 2 only
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
-#   ./run_music_pipeline.sh quick            # Quick test (5 epochs each)
+#   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #
 # Environment variables:
 #   CONFIG=/path/to/config.yaml              # Override config file
@@ -149,6 +149,10 @@ run_quick_test() {
     sed -i 's/epochs: 20/epochs: 5/g' "$TEMP_CONFIG"
 
     print_success "Temporary config created: $TEMP_CONFIG"
+
+    # Set minimum rated songs for testing (avoids sparsity errors)
+    export MIN_RATED_SONGS=500
+    print_success "Set MIN_RATED_SONGS=500 (placeholder will generate 500 rated songs)"
     echo ""
 
     # Run all stages with temp config
@@ -205,7 +209,7 @@ main() {
             echo "  encoder     - Run Stage 1: Train audio encoder"
             echo "  classifier  - Run Stage 2: Train rating classifier"
             echo "  recommend   - Run Stage 3: Generate recommendations"
-            echo "  quick       - Quick test with 5 epochs (for testing)"
+            echo "  quick       - Quick test with 5 epochs and 500 rated songs (for testing)"
             echo ""
             echo "Examples:"
             echo "  $0 all                    # Full pipeline"

@@ -39,7 +39,7 @@ class MusicDataset(torch.utils.data.Dataset):
         songs: list[Song],
         album_to_idx: dict[str, int],
         filename_to_albums: dict[str, list[str]],
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         duration: float = 30.0,
         center_crop: bool = True,
         speech_results: Optional[dict[str, float]] = None,
@@ -83,8 +83,7 @@ class MusicDataset(torch.utils.data.Dataset):
                     continue
 
             # Check file exists
-            filepath = Path(song.filename)
-            if not filepath.exists():
+            if not song.filepath.exists():
                 continue
 
             filtered.append(song)
@@ -107,7 +106,6 @@ class MusicDataset(torch.utils.data.Dataset):
             - rating: Rating value in [0, 1] (or -1 if unrated)
             - albums: List of album indices this song belongs to
             - filename: Song filename
-            - song: Full Song object
         """
         song = self.songs[idx]
 
@@ -134,8 +132,7 @@ class MusicDataset(torch.utils.data.Dataset):
             "audio": audio,
             "rating": rating,
             "albums": albums,
-            "filename": song.filename,
-            "song": song
+            "filename": song.filename
         }
 
     def _get_album_labels(self, filename: str) -> list[int]:
@@ -159,6 +156,38 @@ class MusicDataset(torch.utils.data.Dataset):
                 album_indices.append(idx)
 
         return album_indices
+
+
+def music_collate_fn(batch: list[dict]) -> dict:
+    """Custom collate function for MusicDataset to handle variable-length album lists.
+
+    Args:
+        batch: List of dictionaries from MusicDataset.__getitem__
+
+    Returns:
+        Batched dictionary with:
+        - audio: Stacked tensor (batch_size, num_samples)
+        - rating: Tensor (batch_size,)
+        - albums: List of lists (variable length per sample)
+        - filename: List of strings
+    """
+    audio_list = []
+    rating_list = []
+    albums_list = []
+    filename_list = []
+
+    for item in batch:
+        audio_list.append(item["audio"])
+        rating_list.append(item["rating"])
+        albums_list.append(item["albums"])  # Keep as list (variable length)
+        filename_list.append(item["filename"])
+
+    return {
+        "audio": torch.stack(audio_list),
+        "rating": torch.tensor(rating_list, dtype=torch.float32),
+        "albums": albums_list,  # List of lists
+        "filename": filename_list
+    }
 
 
 class EmbeddingDataset(torch.utils.data.Dataset):
@@ -213,14 +242,12 @@ class EmbeddingDataset(torch.utils.data.Dataset):
             - embedding: Embedding vector (embedding_dim,)
             - rating: Rating value in [0, 1]
             - filename: Song filename
-            - song: Full Song object
         """
         item = self.data[idx]
 
         return {
             "embedding": torch.from_numpy(item["embedding"]).float(),
             "rating": torch.tensor(item["rating"], dtype=torch.float32),
-            "filename": item["filename"],
-            "song": item["song"]
+            "filename": item["filename"]
         }
 

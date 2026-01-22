@@ -21,10 +21,10 @@ music:
   model_version: "v1"  # Version identifier for embeddings
 
   # Audio loading parameters
-  sample_rate: 22050  # Hz
+  sample_rate: 16000  # Hz
   audio_duration: 30.0  # seconds
   center_crop: true  # Extract from center of song
-  max_duration: 900.0  # Skip files >15 minutes (filters live albums, DJ sets)
+  max_duration: 900.0  # Skip files >15 minutes (filters live albums, DJ sets, podcasts)
 
   # Multiprocessing
   num_workers: null  # null = 80% of CPU cores
@@ -35,7 +35,9 @@ music:
   speech_results_path: null  # Path to speech detection results (null = skip filtering)
 
   # Dataset filtering
-  only_rated: true  # Only use rated songs for training
+  # Note: Encoder training includes ALL songs (rated + unrated) for better feature learning
+  # Loss is only computed on rated songs (unrated songs have rating=-1 and are masked)
+  only_rated: false  # Include unrated songs in encoder training (masked in loss)
   train_split: 0.8  # Train/val split ratio
 
   # Multi-album support
@@ -156,6 +158,7 @@ recommendations:
   top_n: 100  # Number of songs to recommend
   output_format: "xspf"  # xspf, json, csv
   output_path: "./recommendations.txt"
+  output_dir: "/Music/recommendations"  # Directory for playlist files
   min_rating_threshold: 0.6  # Only recommend songs with predicted rating > threshold
 
   # Human-in-the-loop reinforcement learning (HITL)

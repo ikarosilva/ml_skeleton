@@ -23,7 +23,7 @@ def get_default_workers() -> int:
 
 def load_audio_file(
     filepath: str,
-    sample_rate: int = 22050,
+    sample_rate: int = 16000,
     mono: bool = True,
     duration: Optional[float] = 30.0,
     center_crop: bool = True,
@@ -121,7 +121,7 @@ def load_audio_file(
 
 def load_audio_batch(
     filepaths: list[str],
-    sample_rate: int = 22050,
+    sample_rate: int = 16000,
     mono: bool = True,
     duration: Optional[float] = 30.0,
     center_crop: bool = True,

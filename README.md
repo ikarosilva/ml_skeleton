@@ -708,7 +708,7 @@ This active learning approach focuses human effort where it matters most!
 music:
   database_path: "/home/ikaro/Music/clementine.db"
   embedding_db_path: "./embeddings.db"
-  sample_rate: 22050
+  sample_rate: 16000
   audio_duration: 30.0
   center_crop: true
   num_workers: null  # 80% CPU cores

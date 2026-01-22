@@ -90,7 +90,7 @@ All audio loading operations use read-only mode:
 waveform, sample_rate = torchaudio.load(filepath)
 
 # librosa also loads in read-only mode
-waveform, sample_rate = librosa.load(filepath, sr=22050)
+waveform, sample_rate = librosa.load(filepath, sr=16000)
 ```
 
 **No write operations exist in the codebase for audio files.**

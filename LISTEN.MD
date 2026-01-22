@@ -109,7 +109,7 @@ All audio loading uses read-only operations:
 waveform, sr = torchaudio.load(filepath)
 
 # librosa.load() - read-only by default
-waveform, sr = librosa.load(filepath, sr=22050)
+waveform, sr = librosa.load(filepath, sr=16000)
 ```
 
 **See [examples/AUDIO_FILES_README.md](examples/AUDIO_FILES_README.md) for complete documentation.**
@@ -239,7 +239,7 @@ def should_fingerprint(metadata_group: list[AudioMetadata]) -> bool:
 
 1. **File size** (bytes) - Instant, most discriminative
 2. **Duration** (seconds, rounded to 0.1s) - Very fast
-3. **Sample rate** (Hz) - Fast (44100, 48000, 22050, etc.)
+3. **Sample rate** (Hz) - Fast (44100, 48000, 16000, etc.)
 4. **Bit rate** (kbps) - Fast (320, 256, 192, 128, etc.)
 5. **Channels** (1=mono, 2=stereo) - Fast
 
@@ -926,7 +926,7 @@ class AudioEncoder(Protocol):
         """
         Args:
             audio: Raw waveform tensor, shape (batch_size, num_samples)
-                   Sample rate is configurable (default: 22050 Hz)
+                   Sample rate is configurable (default: 16000 Hz)
 
         Returns:
             embeddings: shape (batch_size, embedding_dim)
@@ -1019,7 +1019,7 @@ def get_unrated_songs(songs: list[Song]) -> list[Song]:
 **`ml_skeleton/music/audio_loader.py`**:
 - **Load audio files in READ-ONLY mode** using `torchaudio.load()` or `librosa.load()`
 - Handle multiple formats: MP3, FLAC, OGG, WAV, M4A, OPUS
-- Configurable sample rate (default: 22050 Hz)
+- Configurable sample rate (default: 16000 Hz)
 - **Extract from CENTER of song** (default: 30 seconds)
 - **Skip songs longer than max_duration** (default: 15 minutes = 900 seconds)
 - Parallel loading with `multiprocessing.Pool`
@@ -1032,7 +1032,7 @@ def get_unrated_songs(songs: list[Song]) -> list[Song]:
 ```python
 def load_audio_file(
     filepath: Path,
-    sample_rate: int = 22050,
+    sample_rate: int = 16000,
     mono: bool = True,
     duration: Optional[float] = 30.0,
     center_crop: bool = True,
@@ -1059,7 +1059,7 @@ def load_audio_file(
 
 def load_audio_batch(
     filepaths: list[Path],
-    sample_rate: int = 22050,
+    sample_rate: int = 16000,
     num_workers: Optional[int] = None
 ) -> list[torch.Tensor]:
     """Load multiple audio files in parallel.
@@ -1112,7 +1112,7 @@ class MusicDataset(torch.utils.data.Dataset):
         songs: list[Song],
         speech_results: Optional[Dict[str, float]] = None,
         speech_threshold: float = 0.5,
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         duration: float = 30.0,
         cache_dir: Optional[Path] = None
     ):
@@ -1509,7 +1509,7 @@ compute:
 music:
   database_path: /home/ikaro/Music/clementine.db
   embedding_db_path: ./embeddings.db
-  audio_sample_rate: 22050
+  audio_sample_rate: 16000
   audio_duration: 30.0      # seconds (extracted from CENTER of song)
   center_crop: true         # Extract from center, not beginning
   max_audio_duration: 900.0 # Skip files longer than 15 minutes (live albums, DJ sets, etc.)
@@ -1520,7 +1520,7 @@ training_mode: encoder
 # Hyperparameters for encoder training
 hyperparameters:
   # Audio preprocessing
-  sample_rate: 22050
+  sample_rate: 16000
   audio_duration: 30.0       # Extract 30 seconds
   center_crop: true          # From center of song
   max_audio_duration: 900.0  # Skip songs longer than 15 minutes
@@ -1662,7 +1662,7 @@ class SimpleAudioEncoder(nn.Module):
     User should replace with their own architecture (ResNet, Transformer, etc.)
     """
 
-    def __init__(self, embedding_dim: int = 512, sample_rate: int = 22050):
+    def __init__(self, embedding_dim: int = 512, sample_rate: int = 16000):
         super().__init__()
         self.embedding_dim = embedding_dim
 
@@ -1924,7 +1924,7 @@ def test_embedding_store():
 def test_audio_loading():
     """Test audio file loading."""
     # Use test audio file
-    audio = load_audio_file("tests/data/test_audio.mp3", sample_rate=22050)
+    audio = load_audio_file("tests/data/test_audio.mp3", sample_rate=16000)
     assert audio.shape[0] > 0
 
 def test_xspf_export():
@@ -2793,7 +2793,7 @@ class MultiTaskMusicDataset(Dataset):
         artist_to_idx: dict[str, int],
         album_to_idx: dict[str, int],
         filename_to_albums: dict[str, list[str]],
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         audio_duration: float = 30.0
     ):
         self.songs = songs

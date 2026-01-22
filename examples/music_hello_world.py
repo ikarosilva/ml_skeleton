@@ -40,7 +40,7 @@ class HelloWorldEncoder(nn.Module):
     This version just uses a simple 1D convolution for demonstration.
     """
 
-    def __init__(self, embedding_dim: int = 128, sample_rate: int = 22050):
+    def __init__(self, embedding_dim: int = 128, sample_rate: int = 16000):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.sample_rate = sample_rate
@@ -68,7 +68,7 @@ class HelloWorldEncoder(nn.Module):
 
         Args:
             audio: Raw waveform tensor, shape (batch_size, num_samples)
-                   Expected: 30 seconds at 22050 Hz = 661,500 samples
+                   Expected: 30 seconds at 16000 Hz = 480,000 samples
 
         Returns:
             embeddings: shape (batch_size, embedding_dim)
@@ -141,7 +141,7 @@ def test_hello_world_models():
 
     # Configuration
     batch_size = 4
-    sample_rate = 22050
+    sample_rate = 16000
     duration = 30.0  # seconds
     num_samples = int(sample_rate * duration)
     embedding_dim = 128

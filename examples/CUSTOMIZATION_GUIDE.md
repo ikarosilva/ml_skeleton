@@ -23,7 +23,7 @@ The encoder converts raw audio waveforms into embeddings (latent representations
 ```python
 Input:  torch.Tensor of shape (batch_size, num_samples)
         - num_samples = sample_rate × duration
-        - Example: 22050 Hz × 30 seconds = 661,500 samples
+        - Example: 16000 Hz × 30 seconds = 480,000 samples
 
 Output: torch.Tensor of shape (batch_size, embedding_dim)
         - embedding_dim is your choice (Z dimension)
@@ -115,7 +115,7 @@ class MyCustomEncoder(nn.Module):
 import torchaudio.transforms as T
 
 class SpectrogramEncoder(nn.Module):
-    def __init__(self, embedding_dim: int = 512, sample_rate: int = 22050):
+    def __init__(self, embedding_dim: int = 512, sample_rate: int = 16000):
         super().__init__()
         self.embedding_dim = embedding_dim
 
@@ -265,7 +265,7 @@ if __name__ == "__main__":
 
     # Test them
     batch_size = 4
-    num_samples = 661500  # 30 seconds at 22050 Hz
+    num_samples = 480000  # 30 seconds at 16000 Hz
 
     fake_audio = torch.randn(batch_size, num_samples)
     embeddings = encoder(fake_audio)
@@ -361,7 +361,7 @@ import torchaudio.transforms as T
 class MyAudioEncoder(nn.Module):
     """My custom encoder using mel-spectrograms."""
 
-    def __init__(self, embedding_dim: int = 512, sample_rate: int = 22050):
+    def __init__(self, embedding_dim: int = 512, sample_rate: int = 16000):
         super().__init__()
         self.embedding_dim = embedding_dim
 
@@ -450,8 +450,8 @@ if __name__ == "__main__":
     encoder = MyAudioEncoder(embedding_dim=512)
     classifier = MyRatingClassifier(embedding_dim=512)
 
-    # Test with 30 seconds of audio at 22050 Hz
-    audio = torch.randn(4, 661500)
+    # Test with 30 seconds of audio at 16000 Hz
+    audio = torch.randn(4, 480000)
     embeddings = encoder(audio)
     ratings = classifier(embeddings)
 

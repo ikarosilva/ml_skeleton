@@ -34,6 +34,7 @@ class RatingLoss(nn.Module):
         Args:
             predictions: Predicted ratings, shape (batch_size, 1)
             targets: Target ratings, shape (batch_size, 1) or (batch_size,)
+                    Unrated songs have rating < 0 and are excluded from loss
 
         Returns:
             loss: Scalar loss value
@@ -42,7 +43,18 @@ class RatingLoss(nn.Module):
         if targets.dim() == 1:
             targets = targets.unsqueeze(1)
 
-        return self.mse(predictions, targets)
+        # Mask out unrated songs (rating < 0)
+        valid_mask = (targets >= 0).squeeze()
+
+        if valid_mask.sum() == 0:
+            # No rated songs in batch - return zero loss with gradient
+            return torch.zeros(1, device=predictions.device, requires_grad=True).mean()
+
+        # Only compute loss on rated songs
+        valid_predictions = predictions[valid_mask]
+        valid_targets = targets[valid_mask]
+
+        return self.mse(valid_predictions, valid_targets)
 
 
 class MultiTaskLoss(nn.Module):
@@ -90,10 +102,20 @@ class MultiTaskLoss(nn.Module):
             total_loss: Combined loss value
             loss_dict: Dictionary with individual loss components
         """
-        # Rating loss
+        # Rating loss (only on rated songs)
         if rating_targets.dim() == 1:
             rating_targets = rating_targets.unsqueeze(1)
-        rating_loss = self.mse(rating_preds, rating_targets)
+
+        # Mask out unrated songs (rating < 0)
+        valid_mask = (rating_targets >= 0).squeeze()
+
+        if valid_mask.sum() == 0:
+            # No rated songs - rating loss is zero
+            rating_loss = torch.zeros(1, device=rating_preds.device)
+        else:
+            valid_preds = rating_preds[valid_mask]
+            valid_targets = rating_targets[valid_mask]
+            rating_loss = self.mse(valid_preds, valid_targets)
 
         # Album classification loss (averaged over multiple albums per song)
         album_loss = self._compute_multi_album_loss(album_logits, album_labels)
@@ -277,19 +299,31 @@ class SupervisedContrastiveLoss(nn.Module):
         device = embeddings.device
         batch_size = embeddings.size(0)
 
+        # Filter out unrated songs (rating < 0)
+        valid_mask = ratings >= 0
+
+        if valid_mask.sum() < 2:
+            # Need at least 2 rated songs for contrastive learning
+            return torch.zeros(1, device=device, requires_grad=True).mean()
+
+        # Only use rated songs
+        valid_embeddings = embeddings[valid_mask]
+        valid_ratings = ratings[valid_mask]
+        valid_batch_size = valid_embeddings.size(0)
+
         # Normalize embeddings
-        embeddings = F.normalize(embeddings, dim=1)
+        valid_embeddings = F.normalize(valid_embeddings, dim=1)
 
         # Compute similarity matrix
-        similarity_matrix = torch.matmul(embeddings, embeddings.T)
+        similarity_matrix = torch.matmul(valid_embeddings, valid_embeddings.T)
         similarity_matrix = similarity_matrix / self.temperature
 
         # Create positive pair mask based on rating similarity
-        rating_diff = torch.abs(ratings.unsqueeze(0) - ratings.unsqueeze(1))
+        rating_diff = torch.abs(valid_ratings.unsqueeze(0) - valid_ratings.unsqueeze(1))
         pos_mask = (rating_diff < self.rating_threshold).float()
 
         # Remove self-similarity
-        pos_mask = pos_mask * (1 - torch.eye(batch_size, device=device))
+        pos_mask = pos_mask * (1 - torch.eye(valid_batch_size, device=device))
 
         # Compute loss for each anchor
         exp_sim = torch.exp(similarity_matrix)
@@ -298,22 +332,22 @@ class SupervisedContrastiveLoss(nn.Module):
         sum_exp_sim = exp_sim.sum(dim=1, keepdim=True) - torch.diag(exp_sim).unsqueeze(1)
 
         # For each anchor, sum over all positive pairs
-        loss = 0.0
-        num_valid = 0
+        losses = []
 
-        for i in range(batch_size):
+        for i in range(valid_batch_size):
             num_pos = pos_mask[i].sum()
             if num_pos > 0:
                 # Sum positive similarities
                 pos_sim = (exp_sim[i] * pos_mask[i]).sum()
                 # Loss: -log(pos / sum)
-                loss += -torch.log(pos_sim / (sum_exp_sim[i] + 1e-8))
-                num_valid += 1
+                anchor_loss = -torch.log(pos_sim / (sum_exp_sim[i] + 1e-8))
+                losses.append(anchor_loss)
 
-        if num_valid > 0:
-            loss = loss / num_valid
+        if len(losses) > 0:
+            loss = torch.stack(losses).mean()
         else:
-            loss = torch.tensor(0.0, device=device)
+            # No valid positive pairs - return zero loss with gradient
+            loss = torch.zeros(1, device=device, requires_grad=True).mean()
 
         return loss
 

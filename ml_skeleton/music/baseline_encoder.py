@@ -33,7 +33,7 @@ class SimpleAudioEncoder(nn.Module):
 
     def __init__(
         self,
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         duration: float = 30.0,
         embedding_dim: int = 512,
         base_channels: int = 32
@@ -80,7 +80,7 @@ class SimpleAudioEncoder(nn.Module):
         Args:
             audio: Raw audio waveform tensor
                    Shape: (batch_size, num_samples)
-                   Example: (32, 661500) for 30s at 22050 Hz
+                   Example: (32, 480000) for 30s at 16000 Hz
 
         Returns:
             embeddings: Fixed-dimensional embedding vectors
@@ -124,7 +124,7 @@ class SpectrogramEncoder(nn.Module):
 
     def __init__(
         self,
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         n_mels: int = 128,
         n_fft: int = 2048,
         hop_length: Optional[int] = None,

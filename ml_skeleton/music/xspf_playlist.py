@@ -156,7 +156,10 @@ def generate_uncertainty_playlist(
         f.write('</playlist>\n')
 
     print(f"Exported {len(selected_songs)} high-uncertainty songs to: {output_path}")
-    print(f"Average uncertainty: {sum(selected_uncertainties) / len(selected_uncertainties):.3f}")
+    if selected_uncertainties:
+        print(f"Average uncertainty: {sum(selected_uncertainties) / len(selected_uncertainties):.3f}")
+    else:
+        print("No songs with uncertainties available")
 
 
 def generate_best_predictions_playlist(
@@ -203,7 +206,10 @@ def generate_best_predictions_playlist(
         annotation_prefix="Predicted rating"
     )
 
-    print(f"Average predicted rating: {sum(selected_predictions) / len(selected_predictions):.3f}")
+    if selected_predictions:
+        print(f"Average predicted rating: {sum(selected_predictions) / len(selected_predictions):.3f}")
+    else:
+        print("No songs with predictions available")
 
 
 def compute_prediction_uncertainty(
@@ -310,11 +316,11 @@ def generate_human_feedback_playlists(
         "best_predictions_playlist_size": top_n_best,
         "uncertainty_playlist_path": str(uncertainty_path),
         "best_predictions_playlist_path": str(best_path),
-        "avg_uncertainty": sum(uncertainties) / len(uncertainties),
-        "max_uncertainty": max(uncertainties),
-        "avg_prediction": sum(predictions) / len(predictions),
-        "max_prediction": max(predictions),
-        "min_prediction": min(predictions)
+        "avg_uncertainty": sum(uncertainties) / len(uncertainties) if uncertainties else 0.0,
+        "max_uncertainty": max(uncertainties) if uncertainties else 0.0,
+        "avg_prediction": sum(predictions) / len(predictions) if predictions else 0.0,
+        "max_prediction": max(predictions) if predictions else 0.0,
+        "min_prediction": min(predictions) if predictions else 0.0
     }
 
     print("\n" + "=" * 60)

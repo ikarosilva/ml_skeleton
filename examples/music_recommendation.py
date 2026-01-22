@@ -30,7 +30,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from ml_skeleton.music.clementine_db import ClementineDB
-from ml_skeleton.music.dataset import MusicDataset, EmbeddingDataset
+from ml_skeleton.music.dataset import MusicDataset, EmbeddingDataset, music_collate_fn
 from ml_skeleton.music.embedding_store import EmbeddingStore
 from ml_skeleton.music.losses import (
     RatingLoss,
@@ -85,10 +85,12 @@ def train_encoder(config: dict):
     all_songs = db.get_all_songs()
     print(f"  Found {len(all_songs)} songs in database")
 
-    # Filter rated songs
-    if music_config.get('only_rated', True):
-        all_songs = [s for s in all_songs if s.is_rated]
-        print(f"  Filtered to {len(all_songs)} rated songs")
+    # Count rated vs unrated (encoder will train on all, loss only on rated)
+    rated_count = sum(1 for s in all_songs if s.is_rated)
+    unrated_count = len(all_songs) - rated_count
+    print(f"  - Rated: {rated_count} songs")
+    print(f"  - Unrated: {unrated_count} songs")
+    print(f"  Note: Encoder sees all songs, loss computed only on rated songs")
 
     # Build album mappings
     print("\n[2/7] Building album mappings...")
@@ -104,7 +106,7 @@ def train_encoder(config: dict):
         sample_rate=music_config['sample_rate'],
         duration=music_config['audio_duration'],
         center_crop=music_config['center_crop'],
-        only_rated=music_config.get('only_rated', True)
+        only_rated=False  # Include all songs; loss functions handle rated/unrated
     )
 
     # Train/val split
@@ -128,14 +130,16 @@ def train_encoder(config: dict):
         batch_size=encoder_config['batch_size'],
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=music_collate_fn
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=encoder_config['batch_size'],
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=music_collate_fn
     )
 
     # Create model
@@ -236,7 +240,8 @@ def train_encoder(config: dict):
         full_dataset,
         batch_size=encoder_config['batch_size'],
         shuffle=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        collate_fn=music_collate_fn
     )
 
     embeddings = trainer.extract_embeddings(
@@ -457,7 +462,7 @@ def generate_recommendations(config: dict):
         print("  Run classifier training first!")
         return
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     classifier.load_state_dict(checkpoint['model_state_dict'])
     classifier = classifier.to(device)
 
@@ -528,11 +533,12 @@ def generate_recommendations(config: dict):
     # Generate both uncertainty and best-predictions playlists
     top_n_uncertain = rec_config.get('human_feedback_uncertain', 100)
     top_n_best = rec_config.get('human_feedback_best', 50)
+    playlist_output_dir = Path(rec_config.get('output_dir', './'))
 
     playlist_stats = generate_human_feedback_playlists(
         songs=full_songs,
         predictions=full_predictions,
-        output_dir=Path('./'),
+        output_dir=playlist_output_dir,
         top_n_uncertain=top_n_uncertain,
         top_n_best=top_n_best,
         uncertainty_method="distance_from_middle"
@@ -543,8 +549,8 @@ def generate_recommendations(config: dict):
     print("=" * 80)
     print(f"\nGenerated files:")
     print(f"  - {output_path} (text recommendations)")
-    print(f"  - recommender_help.xspf (high uncertainty - maximize learning)")
-    print(f"  - recommender_best.xspf (top predictions - validate quality)")
+    print(f"  - {playlist_output_dir / 'recommender_help.xspf'} (high uncertainty - maximize learning)")
+    print(f"  - {playlist_output_dir / 'recommender_best.xspf'} (top predictions - validate quality)")
     print(f"\nNext steps for human-in-the-loop training:")
     print(f"  1. Open XSPF playlists in Clementine")
     print(f"  2. Listen and rate songs")

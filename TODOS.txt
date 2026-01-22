@@ -1,7 +1,6 @@
 
-make sure implementation catches cases where a song may belong to multiple albums ( for example: an artist own album, and/or a "best country songs" album).
-
-
+*write a plan for an inference pipeline (CLI based). make batch size configurable
+with size of 500 files. The input argument should be the database location
 
 **
 Alot of files may have artist, filename, and albums with generic 
@@ -17,16 +16,6 @@ Should we use Parquet files instead in a ./cache folder? Make
 sure its excluded from git
 
 
-* Add reinforcement learnign with humans in the loop. Generate
-a playlist with top 50-100 most uncertain tracks so humans can rate
-them and feed the ratings back in a loop to train next iteration
-of models.
-
-*Use the classifier output to create recommendation list 
-with the top 100 unrated songs that it things will be highly rated.
-
-*Go ahead and implement/execute the full pipeline.
-
 *Add a step where we generate and plot a network graph 
 of the artists in 3D. Can you generate in html so its 
 interactive. Can you find a pleasant way to have a drop 
@@ -39,7 +28,8 @@ Dynamic augmentations transforms for the encoder (small noise) ?
 
 
 
-how to we deal with no song files (ie speech only) ?
+*Capture diversity of labels ? Option to prioritize labels that are in
+sparse location in the embeddings
 
 
 

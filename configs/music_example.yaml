@@ -14,7 +14,7 @@ compute:
 music:
   database_path: /home/ikaro/Music/clementine.db
   embedding_db_path: ./embeddings.db
-  audio_sample_rate: 22050
+  audio_sample_rate: 16000
   audio_duration: 30.0      # seconds (extracted from CENTER of song)
   center_crop: true         # Extract from center, not beginning
   max_audio_duration: 900.0 # Skip files longer than 15 minutes

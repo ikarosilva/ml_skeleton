@@ -261,7 +261,8 @@ class EncoderTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "epoch": self.current_epoch,
             "history": self.history,
-            "model_version": self.model_version
+            "model_version": self.model_version,
+            "sample_rate": self.encoder.sample_rate
         }
 
         if metrics:
@@ -275,7 +276,18 @@ class EncoderTrainer:
         Args:
             path: Path to checkpoint file
         """
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Validate sample rate compatibility
+        checkpoint_sample_rate = checkpoint.get('sample_rate', 22050)  # legacy default
+        current_sample_rate = self.encoder.sample_rate
+
+        if checkpoint_sample_rate != current_sample_rate:
+            raise ValueError(
+                f"Sample rate mismatch: checkpoint trained with {checkpoint_sample_rate} Hz, "
+                f"but current model expects {current_sample_rate} Hz. "
+                f"You must retrain the encoder with the new sample rate."
+            )
 
         self.encoder.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -338,7 +350,7 @@ class EncoderTrainer:
         self,
         songs: list,
         batch_size: int = 64,
-        sample_rate: int = 22050,
+        sample_rate: int = 16000,
         duration: float = 30.0
     ):
         """Extract embeddings in batches without DataLoader.

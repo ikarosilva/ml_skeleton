@@ -29,7 +29,7 @@ class AudioEncoder(Protocol):
         Args:
             audio: Raw audio waveform tensor
                    Shape: (batch_size, num_samples)
-                   Example: (32, 661500) for 30 seconds at 22050 Hz
+                   Example: (32, 480000) for 30 seconds at 16000 Hz
 
         Returns:
             embeddings: Fixed-dimensional embedding vectors
@@ -38,7 +38,7 @@ class AudioEncoder(Protocol):
 
         Note:
             - Input audio is normalized to [-1, 1] range
-            - num_samples = sample_rate * duration (e.g., 22050 * 30 = 661500)
+            - num_samples = sample_rate * duration (e.g., 16000 * 30 = 480000)
             - embedding_dim is user-defined (common: 128, 256, 512, 1024)
         """
         ...
