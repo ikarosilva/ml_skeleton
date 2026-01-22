@@ -54,9 +54,18 @@ tensorflow = [
 ray = [
     "ray[tune]>=2.9.0",
 ]
+music = [
+    "torch>=2.2.0",
+    "torchaudio>=2.2.0",
+    "librosa>=0.10.0",
+    "numpy>=1.24.0",
+]
 all = [
     "torch>=2.2.0",
     "torchvision>=0.17.0",
+    "torchaudio>=2.2.0",
+    "librosa>=0.10.0",
+    "numpy>=1.24.0",
     "tensorflow>=2.15.0",
     "ray[tune]>=2.9.0",
 ]
