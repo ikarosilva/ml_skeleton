@@ -154,5 +154,10 @@ artifact_dir: "./artifacts"
 recommendations:
   top_n: 100  # Number of songs to recommend
   output_format: "xspf"  # xspf, json, csv
-  output_path: "./recommendations.xspf"
+  output_path: "./recommendations.txt"
   min_rating_threshold: 0.6  # Only recommend songs with predicted rating > threshold
+
+  # Human-in-the-loop reinforcement learning (HITL)
+  # These playlists help improve the model through active learning
+  human_feedback_uncertain: 100  # Top-N uncertain predictions (recommender_help.xspf)
+  human_feedback_best: 50  # Top-N best predictions for validation (recommender_best.xspf)

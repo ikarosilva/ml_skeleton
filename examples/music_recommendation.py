@@ -40,6 +40,7 @@ from ml_skeleton.music.losses import (
 )
 from ml_skeleton.music.baseline_encoder import SimpleAudioEncoder, MultiTaskEncoder
 from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
+from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists
 from ml_skeleton.training.encoder_trainer import EncoderTrainer
 from ml_skeleton.training.classifier_trainer import ClassifierTrainer
 
@@ -498,6 +499,45 @@ def generate_recommendations(config: dict):
         song = next((s for s in unrated_songs if s.filename == filename), None)
         if song:
             print(f"  {i}. [{rating:.3f}] {song.artist} - {song.title}")
+
+    # Generate human feedback playlists (for reinforcement learning loop)
+    print("\n" + "=" * 80)
+    print("GENERATING HUMAN FEEDBACK PLAYLISTS")
+    print("=" * 80)
+
+    # Prepare full list of songs and predictions for playlist generation
+    full_predictions = [r for r, _ in results]
+    full_songs = []
+    for _, filename in results:
+        song = next((s for s in unrated_songs if s.filename == filename), None)
+        if song:
+            full_songs.append(song)
+
+    # Generate both uncertainty and best-predictions playlists
+    top_n_uncertain = rec_config.get('human_feedback_uncertain', 100)
+    top_n_best = rec_config.get('human_feedback_best', 50)
+
+    playlist_stats = generate_human_feedback_playlists(
+        songs=full_songs,
+        predictions=full_predictions,
+        output_dir=Path('./'),
+        top_n_uncertain=top_n_uncertain,
+        top_n_best=top_n_best,
+        uncertainty_method="distance_from_middle"
+    )
+
+    print("\n" + "=" * 80)
+    print("RECOMMENDATION COMPLETE")
+    print("=" * 80)
+    print(f"\nGenerated files:")
+    print(f"  - {output_path} (text recommendations)")
+    print(f"  - recommender_help.xspf (high uncertainty - maximize learning)")
+    print(f"  - recommender_best.xspf (top predictions - validate quality)")
+    print(f"\nNext steps for human-in-the-loop training:")
+    print(f"  1. Open XSPF playlists in Clementine")
+    print(f"  2. Listen and rate songs")
+    print(f"  3. Re-run training with updated ratings")
+    print(f"  4. Repeat for continuous improvement!")
 
 
 def main():
