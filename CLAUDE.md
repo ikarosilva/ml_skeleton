@@ -45,11 +45,40 @@ Framework provides: hyperparameters, MLflow tracker, device info, paths
 - VS Code Dev Containers supported (attach to running container)
 - Git auth: credential helper or mount host credentials
 
-## Music Recommendation Components
-- **[music/clementine_db.py](ml_skeleton/music/clementine_db.py)**: Placeholder for loading song metadata from a Clementine music player database. Defines the `Song` data structure.
-- **[music/speech_detector.py](ml_skeleton/music/speech_detector.py)**: Implements a pipeline to detect speech in audio files using a pre-trained VAD model (`silero-vad`). It runs in parallel and caches results in a SQLite database to avoid re-processing files.
-- **[music/dataset.py](ml_skeleton/music/dataset.py)**: Contains the `MusicDataset` class, which handles loading audio data and can filter out files identified as speech based on a configurable threshold.
-- **[examples/music_hello_world.py](examples/music_hello_world.py)**: A demonstration script that showcases how to use the speech detection and filtering pipeline.
+## Music Recommendation System (Complete Implementation)
+Two-phase training pipeline for music recommendations using Clementine database:
+
+### Phase 1: Encoder Training (Audio → Embeddings)
+- **[music/audio_loader.py](ml_skeleton/music/audio_loader.py)**: READ-ONLY audio loading with multiprocessing (80% CPU cores), center-crop extraction, torchaudio integration
+- **[music/baseline_encoder.py](ml_skeleton/music/baseline_encoder.py)**: Simple 1D CNN encoder (SimpleAudioEncoder), mel-spectrogram encoder template, multi-task encoder wrapper
+- **[music/dataset.py](ml_skeleton/music/dataset.py)**: MusicDataset for audio loading, EmbeddingDataset for classifier training, multi-album support
+- **[music/losses.py](ml_skeleton/music/losses.py)**: RatingLoss (MSE), MultiTaskLoss (rating + album), NTXentLoss (SimCLR), SupervisedContrastiveLoss
+- **[training/encoder_trainer.py](ml_skeleton/training/encoder_trainer.py)**: Encoder training orchestration, embedding extraction/storage, checkpoint management
+
+### Phase 2: Classifier Training (Embeddings → Ratings)
+- **[music/baseline_classifier.py](ml_skeleton/music/baseline_classifier.py)**: Simple MLP classifier, deep classifier with residual connections, ensemble classifier
+- **[training/classifier_trainer.py](ml_skeleton/training/classifier_trainer.py)**: Classifier training orchestration, prediction generation, evaluation metrics (MSE, MAE, RMSE, correlation)
+
+### Storage & Database
+- **[music/clementine_db.py](ml_skeleton/music/clementine_db.py)**: READ-ONLY Clementine database interface, Song dataclass
+- **[music/embedding_store.py](ml_skeleton/music/embedding_store.py)**: SQLite storage with multi-version support, batch operations, efficient retrieval
+- **[music/speech_detector.py](ml_skeleton/music/speech_detector.py)**: Speech detection filtering using Silero VAD (optional)
+
+### Protocols & Configuration
+- **[protocols/encoder.py](ml_skeleton/protocols/encoder.py)**: AudioEncoder protocol for user-injectable encoders
+- **[protocols/classifier.py](ml_skeleton/protocols/classifier.py)**: RatingClassifier protocol for user-injectable classifiers
+- **[configs/music_recommendation.yaml](configs/music_recommendation.yaml)**: Complete configuration for encoder, classifier, and recommendation generation
+
+### Examples
+- **[examples/music_recommendation.py](examples/music_recommendation.py)**: Complete end-to-end example with 3 stages (encoder, classifier, recommend)
+
+### Key Features
+- Multi-album support (songs on multiple albums averaged in loss)
+- Album key format: "artist|||album" for uniqueness
+- Multiprocessing default: 80% CPU cores
+- Center-crop extraction: 30s from middle of song
+- Embedding versioning: A/B testing support
+- READ-ONLY operations: All audio file access is read-only
 
 
 ## Conventions

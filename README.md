@@ -469,6 +469,105 @@ This checks Python version, PyTorch/TensorFlow installation, CUDA availability, 
 - TensorFlow >= 2.18.0 (optional)
 - Ray[tune] >= 2.9.0 (optional)
 
+## Music Recommendation Use Case
+
+The framework includes a complete music recommendation system implementation using Clementine database integration.
+
+### Overview
+
+Two-phase training pipeline:
+1. **Stage 1: Encoder** - Train audio encoder (raw waveforms → embeddings)
+2. **Stage 2: Classifier** - Train rating classifier (embeddings → ratings)
+3. **Stage 3: Recommendations** - Generate ranked song recommendations
+
+### Features
+
+- **READ-ONLY Audio Loading** with multiprocessing (80% CPU cores default)
+- **Multi-Album Support** - Songs can belong to multiple albums (original + compilations)
+- **SQLite Embedding Storage** with multi-version support for A/B testing
+- **Center-Crop Extraction** - Extract 30 seconds from center of songs
+- **Baseline Models** - Simple 1D CNN encoder and MLP classifier (easily customizable)
+- **Multiple Loss Functions** - MSE, contrastive learning, supervised contrastive
+- **Speech Detection Filtering** - Optional filtering of spoken word content
+
+### Quick Start
+
+```bash
+# Stage 1: Train encoder
+python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml
+
+# Stage 2: Train classifier
+python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml
+
+# Stage 3: Generate recommendations
+python examples/music_recommendation.py --stage recommend --config configs/music_recommendation.yaml
+```
+
+### Configuration
+
+```yaml
+# configs/music_recommendation.yaml
+music:
+  database_path: "/home/ikaro/Music/clementine.db"
+  embedding_db_path: "./embeddings.db"
+  sample_rate: 22050
+  audio_duration: 30.0
+  center_crop: true
+  num_workers: null  # 80% CPU cores
+
+encoder:
+  embedding_dim: 512
+  epochs: 50
+  batch_size: 32
+  learning_rate: 0.001
+
+classifier:
+  hidden_dims: [256, 128]
+  epochs: 20
+  batch_size: 256
+  learning_rate: 0.0001
+```
+
+### Custom Models
+
+Implement your own encoder and classifier by conforming to the protocols:
+
+```python
+# Custom encoder
+class MyEncoder(nn.Module):
+    def forward(self, audio: torch.Tensor) -> torch.Tensor:
+        """audio: (batch, num_samples) → embeddings: (batch, embedding_dim)"""
+        # Your encoder logic
+        return embeddings
+
+    def get_embedding_dim(self) -> int:
+        return 512
+
+# Custom classifier
+class MyClassifier(nn.Module):
+    def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """embeddings: (batch, Z) → ratings: (batch, 1) in [0, 1]"""
+        # Your classifier logic
+        return ratings
+```
+
+### Architecture
+
+```
+Clementine DB → Audio Loader → Encoder → Embeddings DB → Classifier → Recommendations
+```
+
+Key components:
+- [ml_skeleton/music/clementine_db.py](ml_skeleton/music/clementine_db.py) - READ-ONLY database interface
+- [ml_skeleton/music/audio_loader.py](ml_skeleton/music/audio_loader.py) - Multiprocessing audio loading
+- [ml_skeleton/music/dataset.py](ml_skeleton/music/dataset.py) - PyTorch datasets with multi-album support
+- [ml_skeleton/music/embedding_store.py](ml_skeleton/music/embedding_store.py) - SQLite storage with versioning
+- [ml_skeleton/music/baseline_encoder.py](ml_skeleton/music/baseline_encoder.py) - Simple CNN encoder
+- [ml_skeleton/music/baseline_classifier.py](ml_skeleton/music/baseline_classifier.py) - MLP classifier
+- [ml_skeleton/music/losses.py](ml_skeleton/music/losses.py) - Rating, contrastive, and multi-task losses
+- [ml_skeleton/training/encoder_trainer.py](ml_skeleton/training/encoder_trainer.py) - Stage 1 orchestration
+- [ml_skeleton/training/classifier_trainer.py](ml_skeleton/training/classifier_trainer.py) - Stage 2 orchestration
+
 ## License
 
 MIT License
