@@ -1,4 +1,4 @@
-# Dockerfile for explr training environment
+# Dockerfile for ml_skeleton training environment
 # Supports NVIDIA RTX 5090 (Blackwell) with CUDA 12.8 / Driver 570.x
 
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04

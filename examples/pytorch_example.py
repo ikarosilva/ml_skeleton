@@ -5,9 +5,9 @@ This is a skeleton implementation showing the interface.
 Fill in the TODO sections with your actual training logic.
 """
 
-from explr import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
-from explr.core.config import TunerType
-from explr.tuning import SearchSpaceBuilder
+from ml_skeleton import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
+from ml_skeleton.core.config import TunerType
+from ml_skeleton.tuning import SearchSpaceBuilder
 
 
 def train_model(ctx: TrainingContext) -> TrainingResult:

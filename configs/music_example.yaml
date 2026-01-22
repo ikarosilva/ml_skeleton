@@ -1,0 +1,50 @@
+# Example configuration for the music recommendation project
+name: music_recommendation
+framework: pytorch
+seed: 42
+
+# Compute configuration
+compute:
+  num_workers: null  # null = 80% of CPU cores
+  dataloader_workers: 4
+  device: cuda
+  gpu_memory_limit_gb: 24
+
+# Music-specific configuration
+music:
+  database_path: /home/ikaro/Music/clementine.db
+  embedding_db_path: ./embeddings.db
+  audio_sample_rate: 22050
+  audio_duration: 30.0      # seconds (extracted from CENTER of song)
+  center_crop: true         # Extract from center, not beginning
+  max_audio_duration: 900.0 # Skip files longer than 15 minutes
+
+  # Duplicate detection
+  deduplicate: true
+  fingerprint_cache: ./fingerprints.db
+  merge_duplicate_ratings: true
+
+  # Speech detection and filtering
+  speech_detection:
+    enabled: true                          # Master switch for this feature
+    cache_path: "./speech_cache.db"        # Path to the speech probability cache
+    speech_threshold: 0.5                  # Filter songs with speech prob > 50%
+
+# Training mode: "encoder", "classifier", or "joint"
+training_mode: encoder
+
+# Hyperparameters
+hyperparameters:
+  # Model architecture
+  embedding_dim: 512
+
+  # Encoder training
+  encoder_lr: 0.001
+  encoder_epochs: 50
+  encoder_batch_size: 32
+
+# MLflow tracking
+mlflow:
+  tracking_uri: http://localhost:5000
+  experiment_name: music_recommendation
+  auto_start: true

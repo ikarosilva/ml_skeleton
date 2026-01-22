@@ -2,7 +2,7 @@
 
 # Default target
 help:
-	@echo "explr - Deep Learning Training Framework"
+	@echo "ml_skeleton - Deep Learning Training Framework"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make install        Install the package"
@@ -37,16 +37,16 @@ test:
 	pytest tests/ -v
 
 test-cov:
-	pytest tests/ --cov=explr --cov-report=html
+	pytest tests/ --cov=ml_skeleton --cov-report=html
 
 # Linting and formatting
 lint:
-	ruff check explr/
-	mypy explr/
+	ruff check ml_skeleton/
+	mypy ml_skeleton/
 
 format:
-	black explr/ tests/ examples/
-	ruff check --fix explr/
+	black ml_skeleton/ tests/ examples/
+	ruff check --fix ml_skeleton/
 
 # Cleaning
 clean:
@@ -95,11 +95,11 @@ run-example:
 	python examples/pytorch_example.py
 
 run-example-tune:
-	explr tune configs/example.yaml --train-fn examples.pytorch_example:train_model --n-trials 10
+	mlskel tune configs/example.yaml --train-fn examples.pytorch_example:train_model --n-trials 10
 
 # GPU info
 gpu-info:
-	explr gpu-info
+	mlskel gpu-info
 
 # Using existing kaggle:torch Docker image
 docker-kaggle:

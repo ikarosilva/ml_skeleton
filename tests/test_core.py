@@ -1,8 +1,8 @@
 """Tests for core module."""
 
 import pytest
-from explr.core.protocols import TrainingContext, TrainingResult
-from explr.core.config import ExperimentConfig, TuningConfig, TunerType, MLflowConfig
+from ml_skeleton.core.protocols import TrainingContext, TrainingResult
+from ml_skeleton.core.config import ExperimentConfig, TuningConfig, TunerType, MLflowConfig
 
 
 class TestTrainingResult:

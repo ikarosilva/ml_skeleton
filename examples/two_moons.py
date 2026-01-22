@@ -17,10 +17,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.datasets import make_moons
 from sklearn.model_selection import train_test_split
 
-from explr import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
-from explr.core.config import TunerType
-from explr.tuning import SearchSpaceBuilder
-from explr.utils.memory import limit_gpu_memory
+from ml_skeleton import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
+from ml_skeleton.core.config import TunerType
+from ml_skeleton.tuning import SearchSpaceBuilder
+from ml_skeleton.utils.memory import limit_gpu_memory
 
 
 class SimpleMLP(nn.Module):

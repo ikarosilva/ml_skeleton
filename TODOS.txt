@@ -1,0 +1,48 @@
+
+make sure implementation catches cases where a song may belong to multiple albums ( for example: an artist own album, and/or a "best country songs" album).
+
+
+
+**
+Alot of files may have artist, filename, and albums with generic 
+unknown names in either English of Portuguese. For example:
+are name "Unknown", "Desconhecido"
+Check how the clementine handles these (we may be able to recycle their 
+code), and make sure we masks these labels from the encoder loss. In
+cases where everything is unknown, we may wish to skip those tracks for
+now.
+
+*Not sure if SQLite is best caching mechanism for features.
+Should we use Parquet files instead in a ./cache folder? Make 
+sure its excluded from git
+
+
+* Add reinforcement learnign with humans in the loop. Generate
+a playlist with top 50-100 most uncertain tracks so humans can rate
+them and feed the ratings back in a loop to train next iteration
+of models.
+
+*Use the classifier output to create recommendation list 
+with the top 100 unrated songs that it things will be highly rated.
+
+*Go ahead and implement/execute the full pipeline.
+
+*Add a step where we generate and plot a network graph 
+of the artists in 3D. Can you generate in html so its 
+interactive. Can you find a pleasant way to have a drop 
+down menu where we can add select a meta tag to add 
+without making the graph to noisy ? The meta tags that 
+would be switched on/off would be : Genre and year.
+
+
+Dynamic augmentations transforms for the encoder (small noise) ?
+
+
+
+how to we deal with no song files (ie speech only) ?
+
+
+
+
+Unlabelled songs?
+How leverage MusicBrainz?

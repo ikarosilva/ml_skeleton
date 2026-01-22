@@ -1,4 +1,4 @@
-# explr
+# ml_skeleton
 
 A deep learning training framework with MLflow experiment tracking and hyperparameter tuning (Optuna/Ray Tune).
 
@@ -34,7 +34,7 @@ pip install -e ".[all]"
 ### 1. Define Your Training Function
 
 ```python
-from explr import TrainingContext, TrainingResult
+from ml_skeleton import TrainingContext, TrainingResult
 
 def train_model(ctx: TrainingContext) -> TrainingResult:
     """Your training function receives a context and returns results."""
@@ -67,7 +67,7 @@ def train_model(ctx: TrainingContext) -> TrainingResult:
 ### 2. Run a Single Experiment
 
 ```python
-from explr import run_experiment, ExperimentConfig
+from ml_skeleton import run_experiment, ExperimentConfig
 
 config = ExperimentConfig(
     name="my_experiment",
@@ -81,8 +81,8 @@ print(f"Final loss: {result.primary_metric}")
 ### 3. Run Hyperparameter Tuning
 
 ```python
-from explr import run_experiment, ExperimentConfig, TunerType
-from explr.tuning import SearchSpaceBuilder
+from ml_skeleton import run_experiment, ExperimentConfig, TunerType
+from ml_skeleton.tuning import SearchSpaceBuilder
 
 # Define search space
 search_space = (
@@ -106,23 +106,23 @@ print(f"Best params: {results['best_params']}")
 
 ```bash
 # Run a single training
-explr run config.yaml --train-fn my_module:train_model
+mlskel run config.yaml --train-fn my_module:train_model
 
 # Run hyperparameter tuning
-explr tune config.yaml --train-fn my_module:train_model --n-trials 50
+mlskel tune config.yaml --train-fn my_module:train_model --n-trials 50
 
 # Start MLflow UI
-explr mlflow-ui
+ml_skeleton mlflow-ui
 
 # Show GPU info
-explr gpu-info
+mlskel gpu-info
 
 # Verify environment
-explr verify
+mlskel verify
 
 # Show/set GPU memory limits
-explr memory --show
-explr memory --limit 24
+mlskel memory --show
+mlskel memory --limit 24
 ```
 
 ## Docker Setup
@@ -153,8 +153,9 @@ docker run --shm-size 50G --runtime=nvidia --privileged -it \
   -v ~/PycharmProjects:/projects \
   --rm kaggle:torch bash
 
+
 # Inside container
-cd /git/explr
+cd /git/ml_skeleton
 pip install -e .
 
 # Start MLflow server (background)
@@ -162,6 +163,68 @@ mlflow server --host 0.0.0.0 --port 5000 &
 
 # Run your experiment
 python examples/pytorch_example.py
+
+# Stop MLflow server when done (optional - data persists regardless)
+pkill -f "mlflow server"
+```
+
+### VS Code Dev Containers
+
+You can attach VS Code directly to a running Docker container for full IDE support (debugging, IntelliSense, etc.):
+
+1. Install the **Dev Containers** extension in VS Code
+2. Start the Docker container (see above)
+3. Open Command Palette (`Ctrl+Shift+P`)
+4. Select **Dev Containers: Attach to Running Container...**
+5. Select your `kaggle:torch` container
+6. In the new VS Code window, click **Open Folder** and navigate to `/git/ml_skeleton`
+7. Install the **Python** extension (`Ctrl+Shift+X`, search "Python" by Microsoft)
+8. Select the Python interpreter (`Ctrl+Shift+P` → "Python: Select Interpreter" → choose `/opt/conda/bin/python` or similar)
+9. Run scripts using the Play button (top right) or debug with F5
+
+The project includes VS Code settings (`.vscode/settings.json`) that ensure scripts always run from the workspace root directory, regardless of which file you're editing. The attached VS Code window runs entirely inside the container, with access to the container's Python interpreter, GPU, and all installed packages.
+
+### Git Authentication in Docker
+
+To push code from inside the container, you need to authenticate.
+
+**Option 1: HTTPS with Personal Access Token (No Restart)**
+If you are already inside the container:
+1. Run `git config --global credential.helper store`
+2. Run `git push`
+3. Enter your GitHub username
+4. For the password, use a **Personal Access Token** (not your account password)
+
+> **Note:** If `git push` fails immediately with a 403 error without prompting, you may have a conflicting environment variable. Run `unset GITHUB_TOKEN` and `rm -f ~/.git-credentials`, then try again.
+> **Troubleshooting 403 Errors:**
+> If `git push` fails immediately without prompting, an invalid token is likely active in the environment. Run:
+> ```bash
+> unset GITHUB_TOKEN
+> git config --system --unset credential.helper
+> git config --global --unset credential.helper
+> git remote set-url origin https://<USERNAME>@github.com/<USERNAME>/ml_skeleton.git
+> ```
+>
+> If you see "Permission denied", ensure your Personal Access Token has the **`repo`** scope selected.
+>
+> **Troubleshooting Hanging:**
+> If `git push` hangs without output, the credential helper may be stuck. Run `git config --global --unset credential.helper` to disable it, then try again.
+>
+> **Last Resort (Token in URL):**
+> If prompts are not appearing, embed your token directly in the remote URL (warning: this saves the token in plain text in `.git/config`):
+> `git remote set-url origin https://<YOUR_TOKEN>@github.com/<USERNAME>/ml_skeleton.git`
+>
+> **Network Hanging (MTU):**
+> If it hangs during connection or "Writing objects", it is likely a Docker network packet size issue. Run:
+> `git config --global http.postBuffer 524288000`
+> `ip link set eth0 mtu 1400` (requires root)
+> `git config --global http.version HTTP/1.1`
+> `ip link set eth0 mtu 1200` (requires root)
+
+**Option 2: Mount Host Credentials (Requires Restart)**
+Add these flags to your `docker run` command to share host credentials:
+```bash
+-v ~/.gitconfig:/root/.gitconfig -v ~/.git-credentials:/root/.git-credentials
 ```
 
 ### Docker Commands via Makefile
@@ -212,7 +275,7 @@ seed: 42
 ### Programmatic Configuration
 
 ```python
-from explr import ExperimentConfig, TuningConfig, TunerType
+from ml_skeleton import ExperimentConfig, TuningConfig, TunerType
 
 config = ExperimentConfig(
     name="my_experiment",
@@ -225,10 +288,61 @@ config = ExperimentConfig(
 )
 ```
 
+## MLflow Server Management
+
+The framework automatically manages the MLflow tracking server for you.
+
+### Auto-Start Behavior (Default)
+
+When `auto_start: true` (the default), the framework:
+
+1. Checks if an MLflow server is already running on the configured port
+2. If not running, automatically starts one as a subprocess
+3. Automatically stops the server when your script exits (via `atexit` handler)
+
+This means you can simply run your experiment without manually starting MLflow:
+
+```bash
+python examples/two_moons.py
+# MLflow server starts automatically, runs experiment, then stops on exit
+```
+
+### Using an External Server
+
+If you start MLflow manually before running your experiment, the framework detects it and reuses the existing server without stopping it when your script exits:
+
+```bash
+# Start server manually (stays running)
+mlflow server --host 0.0.0.0 --port 5000 &
+
+# Run experiments (server keeps running after script exits)
+python examples/two_moons.py
+
+# Stop when you're done
+pkill -f "mlflow server"
+```
+
+### Disabling Auto-Start
+
+To disable auto-start and require a pre-running server:
+
+```yaml
+mlflow:
+  auto_start: false
+  tracking_uri: "http://localhost:5000"
+```
+
+Or programmatically:
+
+```python
+config = ExperimentConfig(name="my_experiment")
+config.mlflow.auto_start = False
+```
+
 ## Project Structure
 
 ```
-explr/
+ml_skeleton/
 ├── core/           # Core protocols and configuration
 ├── tracking/       # MLflow integration
 ├── tuning/         # Optuna and Ray Tune
@@ -284,7 +398,7 @@ Control how much GPU memory the framework uses. **Default: 24GB** (leaves 8GB fr
 ### Default Behavior
 
 ```python
-from explr.utils.memory import limit_gpu_memory
+from ml_skeleton.utils.memory import limit_gpu_memory
 
 # Uses default 24GB limit
 limit_gpu_memory()
@@ -304,18 +418,18 @@ limit_gpu_memory(max_memory_gb=0)
 
 ```bash
 # Override the default via environment variable
-export EXPLR_GPU_MEMORY_GB=28
+export ML_SKELETON_GPU_MEMORY_GB=28
 python my_training.py
 
 # Disable limit via environment variable
-export EXPLR_GPU_MEMORY_GB=0
+export ML_SKELETON_GPU_MEMORY_GB=0
 ```
 
 ### In train_model()
 
 ```python
 def train_model(ctx: TrainingContext) -> TrainingResult:
-    from explr.utils.memory import limit_gpu_memory
+    from ml_skeleton.utils.memory import limit_gpu_memory
 
     # Get limit from hyperparameters or use default (24GB)
     max_mem = ctx.hyperparameters.get("max_gpu_memory_gb")
@@ -327,8 +441,8 @@ def train_model(ctx: TrainingContext) -> TrainingResult:
 ### CLI
 
 ```bash
-explr memory --show        # Show current usage
-explr memory --limit 16    # Set custom limit
+mlskel memory --show        # Show current usage
+mlskel memory --limit 16    # Set custom limit
 ```
 
 ## Environment Verification
@@ -337,10 +451,10 @@ Verify your environment has all required dependencies:
 
 ```bash
 # Via CLI
-explr verify
+mlskel verify
 
 # Via Python
-python -m explr.utils.verify
+python -m ml_skeleton.utils.verify
 ```
 
 This checks Python version, PyTorch/TensorFlow installation, CUDA availability, and GPU detection.

@@ -3,14 +3,14 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "explr"
+name = "ml-skeleton"
 version = "0.1.0"
 description = "Deep Learning Training Framework with MLflow and Hyperparameter Tuning"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "explr-dev", email = "explr-dev@example.com"}
+    {name = "ml-skeleton-dev", email = "ml-skeleton-dev@example.com"}
 ]
 keywords = [
     "deep-learning",
@@ -69,16 +69,16 @@ dev = [
 ]
 
 [project.scripts]
-explr = "explr.runner.cli:main"
+mlskel = "ml_skeleton.runner.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/explr-org/explr"
-Documentation = "https://github.com/explr-org/explr#readme"
-Repository = "https://github.com/explr-org/explr"
+Homepage = "https://github.com/ml-skeleton-org/ml_skeleton"
+Documentation = "https://github.com/ml-skeleton-org/ml_skeleton#readme"
+Repository = "https://github.com/ml-skeleton-org/ml_skeleton"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["explr*"]
+include = ["ml_skeleton*"]
 
 [tool.black]
 line-length = 88
