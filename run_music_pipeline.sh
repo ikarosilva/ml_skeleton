@@ -116,6 +116,7 @@ run_recommend() {
     echo "  - Predict ratings using trained models"
     echo "  - Generate top-N recommendations"
     echo "  - Save to recommendations.txt"
+    echo "  - Generate HITL playlists (recommender_help.xspf, recommender_best.xspf)"
     echo ""
 
     python "$SCRIPT" --stage recommend --config "$CONFIG"
@@ -168,6 +169,11 @@ main() {
             echo "  - Classifier model: checkpoints/classifier_best.pt"
             echo "  - Embeddings: embeddings.db"
             echo "  - Recommendations: recommendations.txt"
+            echo "  - HITL Playlists:"
+            echo "    * recommender_help.xspf (uncertain songs for learning)"
+            echo "    * recommender_best.xspf (top predictions for validation)"
+            echo ""
+            echo "Next: Open XSPF playlists in Clementine, rate songs, and re-run!"
             ;;
         encoder)
             run_encoder

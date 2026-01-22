@@ -603,7 +603,51 @@ Stage 3 (Recommendations):
   ✓ Predicts ratings for unrated songs
   ✓ Generates top-100 recommendations
   ✓ Saves to: recommendations.txt
+  ✓ Generates HITL playlists:
+    - recommender_help.xspf (100 uncertain songs for learning)
+    - recommender_best.xspf (50 best predictions for validation)
 ```
+
+### Human-in-the-Loop Reinforcement Learning
+
+Stage 3 automatically generates two XSPF playlists for continuous model improvement:
+
+#### 1. High Uncertainty Playlist (`recommender_help.xspf`)
+Contains 100 songs where the model is most uncertain (predictions near 0.5). Rating these songs provides maximum information gain for improving the model.
+
+#### 2. Best Predictions Playlist (`recommender_best.xspf`)
+Contains 50 songs with highest predicted ratings. Use this to validate that the model's top recommendations are actually good.
+
+#### Workflow
+
+```bash
+# Step 1: Train and generate playlists
+./run_music_pipeline.sh all
+
+# Step 2: Open playlists in Clementine
+# - File > Open Playlist > recommender_help.xspf
+# - Listen and rate songs (right-click > Rate)
+# - Clementine saves ratings to database automatically
+
+# Step 3: Re-train with updated ratings
+./run_music_pipeline.sh all
+
+# Step 4: Repeat for continuous improvement
+```
+
+#### Configuration
+
+```yaml
+recommendations:
+  human_feedback_uncertain: 100  # Songs for maximum learning
+  human_feedback_best: 50        # Songs for validation
+```
+
+The playlists include annotations showing:
+- Predicted rating (0-5 scale, compatible with Clementine)
+- Uncertainty score (for help playlist)
+
+This active learning approach focuses human effort where it matters most!
 
 ### Troubleshooting
 
