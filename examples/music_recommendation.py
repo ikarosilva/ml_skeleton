@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import sys
+import os
 from pathlib import Path
 
 import torch
@@ -46,9 +47,20 @@ from ml_skeleton.training.classifier_trainer import ClassifierTrainer
 
 
 def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
+    """Load configuration from YAML file.
+
+    Environment variable override:
+    - CLEMENTINE_DB_PATH: Override database path from config
+    """
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+
+    # Allow environment variable override for database path
+    env_db_path = os.getenv('CLEMENTINE_DB_PATH')
+    if env_db_path:
+        print(f"Using database path from environment: {env_db_path}")
+        config['music']['database_path'] = env_db_path
+
     return config
 
 

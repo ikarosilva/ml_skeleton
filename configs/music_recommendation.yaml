@@ -13,7 +13,8 @@ tags:
 # Music-specific configuration
 music:
   # Clementine database path
-  database_path: "/home/ikaro/Music/clementine.db"
+  # IMPORTANT: Update this path to match your Clementine database location
+  database_path: "/Music/database/clementine_backup_2026-01.db"
 
   # Embedding storage (SQLite)
   embedding_db_path: "./embeddings.db"

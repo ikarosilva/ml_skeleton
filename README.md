@@ -502,10 +502,17 @@ Two-phase training pipeline:
    ```
 
 2. **Configure Your Database Path**
-   Edit [configs/music_recommendation.yaml](configs/music_recommendation.yaml) and set:
+
+   **Option A: Environment Variable (Easiest)**
+   ```bash
+   export CLEMENTINE_DB_PATH="/Music/database/clementine_backup_2026-01.db"
+   ```
+
+   **Option B: Edit Config File**
+   Edit [configs/music_recommendation.yaml](configs/music_recommendation.yaml):
    ```yaml
    music:
-     database_path: "/home/ikaro/Music/clementine.db"  # Your Clementine DB path
+     database_path: "/Music/database/clementine_backup_2026-01.db"
    ```
 
 #### Full Training Pipeline

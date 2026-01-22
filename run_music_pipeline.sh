@@ -7,11 +7,21 @@
 #   ./run_music_pipeline.sh classifier       # Run Stage 2 only
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs each)
+#
+# Environment variables:
+#   CONFIG=/path/to/config.yaml              # Override config file
+#   CLEMENTINE_DB_PATH=/path/to/db           # Override database path
 
 set -e  # Exit on error
 
 CONFIG="${CONFIG:-configs/music_recommendation.yaml}"
 SCRIPT="examples/music_recommendation.py"
+
+# Allow database path override via environment variable
+# Example: CLEMENTINE_DB_PATH=/Music/database/clementine_backup_2026-01.db ./run_music_pipeline.sh all
+if [ -n "$CLEMENTINE_DB_PATH" ]; then
+    export CLEMENTINE_DB_PATH
+fi
 
 # Colors for output
 GREEN='\033[0;32m'

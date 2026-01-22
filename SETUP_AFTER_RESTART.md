@@ -36,9 +36,9 @@ cd /git/ml_skeleton
 # 2. Install with music dependencies
 pip install -e ".[music]"
 
-# 3. Verify Clementine DB path
-ls -lh /home/ikaro/Music/clementine.db
-# Or update the path in configs/music_recommendation.yaml
+# 3. Verify Clementine DB path (default path in config)
+ls -lh /Music/database/clementine_backup_2026-01.db
+# Or set your own path using environment variable (see "Update Configuration" below)
 
 # 4. Test the setup (optional - quick check)
 python -c "import torch; import torchaudio; import librosa; print('✓ All imports work!')"
@@ -60,13 +60,40 @@ This includes: PyTorch, TorchAudio, Librosa, TensorFlow, Ray Tune, and all extra
 
 ## Update Configuration
 
-Edit `configs/music_recommendation.yaml` to set your database path:
+You have **three options** to set the database path (in order of preference):
+
+### Option 1: Environment Variable (Easiest)
+
+Set the `CLEMENTINE_DB_PATH` environment variable:
+
+```bash
+export CLEMENTINE_DB_PATH="/Music/database/clementine_backup_2026-01.db"
+./run_music_pipeline.sh all
+```
+
+Or inline:
+
+```bash
+CLEMENTINE_DB_PATH="/Music/database/clementine_backup_2026-01.db" ./run_music_pipeline.sh all
+```
+
+### Option 2: Edit Config File
+
+Edit `configs/music_recommendation.yaml`:
 
 ```yaml
 music:
-  database_path: "/home/ikaro/Music/clementine.db"  # Update if different
-  # or
-  database_path: "/Music/clementine.db"  # If mounted at /Music
+  database_path: "/Music/database/clementine_backup_2026-01.db"
+```
+
+### Option 3: Create Custom Config
+
+Copy and customize:
+
+```bash
+cp configs/music_recommendation.yaml configs/my_music.yaml
+# Edit configs/my_music.yaml with your paths
+CONFIG=configs/my_music.yaml ./run_music_pipeline.sh all
 ```
 
 ## Verify Setup
