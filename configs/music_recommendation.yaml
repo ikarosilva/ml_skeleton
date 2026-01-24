@@ -70,7 +70,7 @@ music:
 
   # Multiprocessing (optimized for parallel audio loading and resampling)
   num_workers: null  # null = 80% of CPU cores (for batch operations)
-  dataloader_workers: 12  # Workers for DataLoader (each worker loads+resamples audio in parallel)
+  dataloader_workers: 10  # Workers for DataLoader (each worker loads+resamples audio in parallel)
   # Note: Audio resampling (e.g., 44100Hz -> 16000Hz) is done in parallel across workers
   # with cached resamplers for efficiency and prefetch_factor=4 for better throughput
 
@@ -111,7 +111,7 @@ encoder:
   #   - For final training with optimized hyperparameters: Use final_training_epochs (50 epochs)
   epochs: 20  # Default for HPO trials
   final_training_epochs: 50  # Use this for final training with best hyperparameters
-  batch_size: 96  # Increased - resnet34 uses less memory than resnet50
+  batch_size: 64  # Reduced to prevent OOM crashes
   learning_rate: 0.001
 
   # Early stopping (especially useful for hyperparameter tuning)

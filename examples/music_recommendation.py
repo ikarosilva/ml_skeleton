@@ -598,7 +598,7 @@ def train_encoder(
         print(f"    Total albums: {dataset_stats['total_albums']}")
 
     # Apply model version override if provided
-    model_version = model_version_override if model_version_override else music_config['model_version']
+    model_version = model_version_override if model_version_override else music_config['encoder_version']
 
     # Create trainer
     if verbose:
@@ -900,7 +900,7 @@ def train_classifier(
     filenames = [s.filename for s in all_songs]
     embeddings_dict = embedding_store.get_embeddings_batch(
         filenames,
-        model_version=music_config['model_version']
+        model_version=music_config['encoder_version']
     )
 
     if verbose:
