@@ -7,7 +7,7 @@ A deep learning training framework with MLflow experiment tracking and hyperpara
 - **Simple Interface**: Implement a single `train_model()` function with your training logic
 - **MLflow Integration**: Automatic experiment tracking, metric logging, and artifact storage
 - **Hyperparameter Tuning**: Support for Optuna and Ray Tune with pruning
-- **Multi-Framework**: Works with both PyTorch and TensorFlow
+- **PyTorch Framework**: Optimized for PyTorch deep learning
 - **Docker Ready**: Pre-configured for NVIDIA GPUs (including RTX 5090)
 
 ## Installation
@@ -16,11 +16,8 @@ A deep learning training framework with MLflow experiment tracking and hyperpara
 # Basic installation
 pip install -e .
 
-# With PyTorch
+# With PyTorch (recommended)
 pip install -e ".[pytorch]"
-
-# With TensorFlow
-pip install -e ".[tensorflow]"
 
 # With Ray Tune
 pip install -e ".[ray]"
@@ -465,8 +462,9 @@ This checks Python version, PyTorch/TensorFlow installation, CUDA availability, 
 - CUDA 12.8+ (for RTX 5090 Blackwell support)
 - MLflow >= 2.10.0
 - Optuna >= 3.5.0
-- PyTorch >= 2.5.0 (optional, required for Blackwell GPUs)
-- TensorFlow >= 2.18.0 (optional)
+- PyTorch >= 2.5.0 (required for Blackwell GPUs)
+- torchaudio (for audio loading)
+- librosa (fallback audio loader for problematic files)
 - Ray[tune] >= 2.9.0 (optional)
 
 ## Music Recommendation Use Case
@@ -482,12 +480,13 @@ Two-phase training pipeline:
 
 ### Features
 
-- **READ-ONLY Audio Loading** with multiprocessing (80% CPU cores default)
+- **SimSiam Self-Supervised Encoder** - ResNet34 backbone with mel spectrograms
+- **READ-ONLY Audio Loading** with torchaudio + librosa fallback for problematic files
+- **Waveform Caching** - Cache resampled audio for 10x faster subsequent epochs
 - **Multi-Album Support** - Songs can belong to multiple albums (original + compilations)
 - **SQLite Embedding Storage** with multi-version support for A/B testing
-- **Center-Crop Extraction** - Extract 30 seconds from center of songs
-- **Baseline Models** - Simple 1D CNN encoder and MLP classifier (easily customizable)
-- **Multiple Loss Functions** - MSE, contrastive learning, supervised contrastive
+- **End-Crop Extraction** - Extract 60 seconds from end of songs (with z-normalization)
+- **MLP Classifier** with residual connections (easily customizable)
 - **Speech Detection Filtering** - Optional filtering of spoken word content
 
 ### Quick Start
@@ -523,6 +522,9 @@ Two-phase training pipeline:
 # Make script executable (first time only)
 chmod +x run_music_pipeline.sh
 
+# Pre-populate waveform cache (recommended before first training)
+./run_music_pipeline.sh build-cache
+
 # Run entire pipeline (all 3 stages)
 ./run_music_pipeline.sh all
 
@@ -533,6 +535,9 @@ chmod +x run_music_pipeline.sh
 
 # Quick test with reduced epochs (for testing)
 ./run_music_pipeline.sh quick
+
+# Cache management
+./run_music_pipeline.sh clear-cache  # Delete cache when audio files change
 ```
 
 **Option 2: Running stages manually**
@@ -594,9 +599,15 @@ mlflow ui --host 0.0.0.0 --port 5000
 #### Expected Output
 
 ```
+Build Cache (optional but recommended):
+  ✓ Iterates through all audio files
+  ✓ Caches resampled waveforms to ./cache
+  ✓ Subsequent training is ~10x faster
+
 Stage 1 (Encoder):
   ✓ Loads ~60K songs from Clementine DB
-  ✓ Trains for 50 epochs (~1-2 hours on RTX 5090)
+  ✓ Trains SimSiam encoder on mel spectrograms
+  ✓ First epoch populates cache (if not pre-built)
   ✓ Extracts embeddings for all songs
   ✓ Saves to: checkpoints/encoder_best.pt, embeddings.db
 
@@ -675,12 +686,16 @@ This active learning approach focuses human effort where it matters most!
     batch_size: 128  # Reduce from 256
   ```
 
-**Problem: "Training is slow"**
-- Solution: Check multiprocessing settings:
+**Problem: "Training is slow" or "Variable iteration times"**
+- Solution 1: Pre-populate the waveform cache before training:
+  ```bash
+  ./run_music_pipeline.sh build-cache
+  ```
+- Solution 2: Check multiprocessing settings:
   ```yaml
   music:
     num_workers: null  # Uses 80% CPU cores (default)
-    dataloader_workers: 4  # Increase if CPU has many cores
+    dataloader_workers: 10  # Increase if CPU has many cores
   ```
 
 **Problem: "No embeddings found for Stage 2"**
@@ -709,20 +724,26 @@ music:
   database_path: "/home/ikaro/Music/clementine.db"
   embedding_db_path: "./embeddings.db"
   sample_rate: 16000
-  audio_duration: 30.0
-  center_crop: true
-  num_workers: null  # 80% CPU cores
+  duration: 60.0
+  crop_position: "end"
+  waveform_cache_dir: "./cache"
+  waveform_cache_max_gb: 140
+  dataloader_workers: 10
 
 encoder:
-  embedding_dim: 512
-  epochs: 50
-  batch_size: 32
+  encoder_type: "simsiam"
+  epochs: 20
+  batch_size: 64
   learning_rate: 0.001
+  simsiam:
+    backbone: "resnet34"
+    projection_dim: 2048
+    predictor_hidden_dim: 512
 
 classifier:
-  hidden_dims: [256, 128]
+  hidden_dims: [512, 256, 128]
   epochs: 20
-  batch_size: 256
+  batch_size: 64
   learning_rate: 0.0001
 ```
 
@@ -752,17 +773,19 @@ class MyClassifier(nn.Module):
 ### Architecture
 
 ```
-Clementine DB → Audio Loader → Encoder → Embeddings DB → Classifier → Recommendations
+Clementine DB → Audio Loader → SimSiam Encoder → Embeddings DB → Classifier → Recommendations
+                     ↓
+              Waveform Cache (./cache)
 ```
 
 Key components:
 - [ml_skeleton/music/clementine_db.py](ml_skeleton/music/clementine_db.py) - READ-ONLY database interface
-- [ml_skeleton/music/audio_loader.py](ml_skeleton/music/audio_loader.py) - Multiprocessing audio loading
-- [ml_skeleton/music/dataset.py](ml_skeleton/music/dataset.py) - PyTorch datasets with multi-album support
+- [ml_skeleton/music/audio_loader.py](ml_skeleton/music/audio_loader.py) - Audio loading with torchaudio + librosa fallback
+- [ml_skeleton/music/dataset.py](ml_skeleton/music/dataset.py) - PyTorch datasets with waveform caching
 - [ml_skeleton/music/embedding_store.py](ml_skeleton/music/embedding_store.py) - SQLite storage with versioning
-- [ml_skeleton/music/baseline_encoder.py](ml_skeleton/music/baseline_encoder.py) - Simple CNN encoder
-- [ml_skeleton/music/baseline_classifier.py](ml_skeleton/music/baseline_classifier.py) - MLP classifier
-- [ml_skeleton/music/losses.py](ml_skeleton/music/losses.py) - Rating, contrastive, and multi-task losses
+- [ml_skeleton/music/simsiam_encoder.py](ml_skeleton/music/simsiam_encoder.py) - SimSiam self-supervised encoder (ResNet34)
+- [ml_skeleton/music/baseline_classifier.py](ml_skeleton/music/baseline_classifier.py) - MLP classifier with residual connections
+- [ml_skeleton/music/losses.py](ml_skeleton/music/losses.py) - SimSiam loss, rating loss
 - [ml_skeleton/training/encoder_trainer.py](ml_skeleton/training/encoder_trainer.py) - Stage 1 orchestration
 - [ml_skeleton/training/classifier_trainer.py](ml_skeleton/training/classifier_trainer.py) - Stage 2 orchestration
 

@@ -7,6 +7,7 @@ Performance optimizations:
 - PyTorch DataLoader workers handle parallel loading automatically
 - prefetch_factor enables pre-loading multiple batches per worker
 - persistent_workers keeps workers alive between epochs (reduces startup overhead)
+- Librosa fallback for files that torchaudio can't handle
 
 Example usage with DataLoader:
     from torch.utils.data import DataLoader
@@ -20,8 +21,17 @@ Example usage with DataLoader:
     )
 """
 
+import os
+import warnings
+
+# Suppress ffmpeg mjpeg warnings (from embedded album art)
+os.environ.setdefault('AV_LOG_FORCE_NOCOLOR', '1')
+os.environ.setdefault('FFREPORT', 'level=error')
+
 import torch
 import torchaudio
+import librosa
+import numpy as np
 from pathlib import Path
 from typing import Optional
 import multiprocessing
@@ -36,6 +46,58 @@ def get_default_workers() -> int:
     """
     cpu_count = multiprocessing.cpu_count()
     return max(1, int(cpu_count * 0.8))
+
+
+def _load_with_librosa(
+    filepath: str,
+    sample_rate: int,
+    duration: Optional[float],
+    crop_position: str,
+    mono: bool
+) -> Optional[tuple[torch.Tensor, int]]:
+    """Fallback audio loader using librosa (more robust but slower).
+
+    Args:
+        filepath: Path to audio file
+        sample_rate: Target sample rate (Hz)
+        duration: Duration in seconds to extract (None = full file)
+        crop_position: Where to extract from - "start", "center", or "end"
+        mono: Convert to mono if True
+
+    Returns:
+        Tuple of (waveform tensor, sample_rate) or None if loading fails
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+
+            # Get file duration first
+            file_duration = librosa.get_duration(path=filepath)
+
+            # Calculate offset based on crop position
+            offset = 0.0
+            if duration is not None and file_duration > duration:
+                if crop_position == "center":
+                    offset = (file_duration - duration) / 2
+                elif crop_position == "end":
+                    offset = file_duration - duration
+                # "start" keeps offset = 0
+
+            # Load with librosa (automatically resamples)
+            y, sr = librosa.load(
+                filepath,
+                sr=sample_rate,
+                mono=mono,
+                offset=offset,
+                duration=duration
+            )
+
+            # Convert to torch tensor
+            waveform = torch.from_numpy(y.astype(np.float32))
+            return waveform, sr
+
+    except Exception:
+        return None
 
 
 @lru_cache(maxsize=8)
@@ -84,28 +146,34 @@ def load_audio_file(
 
     Note:
         - This function is READ-ONLY - audio files are NEVER modified
-        - Uses torchaudio.load() which opens files in read-only mode
+        - Uses torchaudio.load() with librosa fallback for problematic files
         - Long files (>max_duration) are skipped to filter out live albums, DJ sets
         - Z-normalization: (audio - mean) / std, prevents volume differences from affecting features
     """
     # Handle deprecated center_crop parameter
     if center_crop is not None:
         crop_position = "center" if center_crop else "start"
+
+    filepath = Path(filepath)
+
+    # Check file exists
+    if not filepath.exists():
+        return None
+
+    waveform = None
+    sr = sample_rate
+    use_librosa = False
+
+    # Try torchaudio first (faster)
     try:
-        filepath = Path(filepath)
-        
-        # Check file exists
-        if not filepath.exists():
-            return None
-        
         # Get audio info first (faster than loading)
         info = torchaudio.info(str(filepath))
         file_duration = info.num_frames / info.sample_rate
-        
+
         # Skip very long files (live albums, DJ sets, podcasts)
         if file_duration > max_duration:
             return None
-        
+
         # Load audio (READ-ONLY operation)
         if duration is None:
             # Load full file
@@ -139,7 +207,7 @@ def load_audio_file(
                     frame_offset=0,
                     num_frames=frames_to_load
                 )
-        
+
         # Convert to mono if requested
         if mono and waveform.shape[0] > 1:
             waveform = waveform.mean(dim=0, keepdim=False)
@@ -150,42 +218,51 @@ def load_audio_file(
         if sr != sample_rate:
             resampler = get_resampler(sr, sample_rate)
             waveform = resampler(waveform)
-        
-        # Pad or truncate to exact duration if specified
-        if duration is not None:
-            target_length = int(duration * sample_rate)
-            current_length = waveform.shape[-1] if waveform.dim() > 0 else len(waveform)
 
-            if current_length < target_length:
-                # Pad with zeros
-                padding = target_length - current_length
-                waveform = torch.nn.functional.pad(waveform, (0, padding))
-            elif current_length > target_length:
-                # Truncate
-                waveform = waveform[:target_length]
+    except Exception:
+        # Fallback to librosa (more robust for problematic files)
+        use_librosa = True
 
-        # Apply z-normalization (standardization) if requested
-        # This ensures consistent amplitude across different recordings
-        if normalize:
-            mean = waveform.mean()
-            std = waveform.std()
-            # Avoid division by zero for silent audio
-            if std > 1e-8:
-                waveform = (waveform - mean) / std
-            else:
-                # Silent audio - just center at zero
-                waveform = waveform - mean
+    # Librosa fallback
+    if use_librosa:
+        result = _load_with_librosa(
+            str(filepath), sample_rate, duration, crop_position, mono
+        )
+        if result is None:
+            print(f"Warning: Could not load {filepath}: Failed to decode audio.")
+            return None
+        waveform, sr = result
 
-        # Add white noise (dynamic augmentation)
-        if noise_level > 0.0:
-            waveform = waveform + torch.randn_like(waveform) * noise_level
+    # Pad or truncate to exact duration if specified
+    if duration is not None:
+        target_length = int(duration * sample_rate)
+        current_length = waveform.shape[-1] if waveform.dim() > 0 else len(waveform)
 
-        return waveform
-        
-    except Exception as e:
-        # Return None for corrupted/unreadable files
-        print(f"Warning: Could not load {filepath}: {e}")
-        return None
+        if current_length < target_length:
+            # Pad with zeros
+            padding = target_length - current_length
+            waveform = torch.nn.functional.pad(waveform, (0, padding))
+        elif current_length > target_length:
+            # Truncate
+            waveform = waveform[:target_length]
+
+    # Apply z-normalization (standardization) if requested
+    # This ensures consistent amplitude across different recordings
+    if normalize:
+        mean = waveform.mean()
+        std = waveform.std()
+        # Avoid division by zero for silent audio
+        if std > 1e-8:
+            waveform = (waveform - mean) / std
+        else:
+            # Silent audio - just center at zero
+            waveform = waveform - mean
+
+    # Add white noise (dynamic augmentation)
+    if noise_level > 0.0:
+        waveform = waveform + torch.randn_like(waveform) * noise_level
+
+    return waveform
 
 
 def load_audio_batch(
@@ -374,9 +451,56 @@ def load_audio_file_with_jitter(
 
         return processed[0], processed[1]
 
-    except Exception as e:
-        print(f"Warning: Could not load {filepath} for augmentation: {e}")
-        return None, None
+    except Exception:
+        # Fallback to librosa for problematic files
+        # Load two views with slightly different offsets
+        import random
+
+        result1 = _load_with_librosa(str(filepath), sample_rate, duration, crop_position, mono)
+        if result1 is None:
+            print(f"Warning: Could not load {filepath} for augmentation: Failed to decode audio.")
+            return None, None
+
+        waveform1, _ = result1
+
+        # For view2, slightly shift the crop position
+        alt_position = "center" if crop_position == "end" else "end"
+        result2 = _load_with_librosa(str(filepath), sample_rate, duration, alt_position, mono)
+        if result2 is None:
+            # Use same view if alternate position fails
+            waveform2 = waveform1.clone()
+        else:
+            waveform2, _ = result2
+
+        # Process both waveforms
+        processed = []
+        for waveform in [waveform1, waveform2]:
+            # Pad or truncate to exact duration
+            target_length = int(duration * sample_rate)
+            current_length = waveform.shape[-1] if waveform.dim() > 0 else len(waveform)
+
+            if current_length < target_length:
+                padding = target_length - current_length
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+            elif current_length > target_length:
+                waveform = waveform[:target_length]
+
+            # Z-normalization
+            if normalize:
+                mean = waveform.mean()
+                std = waveform.std()
+                if std > 1e-8:
+                    waveform = (waveform - mean) / std
+                else:
+                    waveform = waveform - mean
+
+            # Add white noise (dynamic augmentation)
+            if noise_level > 0.0:
+                waveform = waveform + torch.randn_like(waveform) * noise_level
+
+            processed.append(waveform)
+
+        return processed[0], processed[1]
 
 
 def get_audio_info(filepath: str) -> Optional[dict]:

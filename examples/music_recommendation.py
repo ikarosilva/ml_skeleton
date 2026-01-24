@@ -1325,6 +1325,85 @@ def generate_recommendations(config: dict):
     print(f"  4. Repeat for continuous improvement!")
 
 
+def build_waveform_cache(config: dict):
+    """Pre-populate waveform cache for consistent training speed.
+
+    Iterates through all audio files once to ensure they are cached.
+    This eliminates variable iteration times during training caused by
+    cache misses when loading uncached files.
+
+    Args:
+        config: Configuration dictionary
+    """
+    from tqdm import tqdm
+    from ml_skeleton.music.clementine_db import ClementineDB
+    from ml_skeleton.music.audio_loader import load_audio_file
+    from ml_skeleton.music.dataset import SimSiamMusicDataset
+
+    music_config = config['music']
+
+    # Load database
+    print("\n[1/3] Loading song database...")
+    db = ClementineDB(music_config.get('database_path'))
+    all_songs = db.get_all_songs()
+    print(f"  Found {len(all_songs)} songs")
+
+    # Get cache settings from config
+    sample_rate = music_config.get('sample_rate', 16000)
+    duration = music_config.get('audio_duration', 60.0)
+    crop_position = music_config.get('crop_position', 'end')
+    normalize = music_config.get('normalize', True)
+    cache_dir = music_config.get('waveform_cache_dir', './cache')
+    cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
+
+    print(f"\n[2/3] Cache configuration:")
+    print(f"  Cache dir: {cache_dir}")
+    print(f"  Sample rate: {sample_rate} Hz")
+    print(f"  Duration: {duration}s")
+    print(f"  Crop position: {crop_position}")
+    print(f"  Max cache size: {cache_max_gb} GB")
+
+    # Create dataset to leverage its caching logic
+    print("\n[3/3] Building cache...")
+    print("  This iterates through all audio files to populate the cache.")
+    print("  Files that fail to load will be logged but won't stop the process.")
+    print("")
+
+    # Create dataset (this handles filtering and caching)
+    # Note: No augmentor needed for cache building - we just want to cache the raw waveforms
+    dataset = SimSiamMusicDataset(
+        songs=all_songs,
+        sample_rate=sample_rate,
+        duration=duration,
+        crop_position=crop_position,
+        normalize=normalize,
+        augmentor=None,  # No augmentation for cache building
+        skip_unknown_metadata=music_config.get('skip_unknown_metadata', True),
+        cache_dir=cache_dir,
+        cache_max_gb=cache_max_gb
+    )
+
+    # Iterate through dataset to populate cache
+    cached = 0
+    failed = 0
+    for i in tqdm(range(len(dataset)), desc="Caching audio files"):
+        try:
+            _ = dataset[i]
+            cached += 1
+        except Exception:
+            failed += 1
+
+    print(f"\n  Cached: {cached} files")
+    print(f"  Failed: {failed} files")
+    if cache_dir:
+        import os
+        cache_size = sum(
+            os.path.getsize(os.path.join(cache_dir, f))
+            for f in os.listdir(cache_dir) if f.endswith('.npy')
+        ) / (1024 ** 3)
+        print(f"  Cache size: {cache_size:.1f} GB")
+
+
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
@@ -1334,8 +1413,8 @@ def main():
         '--stage',
         type=str,
         required=True,
-        choices=['encoder', 'classifier', 'recommend', 'all', 'tune-encoder', 'tune-classifier'],
-        help='Training stage, recommendation generation, or hyperparameter tuning'
+        choices=['encoder', 'classifier', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache'],
+        help='Training stage, recommendation generation, cache building, or hyperparameter tuning'
     )
     parser.add_argument(
         '--config',
@@ -1464,6 +1543,19 @@ def main():
     elif args.stage == 'recommend':
         generate_recommendations(config)
         cleanup_memory()
+
+    elif args.stage == 'build-cache':
+        # Pre-populate waveform cache for consistent training speed
+        print("\n" + "=" * 80)
+        print("BUILDING WAVEFORM CACHE")
+        print("=" * 80)
+        print("Pre-populating cache to ensure consistent training iteration times.")
+        print("This avoids slowdowns during training when loading uncached files.")
+        print("")
+
+        build_waveform_cache(config)
+        cleanup_memory()
+        print("\nCache build complete! Training will now have consistent speed.")
 
     elif args.stage == 'all':
         # Run complete pipeline: encoder -> classifier -> model card

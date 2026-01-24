@@ -8,6 +8,7 @@
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #   ./run_music_pipeline.sh hpo              # Full hyperparameter optimization pipeline
+#   ./run_music_pipeline.sh build-cache      # Pre-populate waveform cache (faster training)
 #   ./run_music_pipeline.sh clear-cache      # Delete waveform cache (prompts for confirmation)
 #
 # A/B Testing (SimSiam vs Simple encoder):
@@ -156,6 +157,16 @@ run_recommend() {
     print_header "Stage 3: Generating Recommendations"
     python "$SCRIPT" --stage recommend --config "$CONFIG"
     print_success "Recommendations generated!"
+    echo ""
+}
+
+run_build_cache() {
+    print_header "Building Waveform Cache"
+    echo "Pre-populating cache to ensure consistent training speed..."
+    echo "This runs through all audio files once to cache resampled waveforms."
+    echo ""
+    python "$SCRIPT" --stage build-cache --config "$CONFIG"
+    print_success "Cache build complete!"
     echo ""
 }
 
@@ -385,6 +396,9 @@ main() {
         quick)
             run_quick_test
             ;;
+        build-cache)
+            run_build_cache
+            ;;
         hpo)
             run_hpo_pipeline
             ;;
@@ -421,6 +435,7 @@ main() {
             echo "  recommend   - Generate recommendations"
             echo "  quick       - Quick test (5 epochs, 500 songs)"
             echo "  hpo         - Full hyperparameter optimization"
+            echo "  build-cache - Pre-populate waveform cache (run before training for consistent speed)"
             echo "  clear-cache - Delete waveform cache (use when audio files change)"
             echo "  model-card  - Display model card"
             echo ""

@@ -344,7 +344,8 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
     """PyTorch Dataset for SimSiam self-supervised learning.
 
     Returns two augmented views of the same audio for contrastive learning.
-    Each view is converted to a mel-spectrogram for 2D CNN processing.
+    Waveforms are returned directly - mel-spectrogram conversion happens on GPU
+    in the encoder for much faster training.
 
     Args:
         songs: List of Song objects from Clementine DB
@@ -353,9 +354,9 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
         crop_position: Where to extract from - "start", "center", or "end"
         normalize: Apply z-normalization to waveform
         augmentor: AudioAugmentor instance for creating augmented views
-        n_mels: Number of mel frequency bins
-        n_fft: FFT window size
-        hop_length: Hop length for STFT
+        n_mels: Number of mel frequency bins (kept for compatibility, unused)
+        n_fft: FFT window size (kept for compatibility, unused)
+        hop_length: Hop length for STFT (kept for compatibility, unused)
         skip_unknown_metadata: If True, skip songs with all-unknown metadata
         speech_results: Optional speech detection scores for filtering
         speech_threshold: Threshold for speech filtering
@@ -380,14 +381,13 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
         cache_dir: Optional[str] = None,
         cache_max_gb: float = 140.0
     ):
-        import torchaudio.transforms as T
-
         super().__init__()
         self.sample_rate = sample_rate
         self.duration = duration
         self.crop_position = crop_position
         self.normalize = normalize
         self.augmentor = augmentor
+        # These are kept for compatibility but mel-spectrogram is computed on GPU
         self.n_mels = n_mels
         self.n_fft = n_fft
         self.hop_length = hop_length
@@ -400,14 +400,6 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             # Include settings in cache key to invalidate on config change
             self._cache_key = f"sr{sample_rate}_dur{duration}_{crop_position}_norm{normalize}"
-
-        # Create mel spectrogram transform
-        self.mel_transform = T.MelSpectrogram(
-            sample_rate=sample_rate,
-            n_mels=n_mels,
-            n_fft=n_fft,
-            hop_length=hop_length
-        )
 
         # Filter songs
         self.songs, self.filter_counts = self._filter_songs(
