@@ -59,6 +59,7 @@ music = [
     "torchaudio>=2.2.0",
     "librosa>=0.10.0",
     "numpy>=1.24.0",
+    "nnAudio>=0.3.2",
 ]
 all = [
     "torch>=2.2.0",
@@ -66,6 +67,7 @@ all = [
     "torchaudio>=2.2.0",
     "librosa>=0.10.0",
     "numpy>=1.24.0",
+    "nnAudio>=0.3.2",
     "tensorflow>=2.15.0",
     "ray[tune]>=2.9.0",
 ]

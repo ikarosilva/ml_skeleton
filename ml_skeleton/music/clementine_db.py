@@ -16,7 +16,8 @@ class Song:
     year: int
     rating: float  # -1 = unrated, 0.0-5.0 = rated (star rating scale)
     filename: str  # file:// URI
-    mtime: float = 0.0 # Last modification time, to be filled in later
+    genre: str = ""  # Genre string (may contain "/" for multi-genre, e.g. "Rock/Alternative")
+    mtime: float = 0.0  # Last modification time, to be filled in later
 
     @property
     def filepath(self) -> Path:
@@ -99,7 +100,7 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
         cursor = conn.cursor()
 
         # Query the songs table
-        # Clementine schema: ROWID, title, artist, album, year, rating, filename, mtime
+        # Clementine schema: ROWID, title, artist, album, year, rating, filename, genre, mtime
         # Rating: -1 = unrated, 0-1 = 0-5 stars (0.2 per star)
         query = """
             SELECT
@@ -110,6 +111,7 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
                 CAST(year AS INTEGER) as year,
                 CAST(rating AS REAL) as rating,
                 filename,
+                genre,
                 CAST(mtime AS REAL) as mtime
             FROM songs
             WHERE filename IS NOT NULL
@@ -121,7 +123,7 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
 
         songs = []
         for row in rows:
-            rowid, title, artist, album, year, rating, filename, mtime = row
+            rowid, title, artist, album, year, rating, filename, genre, mtime = row
 
             # Convert bytes to strings if needed (SQLite text_factory compatibility)
             def to_str(val):
@@ -145,6 +147,7 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
                 year=year or 0,
                 rating=rating_converted,
                 filename=to_str(filename) if filename else "",
+                genre=to_str(genre) if genre else "",
                 mtime=mtime or 0.0
             ))
 
@@ -180,6 +183,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
             year=2024,
             rating=4.0,  # 4 stars (0-5 scale)
             filename=f"file:///git/ml_skeleton/examples/placeholder_music.mp3",
+            genre="Rock/Alternative",
             mtime=1674259200.0
         ),
         Song(
@@ -190,6 +194,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
             year=2024,
             rating=-1,  # Unrated
             filename=f"file:///git/ml_skeleton/examples/placeholder_speech.mp3",
+            genre="",
             mtime=1674259200.0
         ),
         Song(
@@ -200,6 +205,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
             year=2024,
             rating=3.5,  # 3.5 stars (0-5 scale)
             filename=f"file:///git/ml_skeleton/examples/placeholder_long.mp3",
+            genre="Electronic/Dance",
             mtime=1674259200.0
         ),
     ]
@@ -219,6 +225,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
         random.seed(42)  # Reproducible dummy data
 
         artists = ["Artist A", "Artist B", "Artist C", "Artist D", "Artist E"]
+        genres = ["Rock", "Pop", "Electronic", "Hip-Hop", "Jazz", "Rock/Alternative", "Pop/Dance"]
         albums_per_artist = 5
 
         for i in range(4, min_songs + 1):
@@ -227,6 +234,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
 
             artist = artists[artist_idx % len(artists)]
             album = f"Album {album_idx + 1}"
+            genre = genres[i % len(genres)]
 
             # 80% rated, 20% unrated
             is_rated = random.random() < 0.8
@@ -240,6 +248,7 @@ def _generate_placeholder_songs(min_songs: int) -> List[Song]:
                 year=2020 + (i % 6),
                 rating=rating,
                 filename=f"file:///git/ml_skeleton/examples/placeholder_music.mp3",  # Reuse same file
+                genre=genre,
                 mtime=1674259200.0 + i
             ))
 

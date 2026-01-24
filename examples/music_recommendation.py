@@ -1328,17 +1328,14 @@ def generate_recommendations(config: dict):
 def build_waveform_cache(config: dict):
     """Pre-populate waveform cache for consistent training speed.
 
-    Iterates through all audio files once to ensure they are cached.
-    This eliminates variable iteration times during training caused by
-    cache misses when loading uncached files.
+    Supports two caching modes:
+    1. MoCo mode (chunk_cache enabled): 4 evenly-spaced 30s chunks per song
+    2. Legacy mode: Single crop from specified position
 
     Args:
         config: Configuration dictionary
     """
-    from tqdm import tqdm
     from ml_skeleton.music.clementine_db import ClementineDB
-    from ml_skeleton.music.audio_loader import load_audio_file
-    from ml_skeleton.music.dataset import SimSiamMusicDataset
 
     music_config = config['music']
 
@@ -1348,60 +1345,103 @@ def build_waveform_cache(config: dict):
     all_songs = db.get_all_songs()
     print(f"  Found {len(all_songs)} songs")
 
-    # Get cache settings from config
-    sample_rate = music_config.get('sample_rate', 16000)
-    duration = music_config.get('audio_duration', 60.0)
-    crop_position = music_config.get('crop_position', 'end')
-    normalize = music_config.get('normalize', True)
-    cache_dir = music_config.get('waveform_cache_dir', './cache')
-    cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
+    # Check if using MoCo chunk cache (new 4-chunk strategy)
+    chunk_cache_config = music_config.get('chunk_cache', {})
+    use_chunk_cache = chunk_cache_config.get('enabled', False)
 
-    print(f"\n[2/3] Cache configuration:")
-    print(f"  Cache dir: {cache_dir}")
-    print(f"  Sample rate: {sample_rate} Hz")
-    print(f"  Duration: {duration}s")
-    print(f"  Crop position: {crop_position}")
-    print(f"  Max cache size: {cache_max_gb} GB")
+    if use_chunk_cache:
+        # MoCo mode: Use new 4-chunk cache builder
+        from ml_skeleton.music.chunk_cache import build_chunk_cache, get_cache_stats
 
-    # Create dataset to leverage its caching logic
-    print("\n[3/3] Building cache...")
-    print("  This iterates through all audio files to populate the cache.")
-    print("  Files that fail to load will be logged but won't stop the process.")
-    print("")
+        cache_dir = chunk_cache_config.get('directory', './cache/chunks')
+        num_chunks = chunk_cache_config.get('num_chunks', 4)
+        chunk_duration = chunk_cache_config.get('chunk_duration', 30.0)
+        num_workers = chunk_cache_config.get('num_workers', None)  # None = 80% CPU
+        sample_rate = music_config.get('sample_rate', 16000)
+        max_duration = music_config.get('max_duration', 900.0)
 
-    # Create dataset (this handles filtering and caching)
-    # Note: No augmentor needed for cache building - we just want to cache the raw waveforms
-    dataset = SimSiamMusicDataset(
-        songs=all_songs,
-        sample_rate=sample_rate,
-        duration=duration,
-        crop_position=crop_position,
-        normalize=normalize,
-        augmentor=None,  # No augmentation for cache building
-        skip_unknown_metadata=music_config.get('skip_unknown_metadata', True),
-        cache_dir=cache_dir,
-        cache_max_gb=cache_max_gb
-    )
+        print(f"\n[2/3] MoCo Chunk Cache configuration:")
+        print(f"  Cache dir: {cache_dir}")
+        print(f"  Chunks per song: {num_chunks}")
+        print(f"  Chunk duration: {chunk_duration}s")
+        print(f"  Sample rate: {sample_rate} Hz")
+        print(f"  Max file duration: {max_duration}s")
+        print(f"  Workers: {num_workers if num_workers else 'auto (80% CPU)'}")
 
-    # Iterate through dataset to populate cache
-    cached = 0
-    failed = 0
-    for i in tqdm(range(len(dataset)), desc="Caching audio files"):
-        try:
-            _ = dataset[i]
-            cached += 1
-        except Exception:
-            failed += 1
+        print("\n[3/3] Building chunk cache...")
+        stats = build_chunk_cache(
+            songs=all_songs,
+            cache_dir=cache_dir,
+            num_chunks=num_chunks,
+            chunk_duration=chunk_duration,
+            sample_rate=sample_rate,
+            max_duration=max_duration,
+            num_workers=num_workers,
+            overwrite=False,
+            show_progress=True
+        )
 
-    print(f"\n  Cached: {cached} files")
-    print(f"  Failed: {failed} files")
-    if cache_dir:
-        import os
-        cache_size = sum(
-            os.path.getsize(os.path.join(cache_dir, f))
-            for f in os.listdir(cache_dir) if f.endswith('.npy')
-        ) / (1024 ** 3)
-        print(f"  Cache size: {cache_size:.1f} GB")
+        # Show final stats
+        final_stats = get_cache_stats(cache_dir)
+        print(f"\nCache complete:")
+        print(f"  Total songs: {final_stats['num_songs']}")
+        print(f"  Total files: {final_stats['num_files']}")
+        print(f"  Cache size: {final_stats['size_gb']:.1f} GB")
+
+    else:
+        # Legacy mode: Use original SimSiam caching
+        from tqdm import tqdm
+        from ml_skeleton.music.dataset import SimSiamMusicDataset
+
+        sample_rate = music_config.get('sample_rate', 16000)
+        duration = music_config.get('audio_duration', 60.0)
+        crop_position = music_config.get('crop_position', 'end')
+        normalize = music_config.get('normalize', True)
+        cache_dir = music_config.get('waveform_cache_dir', './cache')
+        cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
+
+        print(f"\n[2/3] Legacy Cache configuration:")
+        print(f"  Cache dir: {cache_dir}")
+        print(f"  Sample rate: {sample_rate} Hz")
+        print(f"  Duration: {duration}s")
+        print(f"  Crop position: {crop_position}")
+        print(f"  Max cache size: {cache_max_gb} GB")
+
+        print("\n[3/3] Building cache...")
+        print("  This iterates through all audio files to populate the cache.")
+        print("  Files that fail to load will be logged but won't stop the process.")
+        print("")
+
+        dataset = SimSiamMusicDataset(
+            songs=all_songs,
+            sample_rate=sample_rate,
+            duration=duration,
+            crop_position=crop_position,
+            normalize=normalize,
+            augmentor=None,
+            skip_unknown_metadata=music_config.get('skip_unknown_metadata', True),
+            cache_dir=cache_dir,
+            cache_max_gb=cache_max_gb
+        )
+
+        cached = 0
+        failed = 0
+        for i in tqdm(range(len(dataset)), desc="Caching audio files"):
+            try:
+                _ = dataset[i]
+                cached += 1
+            except Exception:
+                failed += 1
+
+        print(f"\n  Cached: {cached} files")
+        print(f"  Failed: {failed} files")
+        if cache_dir:
+            import os
+            cache_size = sum(
+                os.path.getsize(os.path.join(cache_dir, f))
+                for f in os.listdir(cache_dir) if f.endswith('.npy')
+            ) / (1024 ** 3)
+            print(f"  Cache size: {cache_size:.1f} GB")
 
 
 def main():

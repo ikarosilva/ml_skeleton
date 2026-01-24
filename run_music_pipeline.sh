@@ -1,19 +1,20 @@
 #!/bin/bash
-# Music Recommendation Pipeline Runner
+# Music Recommendation Pipeline Runner (MoCo v2 + Genre BCE)
 #
 # Usage:
 #   ./run_music_pipeline.sh all              # Run all 3 stages
-#   ./run_music_pipeline.sh encoder          # Run Stage 1 only
+#   ./run_music_pipeline.sh encoder          # Run Stage 1 only (MoCo v2 + Genre)
 #   ./run_music_pipeline.sh classifier       # Run Stage 2 only
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #   ./run_music_pipeline.sh hpo              # Full hyperparameter optimization pipeline
-#   ./run_music_pipeline.sh build-cache      # Pre-populate waveform cache (faster training)
+#   ./run_music_pipeline.sh build-cache      # Build 4-chunk waveform cache (~30GB)
 #   ./run_music_pipeline.sh clear-cache      # Delete waveform cache (prompts for confirmation)
 #
-# A/B Testing (SimSiam vs Simple encoder):
-#   ./run_music_pipeline.sh encoder --encoder-type simsiam   # Train with SimSiam encoder
-#   ./run_music_pipeline.sh all --encoder-type simple        # Train with Simple encoder
+# Architecture:
+#   Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D → 2048-dim
+#   ├── MoCo v2 contrastive head (queue=4096, τ=0.07)
+#   └── Genre BCE head (7 categories)
 #
 # VERSION COMPATIBILITY RULES:
 #   - Encoder and Classifier have SEPARATE versions
@@ -35,18 +36,16 @@
 #   CLEMENTINE_DB_PATH=/path/to/db           # Override database path
 #   HPO_ENCODER_TRIALS=30                    # Number of encoder HPO trials
 #   HPO_CLASSIFIER_TRIALS=20                 # Number of classifier HPO trials
-#   ENCODER_TYPE=simsiam                     # Override encoder type (simple or simsiam)
 #   RESUME_CHECKPOINT=/path/to/checkpoint    # Resume from previous training
 #   ENCODER_VERSION=v2                       # Encoder version for embeddings
 #   CLASSIFIER_VERSION=v2                    # Classifier version
 
 set -e  # Exit on error
 
-CONFIG="${CONFIG:-configs/music_recommendation.yaml}"
+CONFIG="${CONFIG:-configs/music_moco.yaml}"
 SCRIPT="examples/music_recommendation.py"
 HPO_ENCODER_TRIALS="${HPO_ENCODER_TRIALS:-30}"
 HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-20}"
-ENCODER_TYPE="${ENCODER_TYPE:-}"  # Optional: "simple" or "simsiam"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"  # Optional: path to checkpoint to resume from
 ENCODER_VERSION="${ENCODER_VERSION:-}"  # Optional: encoder version for embeddings (e.g., "v2")
 CLASSIFIER_VERSION="${CLASSIFIER_VERSION:-}"  # Optional: classifier version (e.g., "v2")
@@ -86,31 +85,32 @@ check_prerequisites() {
         exit 1
     fi
     print_success "Python found: $(python --version)"
-    
+
     if [ ! -f "$SCRIPT" ]; then
         print_error "Script not found: $SCRIPT"
         exit 1
     fi
     print_success "Script found: $SCRIPT"
-    
+
     if [ ! -f "$CONFIG" ]; then
         print_error "Config not found: $CONFIG"
         exit 1
     fi
     print_success "Config found: $CONFIG"
+
+    # Check for nnAudio
+    if python -c "import nnAudio" 2>/dev/null; then
+        print_success "nnAudio available"
+    else
+        print_warning "nnAudio not installed. Run: pip install nnAudio"
+    fi
     echo ""
 }
 
 run_encoder() {
     local extra_args="$1"
-    local encoder_type_arg=""
     local resume_arg=""
     local version_arg=""
-
-    # Add encoder type if specified
-    if [ -n "$ENCODER_TYPE" ]; then
-        encoder_type_arg="--encoder-type $ENCODER_TYPE"
-    fi
 
     # Add resume checkpoint if specified
     if [ -n "$RESUME_CHECKPOINT" ]; then
@@ -123,13 +123,16 @@ run_encoder() {
     fi
 
     # Print header with relevant info
-    local header="Stage 1: Training Audio Encoder"
-    [ -n "$ENCODER_TYPE" ] && header="$header (type: $ENCODER_TYPE)"
+    local header="Stage 1: Training MoCo v2 + Genre BCE Encoder"
     [ -n "$RESUME_CHECKPOINT" ] && header="$header [RESUMING from $RESUME_CHECKPOINT]"
     [ -n "$ENCODER_VERSION" ] && header="$header [encoder: $ENCODER_VERSION]"
     print_header "$header"
 
-    python "$SCRIPT" --stage encoder --config "$CONFIG" $encoder_type_arg $resume_arg $version_arg $extra_args
+    echo "Architecture: Audio → CQT → ResNet-50 2D → 2048-dim"
+    echo "Loss: 0.6×MoCo(NT-Xent) + 0.4×Genre_BCE"
+    echo ""
+
+    python "$SCRIPT" --stage encoder --config "$CONFIG" $resume_arg $version_arg $extra_args
     print_success "Encoder training complete!"
     echo ""
 }
@@ -161,9 +164,11 @@ run_recommend() {
 }
 
 run_build_cache() {
-    print_header "Building Waveform Cache"
-    echo "Pre-populating cache to ensure consistent training speed..."
-    echo "This runs through all audio files once to cache resampled waveforms."
+    print_header "Building 4-Chunk Waveform Cache"
+    echo "Pre-populating cache for fast training..."
+    echo "  - 4 chunks per song (evenly spaced)"
+    echo "  - 30 seconds per chunk at 16kHz"
+    echo "  - Estimated size: ~30GB for 60K songs"
     echo ""
     python "$SCRIPT" --stage build-cache --config "$CONFIG"
     print_success "Cache build complete!"
@@ -173,20 +178,20 @@ run_build_cache() {
 # HPO functions
 run_encoder_hpo() {
     local n_trials="${1:-$HPO_ENCODER_TRIALS}"
-    
+
     print_header "HPO Step 1: Encoder Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials (may take hours)..."
     echo ""
-    
+
     # Backup config
     cp "$CONFIG" "${CONFIG}.hpo_backup"
     print_success "Config backup: ${CONFIG}.hpo_backup"
-    
+
     # Run tuning
     HPO_LOG="/tmp/encoder_hpo.log"
     python "$SCRIPT" --stage tune-encoder --config "$CONFIG" \
         --n-trials "$n_trials" 2>&1 | tee "$HPO_LOG"
-    
+
     # Extract best params
     echo ""
     print_header "Best Encoder Parameters"
@@ -198,16 +203,16 @@ run_encoder_hpo() {
 
 run_classifier_hpo() {
     local n_trials="${1:-$HPO_CLASSIFIER_TRIALS}"
-    
+
     print_header "HPO Step 3: Classifier Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials..."
     echo ""
-    
+
     # Run tuning
     HPO_LOG="/tmp/classifier_hpo.log"
     python "$SCRIPT" --stage tune-classifier --config "$CONFIG" \
         --n-trials "$n_trials" 2>&1 | tee "$HPO_LOG"
-    
+
     # Extract best params
     echo ""
     print_header "Best Classifier Parameters"
@@ -233,9 +238,9 @@ run_hpo_pipeline() {
     print_header "FULL HYPERPARAMETER OPTIMIZATION PIPELINE"
     echo "Steps:"
     echo "  1. Tune encoder ($HPO_ENCODER_TRIALS trials × 20 epochs each)"
-    echo "  2. AUTOMATED: Train encoder with best parameters (50 epochs)"
+    echo "  2. AUTOMATED: Train encoder with best parameters (100 epochs)"
     echo "  3. Tune classifier ($HPO_CLASSIFIER_TRIALS trials × 20 epochs each)"
-    echo "  4. AUTOMATED: Train classifier with best parameters (50 epochs)"
+    echo "  4. AUTOMATED: Train classifier with best parameters (20 epochs)"
     echo "  5. Display model card"
     echo "  6. Generate recommendations"
     echo ""
@@ -246,10 +251,10 @@ run_hpo_pipeline() {
     # Step 1: Encoder HPO
     run_encoder_hpo "$HPO_ENCODER_TRIALS"
 
-    # Step 2: Train encoder with best params (50 epochs) - AUTOMATED
+    # Step 2: Train encoder with best params - AUTOMATED
     BEST_ENCODER_PARAMS="checkpoints/best_encoder_params.json"
     if [ -f "$BEST_ENCODER_PARAMS" ]; then
-        print_header "HPO Step 2: Training Encoder with Best Parameters (50 epochs)"
+        print_header "HPO Step 2: Training Encoder with Best Parameters (100 epochs)"
         print_success "Using best parameters from: $BEST_ENCODER_PARAMS"
         python "$SCRIPT" --stage encoder --config "$CONFIG" \
             --final-training --best-params "$BEST_ENCODER_PARAMS"
@@ -264,10 +269,10 @@ run_hpo_pipeline() {
     # Step 3: Classifier HPO
     run_classifier_hpo "$HPO_CLASSIFIER_TRIALS"
 
-    # Step 4: Train classifier with best params (50 epochs) - AUTOMATED
+    # Step 4: Train classifier with best params - AUTOMATED
     BEST_CLASSIFIER_PARAMS="checkpoints/best_classifier_params.json"
     if [ -f "$BEST_CLASSIFIER_PARAMS" ]; then
-        print_header "HPO Step 4: Training Classifier with Best Parameters (50 epochs)"
+        print_header "HPO Step 4: Training Classifier with Best Parameters (20 epochs)"
         print_success "Using best parameters from: $BEST_CLASSIFIER_PARAMS"
         python "$SCRIPT" --stage classifier --config "$CONFIG" \
             --final-training --best-params "$BEST_CLASSIFIER_PARAMS"
@@ -278,13 +283,13 @@ run_hpo_pipeline() {
         echo "Running classifier HPO should have created this file."
         exit 1
     fi
-    
+
     # Step 5: Model card
     display_model_card
-    
+
     # Step 6: Recommendations
     run_recommend
-    
+
     # Final summary
     print_header "HPO PIPELINE COMPLETE!"
     echo "Results:"
@@ -301,17 +306,18 @@ run_hpo_pipeline() {
 
 run_quick_test() {
     print_header "Quick Test Mode"
-    TEMP_CONFIG="/tmp/music_recommendation_quick.yaml"
+    TEMP_CONFIG="/tmp/music_moco_quick.yaml"
     cp "$CONFIG" "$TEMP_CONFIG"
+    sed -i 's/epochs: 100/epochs: 5/g' "$TEMP_CONFIG"
     sed -i 's/epochs: 50/epochs: 5/g' "$TEMP_CONFIG"
     sed -i 's/epochs: 20/epochs: 5/g' "$TEMP_CONFIG"
     print_success "Temp config: $TEMP_CONFIG"
     echo ""
-    
+
     CONFIG="$TEMP_CONFIG" run_encoder
     CONFIG="$TEMP_CONFIG" run_classifier
     CONFIG="$TEMP_CONFIG" run_recommend
-    
+
     print_success "Quick test complete!"
 }
 
@@ -323,14 +329,6 @@ main() {
     # Parse additional arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --encoder-type)
-                ENCODER_TYPE="$2"
-                shift 2
-                ;;
-            --encoder-type=*)
-                ENCODER_TYPE="${1#*=}"
-                shift
-                ;;
             --resume-checkpoint)
                 RESUME_CHECKPOINT="$2"
                 shift 2
@@ -425,22 +423,36 @@ main() {
         model-card)
             display_model_card
             ;;
+        cache-stats)
+            print_header "Cache Statistics"
+            python -c "
+from ml_skeleton.music.chunk_cache import get_cache_stats
+stats = get_cache_stats()
+if stats['exists']:
+    print(f'  Directory: {stats[\"cache_dir\"]}')
+    print(f'  Files: {stats[\"num_files\"]}')
+    print(f'  Songs: {stats[\"num_songs\"]}')
+    print(f'  Size: {stats[\"size_gb\"]:.2f} GB')
+else:
+    print('  No cache found')
+"
+            ;;
         *)
-            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|clear-cache|model-card} [options]"
+            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|build-cache|clear-cache|cache-stats|model-card} [options]"
             echo ""
             echo "Stages:"
-            echo "  all         - Run complete pipeline"
-            echo "  encoder     - Train audio encoder"
+            echo "  all         - Run complete pipeline (encoder + classifier + recommend)"
+            echo "  encoder     - Train MoCo v2 + Genre BCE encoder"
             echo "  classifier  - Train rating classifier"
             echo "  recommend   - Generate recommendations"
             echo "  quick       - Quick test (5 epochs, 500 songs)"
             echo "  hpo         - Full hyperparameter optimization"
-            echo "  build-cache - Pre-populate waveform cache (run before training for consistent speed)"
-            echo "  clear-cache - Delete waveform cache (use when audio files change)"
+            echo "  build-cache - Build 4-chunk waveform cache (~30GB)"
+            echo "  clear-cache - Delete waveform cache"
+            echo "  cache-stats - Show cache statistics"
             echo "  model-card  - Display model card"
             echo ""
             echo "Options:"
-            echo "  --encoder-type TYPE        - Encoder type: 'simple' or 'simsiam' (A/B testing)"
             echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
             echo "  --encoder-version VERSION  - Encoder version for embeddings (e.g., v2)"
             echo "  --classifier-version VER   - Classifier version (e.g., v2)"
@@ -448,34 +460,26 @@ main() {
             echo "Environment Variables:"
             echo "  HPO_ENCODER_TRIALS=30"
             echo "  HPO_CLASSIFIER_TRIALS=20"
-            echo "  ENCODER_TYPE=simsiam        - Override encoder type"
             echo "  RESUME_CHECKPOINT=/path/to  - Resume from checkpoint"
             echo "  ENCODER_VERSION=v2          - Encoder version for embeddings"
             echo "  CLASSIFIER_VERSION=v2       - Classifier version"
             echo ""
+            echo "Architecture:"
+            echo "  Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D"
+            echo "  ├── MoCo v2 head (queue=4096, τ=0.07)"
+            echo "  └── Genre BCE head (7 categories)"
+            echo ""
             echo "Examples:"
-            echo "  $0 all                          # Run with default (simple) encoder"
-            echo "  $0 encoder --encoder-type simsiam  # Train with SimSiam encoder"
-            echo "  ENCODER_TYPE=simsiam $0 all     # Train with SimSiam via env var"
-            echo "  HPO_ENCODER_TRIALS=50 $0 hpo    # Run HPO with 50 encoder trials"
+            echo "  $0 build-cache                 # Build cache first (recommended)"
+            echo "  $0 all                         # Run complete pipeline"
+            echo "  $0 encoder                     # Train encoder only"
+            echo "  HPO_ENCODER_TRIALS=50 $0 hpo   # Run HPO with 50 encoder trials"
             echo ""
             echo "Version Compatibility Rules:"
             echo "  - Encoder and Classifier have SEPARATE versions"
             echo "  - Classifier stores which encoder version it was trained with"
             echo "  - If Encoder is updated, Classifier MUST be retrained"
             echo "  - Deployment (recommend) FAILS if versions don't match"
-            echo ""
-            echo "Resume/Incremental Training Examples:"
-            echo "  # Train v1 (initial training)"
-            echo "  $0 all"
-            echo ""
-            echo "  # Update classifier only (encoder unchanged)"
-            echo "  $0 classifier --classifier-version v2"
-            echo ""
-            echo "  # Update encoder (requires new classifier)"
-            echo "  $0 encoder --resume-checkpoint checkpoints/encoder_best.pt --encoder-version v2"
-            echo "  $0 classifier --classifier-version v1  # New classifier for encoder v2"
-            echo "  $0 recommend"
             exit 1
             ;;
     esac

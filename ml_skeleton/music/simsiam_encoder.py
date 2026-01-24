@@ -25,6 +25,9 @@ import torch
 import torch.nn as nn
 import torchaudio.transforms as T
 from torchvision import models
+from typing import Optional
+
+from ml_skeleton.music.augmentations import SpecAugment
 
 
 class ProjectionMLP(nn.Module):
@@ -162,6 +165,8 @@ class SimSiamEncoder(nn.Module):
         n_mels: Number of mel frequency bins
         n_fft: FFT window size
         hop_length: Hop length for STFT
+        spec_augment: If True, apply SpecAugment on the GPU
+        spec_augment_params: Parameters for SpecAugment
     """
 
     def __init__(
@@ -175,7 +180,9 @@ class SimSiamEncoder(nn.Module):
         predictor_hidden_dim: int = 512,
         n_mels: int = 128,
         n_fft: int = 2048,
-        hop_length: int = 512
+        hop_length: int = 512,
+        spec_augment: bool = True,
+        spec_augment_params: Optional[dict] = None
     ):
         super().__init__()
 
@@ -191,6 +198,13 @@ class SimSiamEncoder(nn.Module):
             n_fft=n_fft,
             hop_length=hop_length
         )
+
+        # SpecAugment (on-GPU)
+        if spec_augment:
+            params = spec_augment_params or {}
+            self.spec_augment = SpecAugment(**params)
+        else:
+            self.spec_augment = None
 
         # Create backbone
         self.backbone, backbone_dim = self._create_backbone(backbone, pretrained)
@@ -267,6 +281,10 @@ class SimSiamEncoder(nn.Module):
 
         # Log scale
         mel_spec = torch.log(mel_spec + 1e-9)
+        
+        # Apply SpecAugment if enabled
+        if self.spec_augment is not None and self.training:
+            mel_spec = self.spec_augment(mel_spec)
 
         # Normalize to [0, 1]
         mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-9)

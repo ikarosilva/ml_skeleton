@@ -559,12 +559,12 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
             pass  # Silently fail on cache write errors
 
     def __getitem__(self, idx: int) -> dict:
-        """Load audio and return two augmented spectrogram views.
+        """Load audio and return two augmented waveform views.
 
         Returns:
             Dictionary with:
-            - view1: First augmented spectrogram, shape (3, n_mels, time)
-            - view2: Second augmented spectrogram, shape (3, n_mels, time)
+            - view1: First augmented waveform
+            - view2: Second augmented waveform
             - filename: Song filename
         """
         song = self.songs[idx]
@@ -602,42 +602,11 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
             view1_waveform = audio
             view2_waveform = audio
 
-        # Convert to mel-spectrograms
-        view1_spec = self._waveform_to_spec(view1_waveform)
-        view2_spec = self._waveform_to_spec(view2_waveform)
-
         return {
-            "view1": view1_spec,
-            "view2": view2_spec,
+            "view1": view1_waveform,
+            "view2": view2_waveform,
             "filename": song.filename
         }
-
-    def _waveform_to_spec(self, waveform: torch.Tensor) -> torch.Tensor:
-        """Convert waveform to mel-spectrogram suitable for ResNet.
-
-        Args:
-            waveform: Audio waveform, shape (num_samples,) or (1, num_samples)
-
-        Returns:
-            Mel-spectrogram repeated to 3 channels, shape (3, n_mels, time)
-        """
-        # Ensure 2D for mel transform
-        if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)
-
-        # Convert to mel-spectrogram: (1, n_mels, time)
-        mel_spec = self.mel_transform(waveform)
-
-        # Log scale (more perceptually meaningful)
-        mel_spec = torch.log(mel_spec + 1e-9)
-
-        # Normalize to [0, 1] range for better ResNet compatibility
-        mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-9)
-
-        # Repeat to 3 channels for ResNet (pretrained on RGB images)
-        mel_spec = mel_spec.repeat(3, 1, 1)
-
-        return mel_spec
 
 
 def simsiam_collate_fn(batch: list[dict]) -> dict:
@@ -648,8 +617,8 @@ def simsiam_collate_fn(batch: list[dict]) -> dict:
 
     Returns:
         Batched dictionary with:
-        - view1: Stacked tensor (batch_size, 3, n_mels, time)
-        - view2: Stacked tensor (batch_size, 3, n_mels, time)
+        - view1: Stacked tensor (batch_size, num_samples)
+        - view2: Stacked tensor (batch_size, num_samples)
         - filename: List of strings
     """
     view1_list = []
@@ -661,16 +630,9 @@ def simsiam_collate_fn(batch: list[dict]) -> dict:
         view2_list.append(item["view2"])
         filename_list.append(item["filename"])
 
-    # Stack spectrograms (need to handle variable time dimension)
-    # Find min time dimension and crop all to that size
-    min_time = min(v.shape[2] for v in view1_list)
-
-    view1_cropped = [v[:, :, :min_time] for v in view1_list]
-    view2_cropped = [v[:, :, :min_time] for v in view2_list]
-
     return {
-        "view1": torch.stack(view1_cropped),
-        "view2": torch.stack(view2_cropped),
+        "view1": torch.stack(view1_list),
+        "view2": torch.stack(view2_list),
         "filename": filename_list
     }
 

@@ -1,0 +1,192 @@
+# MoCo v2 + Genre BCE Music Encoder Configuration
+#
+# Architecture:
+#   Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D → 2048-dim
+#   ├── MoCo v2 contrastive head (queue=4096, τ=0.07)
+#   └── Genre BCE head (7 categories)
+#
+# Training:
+#   Phase 1: Encoder (MoCo + Genre BCE) - 100 epochs
+#   Phase 2: Rating Classifier - 20 epochs
+
+name: "music_moco"
+description: "MoCo v2 + Genre BCE music encoder with CQT spectrograms"
+framework: "pytorch"
+
+tags:
+  project: "music_recommendation"
+  version: "2.0"
+  encoder: "moco_v2"
+
+# Music-specific configuration (matches existing script expectations)
+music:
+  # Clementine database path
+  database_path: "/Music/database/clementine_backup_2026-01.db"
+
+  # Embedding storage (SQLite)
+  embedding_db_path: "./embeddings.db"
+
+  # Model versioning
+  encoder_version: "v1"
+  classifier_version: "v1"
+
+  # Audio loading parameters
+  sample_rate: 16000
+  audio_duration: 30.0  # 30s chunks (4 per song)
+  crop_position: "center"  # Not used for MoCo (chunks are evenly spaced)
+  normalize: true
+  max_duration: 900.0  # Skip files >15 minutes
+
+  # Chunk cache configuration (NEW: 4 chunks per song)
+  chunk_cache:
+    enabled: true
+    directory: "./cache/chunks"
+    num_chunks: 4
+    chunk_duration: 30.0
+    num_workers: 12  # Limit workers for cache building
+
+  # Waveform caching (legacy, kept for compatibility)
+  waveform_cache_dir: "./cache/chunks"
+  waveform_cache_max_gb: 40
+
+  # Multiprocessing
+  num_workers: 8  # null = 80% of CPU cores
+  dataloader_workers: 8
+
+  # Dataset filtering
+  only_rated: false
+  train_split: 0.8
+  skip_unknown_metadata: true
+
+# CQT transform configuration (nnAudio)
+cqt:
+  n_bins: 84          # 7 octaves × 12 semitones
+  fmin: 32.7          # C1
+  hop_length: 512
+
+# Stage 1: MoCo v2 + Genre BCE Encoder
+encoder:
+  encoder_type: "moco"  # Changed from "simsiam" to "moco"
+
+  # Backbone
+  backbone: "resnet50"
+  pretrained_backbone: true
+  embedding_dim: 2048
+
+  # MoCo v2 settings
+  moco:
+    queue_size: 4096
+    momentum: 0.999
+    temperature: 0.07
+    projection_dim: 128
+
+  # Genre head
+  genre:
+    num_categories: 7
+    # Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world
+
+  # Loss weights
+  loss_weights:
+    moco: 0.6
+    genre_bce: 0.4
+
+  # Training
+  epochs: 100
+  final_training_epochs: 100
+  batch_size: 128
+  learning_rate: 0.0003
+
+  # Optimizer
+  optimizer: "adam"
+  scheduler: "cosine"
+  adam_weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_eps: 1.0e-08
+
+  # Early stopping
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0001
+
+  # Augmentation
+  augmentation:
+    crop_duration_min: 5.0
+    crop_duration_max: 15.0
+    gain_db_min: -2.0
+    gain_db_max: 2.0
+    noise_prob: 0.5
+    noise_snr_min: 25.0
+    noise_snr_max: 35.0
+    mixup_prob: 0.5
+    mixup_alpha: 0.1
+    same_album_positive_prob: 0.3
+
+  # Legacy settings (kept for compatibility)
+  base_channels: 32
+  loss_type: "moco_genre"
+  use_augmentation: true
+  crop_jitter: 5.0
+  noise_level: 0.005
+
+# Stage 2: Classifier training
+classifier:
+  hidden_dims: [512, 256, 128]
+  dropout: 0.3
+  use_batch_norm: false
+
+  epochs: 20
+  final_training_epochs: 20
+  batch_size: 256
+  learning_rate: 0.001
+
+  optimizer: "adam"
+  scheduler: "cosine"
+  adam_weight_decay: 0.0001
+  adam_betas: [0.9, 0.999]
+  adam_eps: 1.0e-08
+
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0001
+
+  loss_type: "mse"
+
+  # Rating normalization: 0-5 → 0-1
+  rating_scale: 5.0
+
+# MLflow configuration
+mlflow:
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "music_moco"
+  artifact_location: "./mlruns"
+  backend_store_uri: "sqlite:///mlflow.db"
+  auto_start: true
+
+# Hyperparameter tuning
+tuning:
+  tuner_type: "optuna"
+  n_trials: 30
+  timeout: null
+  sampler: "TPESampler"
+  pruner: "MedianPruner"
+
+# Reproducibility
+seed: 42
+deterministic: true
+
+# Device configuration
+device: "cuda"
+gpu_memory_limit_gb: 30
+precision: "bf16-mixed"
+
+# Paths
+checkpoint_dir: "./checkpoints"
+artifact_dir: "./artifacts"
+
+# Recommendation generation
+recommendations:
+  top_n: 100
+  output_format: "xspf"
+  output_path: "./recommendations.txt"
+  output_dir: "/Music/recommendations"
+  min_rating_threshold: 0.6
+  human_feedback_uncertain: 100
+  human_feedback_best: 50
