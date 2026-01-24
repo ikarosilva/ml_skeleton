@@ -438,12 +438,12 @@ See training sections above for validation losses.
 
 ```python
 import torch
-from ml_skeleton.music.baseline_encoder import SimpleAudioEncoder
+from ml_skeleton.music.simsiam_encoder import SimSiamEncoder
 from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
 from ml_skeleton.music.audio_loader import load_audio_file
 
 # Load models
-encoder = SimpleAudioEncoder(sample_rate=16000, embedding_dim=512)
+encoder = SimSiamEncoder(sample_rate=16000, embedding_dim=512)
 encoder.load_state_dict(torch.load('checkpoints/encoder_best.pt'))
 encoder.eval()
 

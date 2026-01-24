@@ -15,6 +15,7 @@ import time
 from ..music.embedding_store import EmbeddingStore
 from ..music.audio_loader import load_audio_file
 from ..utils.early_stopping import EarlyStopping
+from ..utils.gpu import GPUMonitor
 
 
 class EncoderTrainer:
@@ -62,6 +63,9 @@ class EncoderTrainer:
             "train_loss": [],
             "val_loss": []
         }
+
+        # GPU monitoring (samples utilization during training)
+        self.gpu_monitor = GPUMonitor() if device == "cuda" else None
 
     def train_epoch(
         self,
@@ -185,15 +189,26 @@ class EncoderTrainer:
             total_loss += loss.item()
             num_batches += 1
 
+            # Sample GPU utilization every 10 batches
+            if self.gpu_monitor and num_batches % 10 == 0:
+                self.gpu_monitor.sample()
+
             # Update progress bar
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = total_loss / num_batches
         self.history["train_loss"].append(avg_loss)
 
+        # Get GPU stats for this epoch
+        gpu_stats = {}
+        if self.gpu_monitor:
+            gpu_stats = self.gpu_monitor.get_stats()
+            self.gpu_monitor.reset()
+
         return {
             "loss": avg_loss,
-            "num_batches": num_batches
+            "num_batches": num_batches,
+            "gpu_stats": gpu_stats
         }
 
     def validate(
@@ -315,14 +330,15 @@ class EncoderTrainer:
         save_best_only: bool = True,
         early_stopping_patience: Optional[int] = None,
         early_stopping_min_delta: float = 0.0,
-        verbose: bool = True
+        verbose: bool = True,
+        start_epoch: int = 0
     ) -> dict:
         """Full training loop with optional early stopping.
 
         Args:
             train_loader: Training data loader
             val_loader: Optional validation data loader
-            num_epochs: Number of epochs to train
+            num_epochs: Number of epochs to train (total, not additional)
             checkpoint_dir: Directory to save checkpoints
             use_multi_task: If True, uses multi-task loss
             use_augmentation: If True, expects dual audio views for contrastive learning
@@ -332,6 +348,8 @@ class EncoderTrainer:
                                      (None = no early stopping)
             early_stopping_min_delta: Minimum improvement to count as progress
             verbose: If True, print setup info (device, checkpoint dir, etc.)
+            start_epoch: Epoch to start training from (for resuming). If 0, uses
+                        self.current_epoch if checkpoint was loaded.
 
         Returns:
             Dictionary with training history
@@ -351,12 +369,20 @@ class EncoderTrainer:
             if verbose:
                 print(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
 
+        # Determine starting epoch (for resuming from checkpoint)
+        actual_start = start_epoch if start_epoch > 0 else self.current_epoch
+        remaining_epochs = num_epochs - actual_start
+
         if verbose:
-            print(f"Training encoder for up to {num_epochs} epochs")
+            if actual_start > 0:
+                print(f"Resuming encoder training from epoch {actual_start + 1}/{num_epochs}")
+                print(f"  {remaining_epochs} epochs remaining")
+            else:
+                print(f"Training encoder for up to {num_epochs} epochs")
             print(f"Device: {self.device}")
             print(f"Checkpoint dir: {checkpoint_dir}")
 
-        for epoch in range(num_epochs):
+        for epoch in range(actual_start, num_epochs):
             self.current_epoch = epoch
             start_time = time.time()
 
@@ -376,12 +402,22 @@ class EncoderTrainer:
             if val_metrics:
                 print(f"  Val Loss: {val_metrics['loss']:.4f}")
 
+            # Print GPU stats if available
+            gpu_stats = train_metrics.get('gpu_stats', {})
+            if gpu_stats:
+                print(f"  GPU Util: {gpu_stats.get('gpu_util_avg', 0):.1f}% avg "
+                      f"(min={gpu_stats.get('gpu_util_min', 0):.0f}%, max={gpu_stats.get('gpu_util_max', 0):.0f}%)")
+
             # Log metrics to MLflow for learning curves
             if self.tracker is not None:
                 self.tracker.log_metric('encoder/train_loss', train_metrics['loss'], step=epoch)
                 if val_metrics:
                     self.tracker.log_metric('encoder/val_loss', val_metrics['loss'], step=epoch)
                 self.tracker.log_metric('encoder/epoch_time', epoch_time, step=epoch)
+                # Log GPU metrics
+                if gpu_stats:
+                    self.tracker.log_metric('encoder/gpu_util_avg', gpu_stats.get('gpu_util_avg', 0), step=epoch)
+                    self.tracker.log_metric('encoder/memory_used_gb', gpu_stats.get('memory_used_avg_gb', 0), step=epoch)
 
             # Save checkpoint
             current_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
@@ -394,10 +430,18 @@ class EncoderTrainer:
                     print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
                     break
 
+            # Versioned checkpoint naming (e.g., encoder_v2_best.pt)
+            version_suffix = f"_{self.model_version}" if self.model_version != "default" else ""
+
             if save_best_only:
                 # Save only if this is the best model (either by early stopping or manual check)
                 if early_stop and early_stop.should_save_checkpoint():
                     self.best_loss = current_loss
+                    self.save_checkpoint(
+                        checkpoint_dir / f"encoder{version_suffix}_best.pt",
+                        metrics={"loss": current_loss, "epoch": epoch}
+                    )
+                    # Also save as encoder_best.pt for backwards compatibility
                     self.save_checkpoint(
                         checkpoint_dir / "encoder_best.pt",
                         metrics={"loss": current_loss, "epoch": epoch}
@@ -406,17 +450,27 @@ class EncoderTrainer:
                 elif not early_stop and current_loss < self.best_loss:
                     self.best_loss = current_loss
                     self.save_checkpoint(
+                        checkpoint_dir / f"encoder{version_suffix}_best.pt",
+                        metrics={"loss": current_loss, "epoch": epoch}
+                    )
+                    # Also save as encoder_best.pt for backwards compatibility
+                    self.save_checkpoint(
                         checkpoint_dir / "encoder_best.pt",
                         metrics={"loss": current_loss, "epoch": epoch}
                     )
                     print(f"  Saved best model (loss: {current_loss:.4f})")
             else:
                 self.save_checkpoint(
-                    checkpoint_dir / f"encoder_epoch_{epoch + 1}.pt",
+                    checkpoint_dir / f"encoder{version_suffix}_epoch_{epoch + 1}.pt",
                     metrics={"loss": current_loss, "epoch": epoch}
                 )
 
-        # Save final model
+        # Save final model (versioned and backwards-compatible)
+        version_suffix = f"_{self.model_version}" if self.model_version != "default" else ""
+        self.save_checkpoint(
+            checkpoint_dir / f"encoder{version_suffix}_final.pt",
+            metrics={"epoch": num_epochs}
+        )
         self.save_checkpoint(
             checkpoint_dir / "encoder_final.pt",
             metrics={"epoch": num_epochs}
@@ -446,7 +500,8 @@ class EncoderTrainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "epoch": self.current_epoch,
             "history": self.history,
-            "model_version": self.model_version,
+            "encoder_version": self.model_version,  # Explicit encoder version
+            "model_version": self.model_version,  # Backwards compatibility
             "sample_rate": self.encoder.sample_rate
         }
 

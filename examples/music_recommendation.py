@@ -49,15 +49,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ml_skeleton.music.clementine_db import ClementineDB
 from ml_skeleton.music.dataset import MusicDataset, EmbeddingDataset, music_collate_fn
 from ml_skeleton.music.embedding_store import EmbeddingStore
-from ml_skeleton.music.losses import (
-    RatingLoss,
-    MultiTaskLoss,
-    NTXentLoss,
-    SupervisedContrastiveLoss,
-    MetadataContrastiveLoss,
-    build_album_mapping
-)
-from ml_skeleton.music.baseline_encoder import SimpleAudioEncoder, MultiTaskEncoder
+from ml_skeleton.music.losses import RatingLoss, build_album_mapping
 from ml_skeleton.music.encoder_factory import (
     create_encoder,
     create_loss_fn,
@@ -70,7 +62,11 @@ from ml_skeleton.music.augmentations import create_audio_augmentor
 from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
 from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists
 from ml_skeleton.training.encoder_trainer import EncoderTrainer
-from ml_skeleton.training.classifier_trainer import ClassifierTrainer
+from ml_skeleton.training.classifier_trainer import (
+    ClassifierTrainer,
+    get_encoder_version_from_checkpoint,
+    validate_model_compatibility
+)
 from ml_skeleton.music.model_card import ModelCardGenerator
 from ml_skeleton.music.dataset_stats import (
     collect_preprocessing_stats,
@@ -318,7 +314,9 @@ def train_encoder(
     final_training: bool = False,
     skip_embeddings: bool = False,
     trial_info: tuple[int, int] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    resume_checkpoint: str = None,
+    model_version_override: str = None
 ):
     """Stage 1: Train audio encoder.
 
@@ -329,6 +327,8 @@ def train_encoder(
         skip_embeddings: If True, skip embedding extraction (useful during HPO)
         trial_info: Optional tuple of (trial_number, n_trials) for HPO logging
         verbose: If True, print detailed setup info (set False during HPO to reduce noise)
+        resume_checkpoint: Path to checkpoint to resume training from
+        model_version_override: Override model version for embeddings (e.g., 'v2')
 
     Returns:
         ModelCardGenerator with encoder statistics
@@ -441,6 +441,12 @@ def train_encoder(
         simsiam_config = encoder_config.get('simsiam', {})
         augmentor = create_audio_augmentor(simsiam_config.get('augmentation', {}))
 
+        # Waveform cache for faster loading (skips audio decode + resample)
+        cache_dir = music_config.get('waveform_cache_dir')
+        cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
+        if verbose and cache_dir:
+            print(f"  Waveform cache: {cache_dir} (max {cache_max_gb} GB)")
+
         full_dataset = SimSiamMusicDataset(
             songs=all_songs,
             sample_rate=music_config['sample_rate'],
@@ -451,7 +457,9 @@ def train_encoder(
             augmentor=augmentor,
             n_mels=simsiam_config.get('n_mels', 128),
             n_fft=simsiam_config.get('n_fft', 2048),
-            hop_length=simsiam_config.get('hop_length', 512)
+            hop_length=simsiam_config.get('hop_length', 512),
+            cache_dir=cache_dir,
+            cache_max_gb=cache_max_gb
         )
         if verbose:
             print(f"  Using SimSiamMusicDataset with dual views")
@@ -513,7 +521,7 @@ def train_encoder(
         'collate_fn': collate_fn,
     }
     if num_workers > 0:
-        loader_kwargs['prefetch_factor'] = 4
+        loader_kwargs['prefetch_factor'] = 8  # Increased for better GPU utilization
         loader_kwargs['persistent_workers'] = True
 
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
@@ -526,33 +534,14 @@ def train_encoder(
     if verbose:
         print("\n[4/7] Creating encoder model...")
 
-    if use_simsiam:
-        # Use factory to create SimSiam encoder
-        encoder = create_encoder(config)
-        if verbose:
-            print(f"  Using SimSiamEncoder")
-            simsiam_config = encoder_config.get('simsiam', {})
-            print(f"  Backbone: {simsiam_config.get('backbone', 'resnet50')}")
-            print(f"  Projection dim: {simsiam_config.get('projection_dim', 2048)}")
-            print(f"  Predictor hidden dim: {simsiam_config.get('predictor_hidden_dim', 512)}")
-    else:
-        # Simple encoder (original path)
-        base_encoder = SimpleAudioEncoder(
-            sample_rate=music_config['sample_rate'],
-            duration=music_config['audio_duration'],
-            embedding_dim=encoder_config['embedding_dim'],
-            base_channels=encoder_config.get('base_channels', 32)
-        )
-
-        # Optionally wrap with multi-task encoder
-        if use_multi_task:
-            encoder = MultiTaskEncoder(base_encoder, num_albums=len(album_to_idx))
-            if verbose:
-                print(f"  Using MultiTaskEncoder with {len(album_to_idx)} albums")
-        else:
-            encoder = base_encoder
-            if verbose:
-                print(f"  Using SimpleAudioEncoder")
+    # Create SimSiam encoder using factory
+    encoder = create_encoder(config)
+    if verbose:
+        print(f"  Using SimSiamEncoder")
+        simsiam_config = encoder_config.get('simsiam', {})
+        print(f"  Backbone: {simsiam_config.get('backbone', 'resnet50')}")
+        print(f"  Projection dim: {simsiam_config.get('projection_dim', 2048)}")
+        print(f"  Predictor hidden dim: {simsiam_config.get('predictor_hidden_dim', 512)}")
 
     if verbose:
         print(f"  Embedding dim: {encoder.get_embedding_dim()}")
@@ -561,64 +550,13 @@ def train_encoder(
     if verbose:
         print("\n[5/7] Creating loss function...")
 
-    if use_simsiam:
-        # Use factory for SimSiam loss
-        from ml_skeleton.music.losses import SimSiamLoss
-        loss_fn = SimSiamLoss()
-        if verbose:
-            print(f"  Using SimSiamLoss (self-supervised)")
-            print(f"    - No negative pairs needed")
-            print(f"    - Stop-gradient prevents collapse")
-    else:
-        # Original loss selection for simple encoder
-        loss_type = encoder_config.get('loss_type', 'supervised_contrastive')
-
-        # When augmentation is enabled, use NTXentLoss for guaranteed positive pairs
-        if use_augmentation:
-            loss_fn = NTXentLoss(
-                temperature=encoder_config.get('contrastive_temperature', 0.5)
-            )
-            if verbose:
-                print(f"  Using NTXentLoss (augmentation-based contrastive learning)")
-                print(f"    - Positive pairs: same song with different crops")
-                print(f"    - Temperature: {encoder_config.get('contrastive_temperature', 0.5)}")
-        elif use_multi_task:
-            loss_fn = MultiTaskLoss(
-                rating_weight=1.0,
-                album_weight=music_config.get('album_weight', 0.5)
-            )
-            if verbose:
-                print(f"  Using MultiTaskLoss")
-        elif loss_type == 'metadata_contrastive':
-            loss_fn = MetadataContrastiveLoss(
-                temperature=encoder_config.get('contrastive_temperature', 0.5),
-                year_threshold=encoder_config.get('year_threshold', 5),
-                use_artist=encoder_config.get('use_artist', True),
-                use_album=encoder_config.get('use_album', True),
-                use_year=encoder_config.get('use_year', True)
-            )
-            if verbose:
-                print(f"  Using MetadataContrastiveLoss (no rating info!)")
-                print(f"    - Artist matching: {encoder_config.get('use_artist', True)}")
-                print(f"    - Album matching: {encoder_config.get('use_album', True)}")
-                print(f"    - Year matching: {encoder_config.get('use_year', True)} (±{encoder_config.get('year_threshold', 5)} years)")
-        elif loss_type == 'supervised_contrastive':
-            loss_fn = SupervisedContrastiveLoss(
-                temperature=encoder_config.get('contrastive_temperature', 0.5),
-                rating_threshold=encoder_config.get('rating_threshold', 0.2)
-            )
-            if verbose:
-                print(f"  Using SupervisedContrastiveLoss (WARNING: uses rating info!)")
-        elif loss_type == 'contrastive':
-            loss_fn = NTXentLoss(
-                temperature=encoder_config.get('contrastive_temperature', 0.5)
-            )
-            if verbose:
-                print(f"  Using NTXentLoss")
-        else:
-            loss_fn = nn.MSELoss()
-            if verbose:
-                print(f"  Using MSELoss (WARNING: uses rating info!)")
+    # SimSiam loss
+    from ml_skeleton.music.losses import SimSiamLoss
+    loss_fn = SimSiamLoss()
+    if verbose:
+        print(f"  Using SimSiamLoss (self-supervised)")
+        print(f"    - No negative pairs needed")
+        print(f"    - Stop-gradient prevents collapse")
 
     # Create optimizer with full Adam parameters
     # Handle betas - can be list from config or separate beta1/beta2 from HPO
@@ -659,19 +597,37 @@ def train_encoder(
         print(f"    Total artists: {dataset_stats['total_artists']}")
         print(f"    Total albums: {dataset_stats['total_albums']}")
 
+    # Apply model version override if provided
+    model_version = model_version_override if model_version_override else music_config['model_version']
+
     # Create trainer
     if verbose:
         print("\n[6/7] Creating trainer...")
-    
+
     trainer = EncoderTrainer(
         encoder=encoder,
         device=device,
         loss_fn=loss_fn,
         optimizer=optimizer,
         embedding_store=embedding_store,
-        model_version=music_config['model_version'],
+        model_version=model_version,
         tracker=tracker  # Pass tracker for MLflow learning curves
     )
+
+    # Load checkpoint if resuming from previous training
+    start_epoch = 0
+    if resume_checkpoint:
+        checkpoint_path = Path(resume_checkpoint)
+        if checkpoint_path.exists():
+            print(f"\n  Resuming from checkpoint: {resume_checkpoint}")
+            trainer.load_checkpoint(checkpoint_path)
+            start_epoch = trainer.current_epoch + 1  # Start from next epoch
+            print(f"  Resuming training from epoch {start_epoch + 1}")
+            if model_version_override:
+                print(f"  Model version updated to: {model_version}")
+        else:
+            print(f"\n  WARNING: Checkpoint not found: {resume_checkpoint}")
+            print("  Starting from scratch...")
 
     # Train with time tracking and MLflow logging
     if verbose:
@@ -710,7 +666,8 @@ def train_encoder(
                 save_best_only=True,
                 early_stopping_patience=encoder_config.get('early_stopping_patience'),
                 early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
-                verbose=verbose
+                verbose=verbose,
+                start_epoch=start_epoch
             )
             training_time = time.time() - training_start_time
 
@@ -740,7 +697,8 @@ def train_encoder(
             save_best_only=True,
             early_stopping_patience=encoder_config.get('early_stopping_patience'),
             early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
-            verbose=verbose
+            verbose=verbose,
+            start_epoch=start_epoch
         )
         training_time = time.time() - training_start_time
 
@@ -838,7 +796,8 @@ def train_classifier(
     model_card: ModelCardGenerator = None,
     final_training: bool = False,
     trial_info: tuple[int, int] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    classifier_version_override: str = None
 ):
     """Stage 2: Train rating classifier.
 
@@ -848,6 +807,7 @@ def train_classifier(
         final_training: If True, uses final_training_epochs (50) instead of epochs (20)
         trial_info: Optional tuple of (trial_number, n_trials) for HPO logging
         verbose: If True, print detailed setup info (set False during HPO to reduce noise)
+        classifier_version_override: Override classifier version (e.g., 'v2')
 
     Returns:
         ModelCardGenerator with complete statistics
@@ -1040,6 +1000,22 @@ def train_classifier(
         print(f"    weight_decay={classifier_config.get('adam_weight_decay', 0.0)}")
         print(f"    amsgrad={classifier_config.get('adam_amsgrad', False)}")
 
+    # Get version information
+    encoder_checkpoint_path = Path(config['checkpoint_dir']) / "encoder_best.pt"
+    if encoder_checkpoint_path.exists():
+        encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
+        if verbose:
+            print(f"\n  Encoder version (from checkpoint): {encoder_version}")
+    else:
+        encoder_version = music_config.get('encoder_version', 'v1')
+        if verbose:
+            print(f"\n  Encoder version (from config): {encoder_version}")
+            print(f"  WARNING: No encoder checkpoint found at {encoder_checkpoint_path}")
+
+    classifier_version = classifier_version_override if classifier_version_override else music_config.get('classifier_version', 'v1')
+    if verbose:
+        print(f"  Classifier version: {classifier_version}")
+
     # Create trainer
     if verbose:
         print("\n[5/6] Creating trainer...")
@@ -1048,7 +1024,9 @@ def train_classifier(
         device=device,
         loss_fn=loss_fn,
         optimizer=optimizer,
-        tracker=tracker  # Pass tracker for MLflow learning curves
+        tracker=tracker,  # Pass tracker for MLflow learning curves
+        encoder_version=encoder_version,
+        classifier_version=classifier_version
     )
 
     # Train with time tracking and MLflow logging
@@ -1156,6 +1134,9 @@ def generate_recommendations(config: dict):
 
     Args:
         config: Configuration dictionary
+
+    Raises:
+        ValueError: If classifier was trained with a different encoder version
     """
     # Ensure clean memory state at start of stage
     cleanup_memory()
@@ -1168,6 +1149,22 @@ def generate_recommendations(config: dict):
     music_config = config['music']
     rec_config = config.get('recommendations', {})
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Validate model compatibility BEFORE proceeding
+    encoder_checkpoint = Path(config['checkpoint_dir']) / "encoder_best.pt"
+    classifier_checkpoint = Path(config['checkpoint_dir']) / "classifier_best.pt"
+
+    if encoder_checkpoint.exists() and classifier_checkpoint.exists():
+        print("\n[0/5] Validating model compatibility...")
+        validate_model_compatibility(
+            str(encoder_checkpoint),
+            str(classifier_checkpoint)
+        )
+    else:
+        if not encoder_checkpoint.exists():
+            print(f"\n  WARNING: Encoder checkpoint not found: {encoder_checkpoint}")
+        if not classifier_checkpoint.exists():
+            print(f"\n  WARNING: Classifier checkpoint not found: {classifier_checkpoint}")
 
     # Connect to database
     print("\n[1/5] Loading Clementine database...")
@@ -1187,9 +1184,11 @@ def generate_recommendations(config: dict):
     embedding_store = EmbeddingStore(music_config['embedding_db_path'])
 
     filenames = [s.filename for s in unrated_songs]
+    # Use encoder_version for embedding lookup (with fallback to model_version for backwards compatibility)
+    encoder_version = music_config.get('encoder_version', music_config.get('model_version', 'v1'))
     embeddings_dict = embedding_store.get_embeddings_batch(
         filenames,
-        model_version=music_config['model_version']
+        model_version=encoder_version
     )
 
     print(f"  Loaded {len(embeddings_dict)} embeddings")
@@ -1381,8 +1380,37 @@ def main():
         default=None,
         help='Override encoder type from config (for A/B testing)'
     )
+    parser.add_argument(
+        '--resume-checkpoint',
+        type=str,
+        default=None,
+        help='Path to checkpoint to resume training from (e.g., checkpoints/encoder_best.pt)'
+    )
+    parser.add_argument(
+        '--encoder-version',
+        type=str,
+        default=None,
+        help='Override encoder version for embeddings (e.g., v2, v3). Defaults to config value.'
+    )
+    parser.add_argument(
+        '--model-version',
+        type=str,
+        default=None,
+        help='DEPRECATED: Use --encoder-version instead. Kept for backwards compatibility.'
+    )
+    parser.add_argument(
+        '--classifier-version',
+        type=str,
+        default=None,
+        help='Override classifier version (e.g., v2, v3). Defaults to config value.'
+    )
 
     args = parser.parse_args()
+
+    # Handle backwards compatibility for --model-version
+    if args.model_version and not args.encoder_version:
+        args.encoder_version = args.model_version
+        print(f"NOTE: --model-version is deprecated, use --encoder-version instead")
 
     # Load configuration
     config = load_config(args.config)
@@ -1415,12 +1443,21 @@ def main():
 
     # Run stage
     if args.stage == 'encoder':
-        model_card = train_encoder(config, final_training=args.final_training)
+        model_card = train_encoder(
+            config,
+            final_training=args.final_training,
+            resume_checkpoint=args.resume_checkpoint,
+            model_version_override=args.encoder_version
+        )
         cleanup_memory()
         print("\nNext step: Run with --stage classifier to train the rating predictor")
 
     elif args.stage == 'classifier':
-        model_card = train_classifier(config, final_training=args.final_training)
+        model_card = train_classifier(
+            config,
+            final_training=args.final_training,
+            classifier_version_override=args.classifier_version
+        )
         cleanup_memory()
         print("\nNext step: Run with --stage recommend to generate recommendations")
 
@@ -1440,11 +1477,21 @@ def main():
         print("")
 
         # Stage 1: Train encoder
-        model_card = train_encoder(config, final_training=args.final_training)
+        model_card = train_encoder(
+            config,
+            final_training=args.final_training,
+            resume_checkpoint=args.resume_checkpoint,
+            model_version_override=args.encoder_version
+        )
         cleanup_memory()
 
         # Stage 2: Train classifier (with encoder statistics)
-        model_card = train_classifier(config, model_card=model_card, final_training=args.final_training)
+        model_card = train_classifier(
+            config,
+            model_card=model_card,
+            final_training=args.final_training,
+            classifier_version_override=args.classifier_version
+        )
         cleanup_memory()
 
         print("\n" + "=" * 80)

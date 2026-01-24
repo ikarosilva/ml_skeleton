@@ -161,3 +161,9 @@ logs/
 tmp/
 temp/
 *.tmp
+
+# Music Recommendation Pipeline
+cache/
+embeddings.db
+recommendations.txt
+recommender_*.xspf

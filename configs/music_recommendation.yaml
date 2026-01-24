@@ -1,5 +1,28 @@
 # Music Recommendation System Configuration
 # Two-phase training: Encoder (audio -> embeddings) + Classifier (embeddings -> ratings)
+#
+# MODEL VERSIONING & COMPATIBILITY:
+#   Encoder and Classifier have SEPARATE versions with dependency tracking:
+#
+#   - encoder_version: Version of the audio encoder (e.g., "v1", "v2")
+#   - classifier_version: Version of the rating classifier (e.g., "v1", "v2")
+#
+#   RULES:
+#   1. Classifier stores which encoder_version it was trained with
+#   2. Classifier can be updated independently IF encoder hasn't changed
+#   3. If Encoder is updated, Classifier MUST be retrained
+#   4. Deployment FAILS if Classifier's encoder_version != current Encoder version
+#
+# INCREMENTAL TRAINING WORKFLOW:
+#   # Train v1 (initial)
+#   ./run_music_pipeline.sh all
+#
+#   # Update classifier only (encoder unchanged)
+#   ./run_music_pipeline.sh classifier --classifier-version v2
+#
+#   # Update encoder (requires new classifier)
+#   ./run_music_pipeline.sh encoder --resume-checkpoint checkpoints/encoder_v1_best.pt --encoder-version v2
+#   ./run_music_pipeline.sh classifier --classifier-version v1  # New classifier for encoder v2
 
 name: "music_recommendation"
 description: "Music recommendation system with two-stage training"
@@ -18,7 +41,10 @@ music:
 
   # Embedding storage (SQLite)
   embedding_db_path: "./embeddings.db"
-  model_version: "v1"  # Version identifier for embeddings
+
+  # Model versioning (see header for rules)
+  encoder_version: "v1"  # Version of audio encoder (embeddings tagged with this)
+  classifier_version: "v1"  # Version of rating classifier (must match encoder it was trained with)
 
   # Audio loading parameters
   sample_rate: 16000  # Hz
@@ -27,9 +53,24 @@ music:
   normalize: true  # Apply z-normalization (zero mean, unit variance) for consistent amplitude
   max_duration: 900.0  # Skip files >15 minutes (filters live albums, DJ sets, podcasts)
 
+  # Waveform caching (speeds up training by caching resampled audio as .npy files)
+  # First epoch populates the cache, subsequent epochs load from cache (~10x faster)
+  #
+  # CACHE INVALIDATION (automatic):
+  #   Cache key = sr{sample_rate}_dur{duration}_{crop_position}_norm{normalize}
+  #   Changing ANY of these settings auto-creates a new cache (old cache ignored).
+  #
+  # WHEN TO MANUALLY CLEAR CACHE (rm -rf ./cache):
+  #   - Audio files changed (re-encoded, re-tagged, moved)
+  #   - MUSIC_PATH_REMAP environment variable changed
+  #   - Corrupted cache (training crashes with "invalid .npy")
+  #
+  waveform_cache_dir: "./cache"  # Directory for cached waveforms (null = disabled)
+  waveform_cache_max_gb: 140  # Max cache size in GB (deletes oldest files when exceeded)
+
   # Multiprocessing (optimized for parallel audio loading and resampling)
   num_workers: null  # null = 80% of CPU cores (for batch operations)
-  dataloader_workers: 16 #TODO  # Workers for DataLoader (each worker loads+resamples audio in parallel)
+  dataloader_workers: 12  # Workers for DataLoader (each worker loads+resamples audio in parallel)
   # Note: Audio resampling (e.g., 44100Hz -> 16000Hz) is done in parallel across workers
   # with cached resamplers for efficiency and prefetch_factor=4 for better throughput
 
@@ -55,14 +96,8 @@ music:
 
 # Stage 1: Encoder training hyperparameters
 encoder:
-  # ============================================================
-  # ENCODER TYPE SELECTOR (A/B Testing)
-  # ============================================================
-  # Change this single value to switch encoder strategies:
-  #   - "simple"  : Current 1D CNN on raw waveform (baseline)
-  #   - "simsiam" : SimSiam with ResNet backbone on spectrograms (NEW)
-  # ============================================================
-  encoder_type: "simple"  # ← Change to "simsiam" for new approach
+  # SimSiam encoder with ResNet backbone on spectrograms
+  encoder_type: "simsiam"
 
   # ------------------------------------------------------------
   # Common settings (used by all encoder types)
@@ -76,7 +111,7 @@ encoder:
   #   - For final training with optimized hyperparameters: Use final_training_epochs (50 epochs)
   epochs: 20  # Default for HPO trials
   final_training_epochs: 50  # Use this for final training with best hyperparameters
-  batch_size: 32  # Reduced for testing
+  batch_size: 96  # Increased - resnet34 uses less memory than resnet50
   learning_rate: 0.001
 
   # Early stopping (especially useful for hyperparameter tuning)
@@ -109,23 +144,10 @@ encoder:
   crop_jitter: 5.0        # Random offset in seconds for second crop (creates variety)
   noise_level: 0.005      # Add small white noise (std dev) to augmentations
 
-  # Supervised contrastive loss parameters (DEPRECATED: uses rating info!)
-  rating_threshold: 0.2  # Max rating difference for positive pairs
-
-  # ------------------------------------------------------------
-  # Simple encoder settings (encoder_type: "simple")
-  # These settings are only used when encoder_type is "simple"
-  # ------------------------------------------------------------
-  simple:
-    base_channels: 32  # Starting number of channels (doubles each block)
-
-  # ------------------------------------------------------------
-  # SimSiam encoder settings (encoder_type: "simsiam")
-  # These settings are only used when encoder_type is "simsiam"
-  # ------------------------------------------------------------
+  # SimSiam encoder settings
   simsiam:
     # Backbone architecture
-    backbone: "resnet50"        # "resnet18", "resnet34", "resnet50"
+    backbone: "resnet34"        # "resnet18", "resnet34", "resnet50" - using resnet34 for balance
     pretrained_backbone: false  # Use ImageNet weights for backbone?
 
     # MLP architecture

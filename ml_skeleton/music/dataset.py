@@ -359,6 +359,8 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
         skip_unknown_metadata: If True, skip songs with all-unknown metadata
         speech_results: Optional speech detection scores for filtering
         speech_threshold: Threshold for speech filtering
+        cache_dir: Directory for caching resampled waveforms (None = no caching)
+        cache_max_gb: Maximum cache size in GB (deletes oldest files when exceeded)
     """
 
     def __init__(
@@ -374,7 +376,9 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
         hop_length: int = 512,
         skip_unknown_metadata: bool = False,
         speech_results: Optional[dict[str, float]] = None,
-        speech_threshold: float = 0.5
+        speech_threshold: float = 0.5,
+        cache_dir: Optional[str] = None,
+        cache_max_gb: float = 140.0
     ):
         import torchaudio.transforms as T
 
@@ -387,6 +391,15 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
         self.n_mels = n_mels
         self.n_fft = n_fft
         self.hop_length = hop_length
+
+        # Waveform caching setup
+        self.cache_dir = Path(cache_dir) if cache_dir else None
+        self.cache_max_bytes = int(cache_max_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
+        self._cache_cleanup_counter = 0  # Only check size periodically
+        if self.cache_dir:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            # Include settings in cache key to invalidate on config change
+            self._cache_key = f"sr{sample_rate}_dur{duration}_{crop_position}_norm{normalize}"
 
         # Create mel spectrogram transform
         self.mel_transform = T.MelSpectrogram(
@@ -463,6 +476,96 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return len(self.songs)
 
+    def _get_cache_path(self, filename: str) -> Optional[Path]:
+        """Get cache file path for a song."""
+        if self.cache_dir is None:
+            return None
+        # Create safe filename from original path
+        safe_name = filename.replace("/", "_").replace("\\", "_")
+        return self.cache_dir / self._cache_key / f"{safe_name}.npy"
+
+    def _get_cache_size(self) -> int:
+        """Get total size of cache directory in bytes."""
+        if self.cache_dir is None or not self.cache_dir.exists():
+            return 0
+        total = 0
+        for f in self.cache_dir.rglob("*.npy"):
+            try:
+                total += f.stat().st_size
+            except OSError:
+                pass
+        return total
+
+    def _cleanup_cache(self, target_bytes: int) -> None:
+        """Delete oldest cache files until size is below target.
+
+        Args:
+            target_bytes: Target cache size in bytes
+        """
+        if self.cache_dir is None or not self.cache_dir.exists():
+            return
+
+        # Get all cache files with their modification times
+        cache_files = []
+        for f in self.cache_dir.rglob("*.npy"):
+            try:
+                stat = f.stat()
+                cache_files.append((f, stat.st_mtime, stat.st_size))
+            except OSError:
+                pass
+
+        # Sort by modification time (oldest first)
+        cache_files.sort(key=lambda x: x[1])
+
+        # Calculate current size
+        current_size = sum(f[2] for f in cache_files)
+
+        # Delete oldest files until under target
+        deleted_count = 0
+        deleted_bytes = 0
+        for filepath, _, size in cache_files:
+            if current_size <= target_bytes:
+                break
+            try:
+                filepath.unlink()
+                current_size -= size
+                deleted_count += 1
+                deleted_bytes += size
+            except OSError:
+                pass
+
+        if deleted_count > 0:
+            print(f"  Cache cleanup: deleted {deleted_count} files ({deleted_bytes / 1e9:.1f} GB)")
+
+    def _load_from_cache(self, cache_path: Path) -> Optional[torch.Tensor]:
+        """Load waveform from cache (numpy .npy format for speed)."""
+        try:
+            if cache_path.exists():
+                # Memory-map for faster loading
+                arr = np.load(cache_path, mmap_mode='r')
+                return torch.from_numpy(arr.copy()).float()
+        except Exception:
+            pass
+        return None
+
+    def _save_to_cache(self, cache_path: Path, waveform: torch.Tensor) -> None:
+        """Save waveform to cache with periodic size check."""
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            np.save(cache_path, waveform.numpy())
+
+            # Check cache size every 100 saves to avoid I/O overhead
+            self._cache_cleanup_counter += 1
+            if self._cache_cleanup_counter >= 100:
+                self._cache_cleanup_counter = 0
+                current_size = self._get_cache_size()
+                if current_size > self.cache_max_bytes:
+                    # Delete oldest files to get to 90% of max (leave some headroom)
+                    target = int(self.cache_max_bytes * 0.9)
+                    self._cleanup_cache(target)
+        except Exception:
+            pass  # Silently fail on cache write errors
+
     def __getitem__(self, idx: int) -> dict:
         """Load audio and return two augmented spectrogram views.
 
@@ -473,20 +576,30 @@ class SimSiamMusicDataset(torch.utils.data.Dataset):
             - filename: Song filename
         """
         song = self.songs[idx]
+        audio = None
 
-        # Load audio (use filepath property for path remapping)
-        audio = load_audio_file(
-            str(song.filepath),
-            sample_rate=self.sample_rate,
-            mono=True,
-            duration=self.duration,
-            crop_position=self.crop_position,
-            normalize=self.normalize
-        )
+        # Try loading from cache first
+        cache_path = self._get_cache_path(song.filename)
+        if cache_path is not None:
+            audio = self._load_from_cache(cache_path)
 
-        # Fallback to zeros if loading fails
+        # Load from original file if not cached
         if audio is None:
-            audio = torch.zeros(int(self.sample_rate * self.duration))
+            audio = load_audio_file(
+                str(song.filepath),
+                sample_rate=self.sample_rate,
+                mono=True,
+                duration=self.duration,
+                crop_position=self.crop_position,
+                normalize=self.normalize
+            )
+
+            # Fallback to zeros if loading fails
+            if audio is None:
+                audio = torch.zeros(int(self.sample_rate * self.duration))
+            elif cache_path is not None:
+                # Save to cache for next time
+                self._save_to_cache(cache_path, audio)
 
         # Create two augmented views
         if self.augmentor is not None:

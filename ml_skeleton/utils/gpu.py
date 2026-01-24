@@ -51,18 +51,16 @@ def _get_architecture_name(major: int, minor: int) -> str:
 
 def get_gpu_info() -> Dict[str, Any]:
     """
-    Get comprehensive GPU information from both PyTorch and TensorFlow.
+    Get comprehensive GPU information from PyTorch.
 
     Returns:
-        Dictionary with GPU information from available frameworks
+        Dictionary with GPU information
     """
     info = {
         "has_gpu": False,
         "pytorch": None,
-        "tensorflow": None,
     }
 
-    # PyTorch info
     try:
         import torch
 
@@ -82,7 +80,6 @@ def get_gpu_info() -> Dict[str, Any]:
             info["has_gpu"] = True
             for i in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(i)
-                # Detect architecture generation
                 arch = _get_architecture_name(props.major, props.minor)
 
                 pytorch_info["devices"].append(
@@ -101,27 +98,6 @@ def get_gpu_info() -> Dict[str, Any]:
     except ImportError:
         pass
 
-    # TensorFlow info
-    try:
-        import tensorflow as tf
-
-        gpus = tf.config.list_physical_devices("GPU")
-
-        tensorflow_info = {
-            "available": len(gpus) > 0,
-            "version": tf.__version__,
-            "device_count": len(gpus),
-            "devices": [{"name": gpu.name, "type": gpu.device_type} for gpu in gpus],
-        }
-
-        if len(gpus) > 0:
-            info["has_gpu"] = True
-
-        info["tensorflow"] = tensorflow_info
-
-    except ImportError:
-        pass
-
     return info
 
 
@@ -129,34 +105,17 @@ def get_optimal_device(framework: str = "pytorch") -> str:
     """
     Get the optimal device string for training.
 
-    Args:
-        framework: "pytorch" or "tensorflow"
-
     Returns:
-        Device string ("cuda", "gpu:0", "cpu", etc.)
+        Device string ("cuda" or "cpu")
     """
-    if framework == "pytorch":
-        try:
-            import torch
+    try:
+        import torch
 
-            if torch.cuda.is_available():
-                return "cuda"
-            return "cpu"
-        except ImportError:
-            return "cpu"
-
-    elif framework == "tensorflow":
-        try:
-            import tensorflow as tf
-
-            gpus = tf.config.list_physical_devices("GPU")
-            if gpus:
-                return "/GPU:0"
-            return "/CPU:0"
-        except ImportError:
-            return "/CPU:0"
-
-    return "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        return "cpu"
+    except ImportError:
+        return "cpu"
 
 
 def get_optimal_settings(framework: str = "pytorch") -> Dict[str, Any]:
@@ -164,9 +123,6 @@ def get_optimal_settings(framework: str = "pytorch") -> Dict[str, Any]:
     Get optimal training settings based on detected hardware.
 
     Returns suggested settings for data loading, mixed precision, etc.
-
-    Args:
-        framework: "pytorch" or "tensorflow"
 
     Returns:
         Dictionary with recommended settings
@@ -179,49 +135,36 @@ def get_optimal_settings(framework: str = "pytorch") -> Dict[str, Any]:
         "amp_dtype": None,
     }
 
-    if framework == "pytorch":
-        try:
-            import torch
+    try:
+        import torch
 
-            if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
-                settings["pin_memory"] = True
-                settings["num_workers"] = 8
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            settings["pin_memory"] = True
+            settings["num_workers"] = 8
 
-                # Enable AMP for compute capability >= 7.0 (Volta+)
-                if props.major >= 7:
-                    settings["use_amp"] = True
-                    # BF16 for Ampere+ (compute 8.0+), FP16 otherwise
-                    settings["amp_dtype"] = (
-                        torch.bfloat16 if props.major >= 8 else torch.float16
-                    )
-
-                # Blackwell-specific optimizations (RTX 5090, compute 10.0+)
-                is_blackwell = props.major >= 10
-                if is_blackwell:
-                    settings["use_amp"] = True
-                    settings["amp_dtype"] = torch.bfloat16
-                    settings["torch_compile"] = True  # torch.compile works well on Blackwell
-                    settings["num_workers"] = 16
-
-                # Adjust workers based on GPU memory
-                elif props.total_memory > 20e9:  # > 20GB
-                    settings["num_workers"] = 12
-
-        except ImportError:
-            pass
-
-    elif framework == "tensorflow":
-        try:
-            import tensorflow as tf
-
-            gpus = tf.config.list_physical_devices("GPU")
-            if gpus:
+            # Enable AMP for compute capability >= 7.0 (Volta+)
+            if props.major >= 7:
                 settings["use_amp"] = True
-                settings["num_workers"] = 8
+                # BF16 for Ampere+ (compute 8.0+), FP16 otherwise
+                settings["amp_dtype"] = (
+                    torch.bfloat16 if props.major >= 8 else torch.float16
+                )
 
-        except ImportError:
-            pass
+            # Blackwell-specific optimizations (RTX 5090, compute 10.0+)
+            is_blackwell = props.major >= 10
+            if is_blackwell:
+                settings["use_amp"] = True
+                settings["amp_dtype"] = torch.bfloat16
+                settings["torch_compile"] = True  # torch.compile works well on Blackwell
+                settings["num_workers"] = 16
+
+            # Adjust workers based on GPU memory
+            elif props.total_memory > 20e9:  # > 20GB
+                settings["num_workers"] = 12
+
+    except ImportError:
+        pass
 
     return settings
 
@@ -282,3 +225,111 @@ def configure_optimizations() -> None:
                 torch.set_float32_matmul_precision("high")
     except ImportError:
         pass
+
+
+class GPUMonitor:
+    """Monitor GPU utilization during training.
+
+    Uses pynvml for efficient polling without subprocess overhead.
+    Falls back to nvidia-smi if pynvml is not available.
+    """
+
+    def __init__(self, device_index: int = 0):
+        self.device_index = device_index
+        self._nvml_initialized = False
+        self._handle = None
+        self._samples: list[dict] = []
+
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            self._handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+            self._nvml_initialized = True
+        except (ImportError, Exception):
+            pass
+
+    def sample(self) -> Optional[dict]:
+        """Take a single GPU utilization sample.
+
+        Returns:
+            Dict with gpu_util (%), memory_used (GB), memory_total (GB)
+            or None if sampling fails.
+        """
+        if self._nvml_initialized and self._handle:
+            try:
+                import pynvml
+                util = pynvml.nvmlDeviceGetUtilizationRates(self._handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(self._handle)
+                sample = {
+                    "gpu_util": util.gpu,
+                    "memory_util": util.memory,
+                    "memory_used_gb": mem.used / 1e9,
+                    "memory_total_gb": mem.total / 1e9,
+                }
+                self._samples.append(sample)
+                return sample
+            except Exception:
+                pass
+        return None
+
+    def get_stats(self) -> dict:
+        """Get statistics from collected samples.
+
+        Returns:
+            Dict with avg, min, max for gpu_util and memory stats.
+        """
+        if not self._samples:
+            return {}
+
+        gpu_utils = [s["gpu_util"] for s in self._samples]
+        mem_utils = [s["memory_util"] for s in self._samples]
+        mem_used = [s["memory_used_gb"] for s in self._samples]
+
+        return {
+            "gpu_util_avg": sum(gpu_utils) / len(gpu_utils),
+            "gpu_util_min": min(gpu_utils),
+            "gpu_util_max": max(gpu_utils),
+            "memory_util_avg": sum(mem_utils) / len(mem_utils),
+            "memory_used_avg_gb": sum(mem_used) / len(mem_used),
+            "num_samples": len(self._samples),
+        }
+
+    def reset(self) -> None:
+        """Clear collected samples."""
+        self._samples = []
+
+    def shutdown(self) -> None:
+        """Clean up NVML resources."""
+        if self._nvml_initialized:
+            try:
+                import pynvml
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_initialized = False
+
+
+def get_gpu_utilization(device_index: int = 0) -> Optional[dict]:
+    """Get current GPU utilization (one-shot, no state).
+
+    Args:
+        device_index: GPU device index
+
+    Returns:
+        Dict with gpu_util, memory_used_gb, memory_total_gb or None
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        pynvml.nvmlShutdown()
+        return {
+            "gpu_util": util.gpu,
+            "memory_util": util.memory,
+            "memory_used_gb": mem.used / 1e9,
+            "memory_total_gb": mem.total / 1e9,
+        }
+    except (ImportError, Exception):
+        return None

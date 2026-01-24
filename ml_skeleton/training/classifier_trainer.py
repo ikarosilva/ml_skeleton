@@ -15,6 +15,72 @@ import numpy as np
 from ..utils.early_stopping import EarlyStopping
 
 
+def get_encoder_version_from_checkpoint(checkpoint_path: str) -> str:
+    """Read encoder version from an encoder checkpoint file.
+
+    Args:
+        checkpoint_path: Path to encoder checkpoint (.pt file)
+
+    Returns:
+        Encoder version string (e.g., "v1", "v2")
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return checkpoint.get("encoder_version", checkpoint.get("model_version", "unknown"))
+
+
+def get_classifier_versions_from_checkpoint(checkpoint_path: str) -> tuple[str, str]:
+    """Read version info from a classifier checkpoint file.
+
+    Args:
+        checkpoint_path: Path to classifier checkpoint (.pt file)
+
+    Returns:
+        Tuple of (classifier_version, encoder_version)
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    classifier_version = checkpoint.get("classifier_version", "unknown")
+    encoder_version = checkpoint.get("encoder_version", "unknown")
+    return classifier_version, encoder_version
+
+
+def validate_model_compatibility(
+    encoder_checkpoint: str,
+    classifier_checkpoint: str
+) -> None:
+    """Validate that classifier was trained with the current encoder version.
+
+    Args:
+        encoder_checkpoint: Path to encoder checkpoint
+        classifier_checkpoint: Path to classifier checkpoint
+
+    Raises:
+        ValueError: If encoder versions don't match
+    """
+    encoder_version = get_encoder_version_from_checkpoint(encoder_checkpoint)
+    classifier_version, classifier_encoder_version = get_classifier_versions_from_checkpoint(
+        classifier_checkpoint
+    )
+
+    if classifier_encoder_version != encoder_version:
+        raise ValueError(
+            f"\n{'='*60}\n"
+            f"MODEL VERSION MISMATCH - DEPLOYMENT BLOCKED\n"
+            f"{'='*60}\n"
+            f"Current encoder version: {encoder_version}\n"
+            f"Classifier trained with encoder version: {classifier_encoder_version}\n"
+            f"Classifier version: {classifier_version}\n"
+            f"\n"
+            f"The classifier must be retrained with the new encoder.\n"
+            f"Run: ./run_music_pipeline.sh classifier\n"
+            f"{'='*60}"
+        )
+
+    print(f"Model compatibility validated:")
+    print(f"  Encoder version: {encoder_version}")
+    print(f"  Classifier version: {classifier_version}")
+    print(f"  Classifier trained with encoder: {classifier_encoder_version} ✓")
+
+
 class ClassifierTrainer:
     """Trainer for rating classifier models.
 
@@ -22,12 +88,19 @@ class ClassifierTrainer:
     Predicts continuous ratings in [0, 1] range.
     Supports MLflow metric logging for learning curves.
 
+    Version Compatibility:
+        The classifier stores which encoder_version it was trained with.
+        During deployment, the system validates that the classifier's
+        encoder_version matches the current encoder to prevent mismatches.
+
     Args:
         classifier: Rating classifier model (conforms to RatingClassifier protocol)
         device: Device to train on ('cuda' or 'cpu')
         loss_fn: Loss function (typically MSE)
         optimizer: PyTorch optimizer
         tracker: Optional MLflow tracker (ExplrTracker) for logging metrics
+        encoder_version: Version of encoder used to create embeddings (for compatibility)
+        classifier_version: Version of this classifier
     """
 
     def __init__(
@@ -36,13 +109,19 @@ class ClassifierTrainer:
         device: str,
         loss_fn: nn.Module,
         optimizer: torch.optim.Optimizer,
-        tracker: Optional[Any] = None
+        tracker: Optional[Any] = None,
+        encoder_version: str = "v1",
+        classifier_version: str = "v1"
     ):
         self.classifier = classifier.to(device)
         self.device = device
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.tracker = tracker  # MLflow tracker for logging learning curves
+
+        # Version tracking for compatibility validation
+        self.encoder_version = encoder_version  # Encoder version this classifier was trained with
+        self.classifier_version = classifier_version  # This classifier's version
 
         # Training state
         self.current_epoch = 0
@@ -303,6 +382,10 @@ class ClassifierTrainer:
     def save_checkpoint(self, path: Path, metrics: dict = None):
         """Save model checkpoint.
 
+        Includes version information for compatibility validation:
+        - encoder_version: The encoder version this classifier was trained with
+        - classifier_version: This classifier's version
+
         Args:
             path: Path to save checkpoint
             metrics: Optional metrics to save with checkpoint
@@ -311,7 +394,9 @@ class ClassifierTrainer:
             "model_state_dict": self.classifier.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "epoch": self.current_epoch,
-            "history": self.history
+            "history": self.history,
+            "encoder_version": self.encoder_version,  # Required for compatibility check
+            "classifier_version": self.classifier_version
         }
 
         if metrics:
@@ -319,13 +404,30 @@ class ClassifierTrainer:
 
         torch.save(checkpoint, path)
 
-    def load_checkpoint(self, path: Path):
+    def load_checkpoint(self, path: Path, validate_encoder_version: str = None):
         """Load model checkpoint.
 
         Args:
             path: Path to checkpoint file
+            validate_encoder_version: If provided, validates that the checkpoint's
+                                      encoder_version matches. Raises ValueError on mismatch.
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # Extract version info
+        checkpoint_encoder_version = checkpoint.get("encoder_version", "unknown")
+        checkpoint_classifier_version = checkpoint.get("classifier_version", "unknown")
+
+        # Validate encoder version compatibility if requested
+        if validate_encoder_version is not None:
+            if checkpoint_encoder_version != validate_encoder_version:
+                raise ValueError(
+                    f"Classifier/Encoder version mismatch!\n"
+                    f"  Classifier was trained with encoder version: {checkpoint_encoder_version}\n"
+                    f"  Current encoder version: {validate_encoder_version}\n"
+                    f"  You must retrain the classifier with the new encoder.\n"
+                    f"  Run: ./run_music_pipeline.sh classifier"
+                )
 
         self.classifier.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -335,8 +437,12 @@ class ClassifierTrainer:
             "val_loss": [],
             "val_mae": []
         })
+        self.encoder_version = checkpoint_encoder_version
+        self.classifier_version = checkpoint_classifier_version
 
-        print(f"Loaded checkpoint from epoch {self.current_epoch}")
+        print(f"Loaded classifier checkpoint from epoch {self.current_epoch}")
+        print(f"  Classifier version: {self.classifier_version}")
+        print(f"  Trained with encoder version: {self.encoder_version}")
 
     def predict(
         self,

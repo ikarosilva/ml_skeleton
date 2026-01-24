@@ -1,14 +1,14 @@
-*git push 
+*No utilizing the full GPU compute. 
+ 
 
-*python examples/music_recommendation.py --encoder-type simsiam
+*save small sampples of processed audio so I can listen. 
 
-*fix mlflow logging
 
-*torch tensors @ 16bit resolution
+*backup computer state in case of loss of power? (create a quick recovery_plan.md)
 
-*what parametre of annealing can we tune?
+*make sure the whole pipeline will run and there are checkpoints at each
+stage in case something happens.
 
-*review log for major issues
 
 
 

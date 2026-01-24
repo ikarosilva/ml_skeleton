@@ -17,7 +17,7 @@ Deep learning training framework with MLflow experiment tracking and hyperparame
 - **[runner/](ml_skeleton/runner/)** - Orchestration and CLI
   - `Experiment`: Main orchestrator (run single trial or tune)
   - `cli.py`: CLI commands (run, tune, mlflow-ui, gpu-info, verify)
-- **[frameworks/](ml_skeleton/frameworks/)** - PyTorch/TensorFlow helpers
+- **[frameworks/](ml_skeleton/frameworks/)** - PyTorch helpers
 - **[utils/](ml_skeleton/utils/)** - GPU memory limits, reproducibility (seeding), environment verification
 
 ## User Contract
@@ -34,7 +34,7 @@ Framework provides: hyperparameters, MLflow tracker, device info, paths
 - [ml_skeleton/core/protocols.py](ml_skeleton/core/protocols.py) - Core data structures
 - [ml_skeleton/runner/experiment.py](ml_skeleton/runner/experiment.py) - Main orchestrator
 - [configs/example.yaml](configs/example.yaml) - Example configuration
-- [examples/](examples/) - PyTorch/TensorFlow usage examples
+- [examples/](examples/) - PyTorch usage examples
 - [Dockerfile](Dockerfile) - Container image definition
 - [docker-compose.yml](docker-compose.yml) - MLflow + training services
 
@@ -49,10 +49,10 @@ Framework provides: hyperparameters, MLflow tracker, device info, paths
 Two-phase training pipeline for music recommendations using Clementine database:
 
 ### Phase 1: Encoder Training (Audio → Embeddings)
-- **[music/audio_loader.py](ml_skeleton/music/audio_loader.py)**: READ-ONLY audio loading with multiprocessing (80% CPU cores), center-crop extraction, torchaudio integration
-- **[music/baseline_encoder.py](ml_skeleton/music/baseline_encoder.py)**: Simple 1D CNN encoder (SimpleAudioEncoder), mel-spectrogram encoder template, multi-task encoder wrapper
-- **[music/dataset.py](ml_skeleton/music/dataset.py)**: MusicDataset for audio loading, EmbeddingDataset for classifier training, multi-album support
-- **[music/losses.py](ml_skeleton/music/losses.py)**: RatingLoss (MSE), MultiTaskLoss (rating + album), NTXentLoss (SimCLR), SupervisedContrastiveLoss
+- **[music/audio_loader.py](ml_skeleton/music/audio_loader.py)**: READ-ONLY audio loading with multiprocessing (80% CPU cores), end-crop extraction, torchaudio integration
+- **[music/simsiam_encoder.py](ml_skeleton/music/simsiam_encoder.py)**: SimSiam encoder with ResNet backbone on mel spectrograms
+- **[music/dataset.py](ml_skeleton/music/dataset.py)**: SimSiamMusicDataset for audio loading with augmentations, EmbeddingDataset for classifier training
+- **[music/losses.py](ml_skeleton/music/losses.py)**: SimSiamLoss (self-supervised), RatingLoss (MSE for classifier)
 - **[training/encoder_trainer.py](ml_skeleton/training/encoder_trainer.py)**: Encoder training orchestration, embedding extraction/storage, checkpoint management
 
 ### Phase 2: Classifier Training (Embeddings → Ratings)
@@ -73,11 +73,11 @@ Two-phase training pipeline for music recommendations using Clementine database:
 - **[examples/music_recommendation.py](examples/music_recommendation.py)**: Complete end-to-end example with 3 stages (encoder, classifier, recommend)
 
 ### Key Features
-- Multi-album support (songs on multiple albums averaged in loss)
-- Album key format: "artist|||album" for uniqueness
-- Multiprocessing default: 80% CPU cores
+- SimSiam self-supervised encoder with ResNet34 backbone
+- Waveform caching for fast training (140GB max cache)
 - End-crop extraction: 60s from end of song (with z-normalization)
-- Embedding versioning: A/B testing support
+- Embedding versioning with encoder/classifier version tracking
+- Version compatibility validation at deployment time
 - READ-ONLY operations: All audio file access is read-only
 
 

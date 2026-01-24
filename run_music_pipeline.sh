@@ -1,5 +1,5 @@
 #!/bin/bash
-# Music Recommendation Pipeline Runner  
+# Music Recommendation Pipeline Runner
 #
 # Usage:
 #   ./run_music_pipeline.sh all              # Run all 3 stages
@@ -8,10 +8,26 @@
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #   ./run_music_pipeline.sh hpo              # Full hyperparameter optimization pipeline
+#   ./run_music_pipeline.sh clear-cache      # Delete waveform cache (prompts for confirmation)
 #
 # A/B Testing (SimSiam vs Simple encoder):
 #   ./run_music_pipeline.sh encoder --encoder-type simsiam   # Train with SimSiam encoder
 #   ./run_music_pipeline.sh all --encoder-type simple        # Train with Simple encoder
+#
+# VERSION COMPATIBILITY RULES:
+#   - Encoder and Classifier have SEPARATE versions
+#   - Classifier stores which encoder version it was trained with
+#   - Classifier can be updated independently IF encoder hasn't changed
+#   - If Encoder is updated, Classifier MUST be retrained
+#   - Deployment (recommend) FAILS if versions don't match
+#
+# Resume/Incremental Training (train v2 from v1):
+#   # Update encoder to v2 (requires retraining classifier)
+#   ./run_music_pipeline.sh encoder --resume-checkpoint checkpoints/encoder_best.pt --encoder-version v2
+#   ./run_music_pipeline.sh classifier --classifier-version v1  # New classifier for encoder v2
+#
+#   # Update classifier only (encoder unchanged)
+#   ./run_music_pipeline.sh classifier --classifier-version v2
 #
 # Environment variables:
 #   CONFIG=/path/to/config.yaml              # Override config file
@@ -19,6 +35,9 @@
 #   HPO_ENCODER_TRIALS=30                    # Number of encoder HPO trials
 #   HPO_CLASSIFIER_TRIALS=20                 # Number of classifier HPO trials
 #   ENCODER_TYPE=simsiam                     # Override encoder type (simple or simsiam)
+#   RESUME_CHECKPOINT=/path/to/checkpoint    # Resume from previous training
+#   ENCODER_VERSION=v2                       # Encoder version for embeddings
+#   CLASSIFIER_VERSION=v2                    # Classifier version
 
 set -e  # Exit on error
 
@@ -27,6 +46,9 @@ SCRIPT="examples/music_recommendation.py"
 HPO_ENCODER_TRIALS="${HPO_ENCODER_TRIALS:-30}"
 HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-20}"
 ENCODER_TYPE="${ENCODER_TYPE:-}"  # Optional: "simple" or "simsiam"
+RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"  # Optional: path to checkpoint to resume from
+ENCODER_VERSION="${ENCODER_VERSION:-}"  # Optional: encoder version for embeddings (e.g., "v2")
+CLASSIFIER_VERSION="${CLASSIFIER_VERSION:-}"  # Optional: classifier version (e.g., "v2")
 
 # Set minimum rated songs for placeholder database
 export MIN_RATED_SONGS="${MIN_RATED_SONGS:-500}"
@@ -81,24 +103,51 @@ check_prerequisites() {
 run_encoder() {
     local extra_args="$1"
     local encoder_type_arg=""
+    local resume_arg=""
+    local version_arg=""
 
     # Add encoder type if specified
     if [ -n "$ENCODER_TYPE" ]; then
         encoder_type_arg="--encoder-type $ENCODER_TYPE"
-        print_header "Stage 1: Training Audio Encoder (type: $ENCODER_TYPE)"
-    else
-        print_header "Stage 1: Training Audio Encoder"
     fi
 
-    python "$SCRIPT" --stage encoder --config "$CONFIG" $encoder_type_arg $extra_args
+    # Add resume checkpoint if specified
+    if [ -n "$RESUME_CHECKPOINT" ]; then
+        resume_arg="--resume-checkpoint $RESUME_CHECKPOINT"
+    fi
+
+    # Add encoder version if specified
+    if [ -n "$ENCODER_VERSION" ]; then
+        version_arg="--encoder-version $ENCODER_VERSION"
+    fi
+
+    # Print header with relevant info
+    local header="Stage 1: Training Audio Encoder"
+    [ -n "$ENCODER_TYPE" ] && header="$header (type: $ENCODER_TYPE)"
+    [ -n "$RESUME_CHECKPOINT" ] && header="$header [RESUMING from $RESUME_CHECKPOINT]"
+    [ -n "$ENCODER_VERSION" ] && header="$header [encoder: $ENCODER_VERSION]"
+    print_header "$header"
+
+    python "$SCRIPT" --stage encoder --config "$CONFIG" $encoder_type_arg $resume_arg $version_arg $extra_args
     print_success "Encoder training complete!"
     echo ""
 }
 
 run_classifier() {
     local extra_args="$1"
-    print_header "Stage 2: Training Rating Classifier"
-    python "$SCRIPT" --stage classifier --config "$CONFIG" $extra_args
+    local classifier_version_arg=""
+
+    # Add classifier version if specified
+    if [ -n "$CLASSIFIER_VERSION" ]; then
+        classifier_version_arg="--classifier-version $CLASSIFIER_VERSION"
+    fi
+
+    # Print header with relevant info
+    local header="Stage 2: Training Rating Classifier"
+    [ -n "$CLASSIFIER_VERSION" ] && header="$header [classifier: $CLASSIFIER_VERSION]"
+    print_header "$header"
+
+    python "$SCRIPT" --stage classifier --config "$CONFIG" $classifier_version_arg $extra_args
     print_success "Classifier training complete!"
     echo ""
 }
@@ -271,6 +320,41 @@ main() {
                 ENCODER_TYPE="${1#*=}"
                 shift
                 ;;
+            --resume-checkpoint)
+                RESUME_CHECKPOINT="$2"
+                shift 2
+                ;;
+            --resume-checkpoint=*)
+                RESUME_CHECKPOINT="${1#*=}"
+                shift
+                ;;
+            --encoder-version)
+                ENCODER_VERSION="$2"
+                shift 2
+                ;;
+            --encoder-version=*)
+                ENCODER_VERSION="${1#*=}"
+                shift
+                ;;
+            --classifier-version)
+                CLASSIFIER_VERSION="$2"
+                shift 2
+                ;;
+            --classifier-version=*)
+                CLASSIFIER_VERSION="${1#*=}"
+                shift
+                ;;
+            --model-version)
+                # Backwards compatibility
+                ENCODER_VERSION="$2"
+                echo "NOTE: --model-version is deprecated, use --encoder-version instead"
+                shift 2
+                ;;
+            --model-version=*)
+                ENCODER_VERSION="${1#*=}"
+                echo "NOTE: --model-version is deprecated, use --encoder-version instead"
+                shift
+                ;;
             *)
                 # Unknown option, ignore
                 shift
@@ -304,11 +388,31 @@ main() {
         hpo)
             run_hpo_pipeline
             ;;
+        clear-cache)
+            print_header "Clearing Waveform Cache"
+            CACHE_DIR="./cache"
+            if [ -d "$CACHE_DIR" ]; then
+                CACHE_SIZE=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
+                CACHE_FILES=$(find "$CACHE_DIR" -name "*.npy" 2>/dev/null | wc -l)
+                echo "Cache directory: $CACHE_DIR"
+                echo "Size: $CACHE_SIZE ($CACHE_FILES files)"
+                read -p "Delete cache? [y/N] " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    rm -rf "$CACHE_DIR"
+                    print_success "Cache cleared!"
+                else
+                    print_warning "Cache not deleted"
+                fi
+            else
+                print_warning "No cache found at $CACHE_DIR"
+            fi
+            ;;
         model-card)
             display_model_card
             ;;
         *)
-            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|model-card} [options]"
+            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|clear-cache|model-card} [options]"
             echo ""
             echo "Stages:"
             echo "  all         - Run complete pipeline"
@@ -317,21 +421,46 @@ main() {
             echo "  recommend   - Generate recommendations"
             echo "  quick       - Quick test (5 epochs, 500 songs)"
             echo "  hpo         - Full hyperparameter optimization"
+            echo "  clear-cache - Delete waveform cache (use when audio files change)"
             echo "  model-card  - Display model card"
             echo ""
             echo "Options:"
-            echo "  --encoder-type TYPE   - Encoder type: 'simple' or 'simsiam' (A/B testing)"
+            echo "  --encoder-type TYPE        - Encoder type: 'simple' or 'simsiam' (A/B testing)"
+            echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
+            echo "  --encoder-version VERSION  - Encoder version for embeddings (e.g., v2)"
+            echo "  --classifier-version VER   - Classifier version (e.g., v2)"
             echo ""
             echo "Environment Variables:"
             echo "  HPO_ENCODER_TRIALS=30"
             echo "  HPO_CLASSIFIER_TRIALS=20"
-            echo "  ENCODER_TYPE=simsiam      - Override encoder type"
+            echo "  ENCODER_TYPE=simsiam        - Override encoder type"
+            echo "  RESUME_CHECKPOINT=/path/to  - Resume from checkpoint"
+            echo "  ENCODER_VERSION=v2          - Encoder version for embeddings"
+            echo "  CLASSIFIER_VERSION=v2       - Classifier version"
             echo ""
             echo "Examples:"
             echo "  $0 all                          # Run with default (simple) encoder"
             echo "  $0 encoder --encoder-type simsiam  # Train with SimSiam encoder"
             echo "  ENCODER_TYPE=simsiam $0 all     # Train with SimSiam via env var"
             echo "  HPO_ENCODER_TRIALS=50 $0 hpo    # Run HPO with 50 encoder trials"
+            echo ""
+            echo "Version Compatibility Rules:"
+            echo "  - Encoder and Classifier have SEPARATE versions"
+            echo "  - Classifier stores which encoder version it was trained with"
+            echo "  - If Encoder is updated, Classifier MUST be retrained"
+            echo "  - Deployment (recommend) FAILS if versions don't match"
+            echo ""
+            echo "Resume/Incremental Training Examples:"
+            echo "  # Train v1 (initial training)"
+            echo "  $0 all"
+            echo ""
+            echo "  # Update classifier only (encoder unchanged)"
+            echo "  $0 classifier --classifier-version v2"
+            echo ""
+            echo "  # Update encoder (requires new classifier)"
+            echo "  $0 encoder --resume-checkpoint checkpoints/encoder_best.pt --encoder-version v2"
+            echo "  $0 classifier --classifier-version v1  # New classifier for encoder v2"
+            echo "  $0 recommend"
             exit 1
             ;;
     esac
