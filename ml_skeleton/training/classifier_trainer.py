@@ -7,10 +7,12 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 from tqdm import tqdm
 import time
 import numpy as np
+
+from ..utils.early_stopping import EarlyStopping
 
 
 class ClassifierTrainer:
@@ -18,12 +20,14 @@ class ClassifierTrainer:
 
     Trains on pre-extracted embeddings from Stage 1.
     Predicts continuous ratings in [0, 1] range.
+    Supports MLflow metric logging for learning curves.
 
     Args:
         classifier: Rating classifier model (conforms to RatingClassifier protocol)
         device: Device to train on ('cuda' or 'cpu')
         loss_fn: Loss function (typically MSE)
         optimizer: PyTorch optimizer
+        tracker: Optional MLflow tracker (ExplrTracker) for logging metrics
     """
 
     def __init__(
@@ -31,16 +35,20 @@ class ClassifierTrainer:
         classifier: nn.Module,
         device: str,
         loss_fn: nn.Module,
-        optimizer: torch.optim.Optimizer
+        optimizer: torch.optim.Optimizer,
+        tracker: Optional[Any] = None
     ):
         self.classifier = classifier.to(device)
         self.device = device
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        self.tracker = tracker  # MLflow tracker for logging learning curves
 
         # Training state
         self.current_epoch = 0
         self.best_loss = float('inf')
+        self.best_mae = float('inf')
+        self.best_correlation = 0.0
         self.history = {
             "train_loss": [],
             "val_loss": [],
@@ -154,9 +162,11 @@ class ClassifierTrainer:
         val_loader: Optional[DataLoader],
         num_epochs: int,
         checkpoint_dir: str = "./checkpoints",
-        save_best_only: bool = True
+        save_best_only: bool = True,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_min_delta: float = 0.0
     ) -> dict:
-        """Full training loop.
+        """Full training loop with optional early stopping.
 
         Args:
             train_loader: Training data loader
@@ -164,6 +174,9 @@ class ClassifierTrainer:
             num_epochs: Number of epochs to train
             checkpoint_dir: Directory to save checkpoints
             save_best_only: If True, only saves best model
+            early_stopping_patience: Number of epochs to wait for improvement before stopping
+                                     (None = no early stopping)
+            early_stopping_min_delta: Minimum improvement to count as progress
 
         Returns:
             Dictionary with training history
@@ -171,7 +184,18 @@ class ClassifierTrainer:
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"Training classifier for {num_epochs} epochs")
+        # Initialize early stopping if enabled
+        early_stop = None
+        if early_stopping_patience is not None and val_loader is not None:
+            early_stop = EarlyStopping(
+                patience=early_stopping_patience,
+                min_delta=early_stopping_min_delta,
+                mode='min',
+                verbose=True
+            )
+            print(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
+
+        print(f"Training classifier for up to {num_epochs} epochs")
         print(f"Device: {self.device}")
         print(f"Checkpoint dir: {checkpoint_dir}")
 
@@ -197,11 +221,48 @@ class ClassifierTrainer:
                 print(f"  Val MAE: {val_metrics['mae']:.4f}")
                 print(f"  Val Correlation: {val_metrics['correlation']:.4f}")
 
+            # Log metrics to MLflow for learning curves
+            if self.tracker is not None:
+                self.tracker.log_metric('classifier/train_loss', train_metrics['loss'], step=epoch)
+                if val_metrics:
+                    self.tracker.log_metric('classifier/val_loss', val_metrics['loss'], step=epoch)
+                    self.tracker.log_metric('classifier/val_mae', val_metrics['mae'], step=epoch)
+                    self.tracker.log_metric('classifier/val_correlation', val_metrics['correlation'], step=epoch)
+                self.tracker.log_metric('classifier/epoch_time', epoch_time, step=epoch)
+
+            # Track best metrics
+            if val_metrics:
+                if val_metrics['mae'] < self.best_mae:
+                    self.best_mae = val_metrics['mae']
+                if val_metrics['correlation'] > self.best_correlation:
+                    self.best_correlation = val_metrics['correlation']
+
             # Save checkpoint
             current_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
 
+            # Check early stopping
+            if early_stop is not None:
+                if early_stop(current_loss, epoch):
+                    # Early stopping triggered
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                    break
+
             if save_best_only:
-                if current_loss < self.best_loss:
+                # Save only if this is the best model (either by early stopping or manual check)
+                if early_stop and early_stop.should_save_checkpoint():
+                    self.best_loss = current_loss
+                    self.save_checkpoint(
+                        checkpoint_dir / "classifier_best.pt",
+                        metrics={
+                            "loss": current_loss,
+                            "mae": val_metrics.get('mae') if val_metrics else None,
+                            "correlation": val_metrics.get('correlation') if val_metrics else None,
+                            "epoch": epoch
+                        }
+                    )
+                    print(f"  Saved best model (loss: {current_loss:.4f})")
+                elif not early_stop and current_loss < self.best_loss:
                     self.best_loss = current_loss
                     self.save_checkpoint(
                         checkpoint_dir / "classifier_best.pt",
@@ -224,6 +285,18 @@ class ClassifierTrainer:
             checkpoint_dir / "classifier_final.pt",
             metrics={"epoch": num_epochs}
         )
+
+        # Log final summary metrics to MLflow
+        if self.tracker is not None:
+            epochs_completed = len(self.history['train_loss'])
+            self.tracker.log_metric('classifier/epochs_completed', epochs_completed)
+            self.tracker.log_metric('classifier/best_val_loss', self.best_loss)
+            self.tracker.log_metric('classifier/best_val_mae', self.best_mae)
+            self.tracker.log_metric('classifier/best_val_correlation', self.best_correlation)
+            if self.history['train_loss']:
+                self.tracker.log_metric('classifier/final_train_loss', self.history['train_loss'][-1])
+            if self.history['val_loss']:
+                self.tracker.log_metric('classifier/final_val_loss', self.history['val_loss'][-1])
 
         return self.history
 

@@ -56,8 +56,16 @@ class SimpleAudioEncoder(nn.Module):
         # Global average pooling (reduces temporal dimension to 1)
         self.global_pool = nn.AdaptiveAvgPool1d(1)
 
-        # Project to embedding space
-        self.projection = nn.Linear(base_channels * 8, embedding_dim)
+        # Project to embedding space with Batch Normalization
+        # Using an MLP projection head is standard for contrastive learning
+        backbone_dim = base_channels * 8
+        self.projection = nn.Sequential(
+            nn.Linear(backbone_dim, backbone_dim),
+            nn.BatchNorm1d(backbone_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(backbone_dim, embedding_dim),
+            nn.BatchNorm1d(embedding_dim)
+        )
 
     def _make_conv_block(self, in_channels: int, out_channels: int) -> nn.Module:
         """Create a conv1d block with batch norm, activation, and pooling."""
@@ -80,7 +88,7 @@ class SimpleAudioEncoder(nn.Module):
         Args:
             audio: Raw audio waveform tensor
                    Shape: (batch_size, num_samples)
-                   Example: (32, 480000) for 30s at 16000 Hz
+                   Example: (32, 960000) for 60s at 16000 Hz
 
         Returns:
             embeddings: Fixed-dimensional embedding vectors

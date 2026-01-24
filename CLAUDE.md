@@ -76,7 +76,7 @@ Two-phase training pipeline for music recommendations using Clementine database:
 - Multi-album support (songs on multiple albums averaged in loss)
 - Album key format: "artist|||album" for uniqueness
 - Multiprocessing default: 80% CPU cores
-- Center-crop extraction: 30s from middle of song
+- End-crop extraction: 60s from end of song (with z-normalization)
 - Embedding versioning: A/B testing support
 - READ-ONLY operations: All audio file access is read-only
 

@@ -40,7 +40,7 @@ hyperparameters:
 
   # Encoder training
   encoder_lr: 0.001
-  encoder_epochs: 50
+  encoder_epochs: 20
   encoder_batch_size: 32
 
 # MLflow tracking

@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .metadata_utils import is_unknown_artist, is_unknown_album
+
 
 class RatingLoss(nn.Module):
     """Simple MSE loss for rating prediction.
@@ -352,6 +354,225 @@ class SupervisedContrastiveLoss(nn.Module):
         return loss
 
 
+class MetadataContrastiveLoss(nn.Module):
+    """Metadata-based contrastive loss (NO RATING INFORMATION).
+
+    Creates positive pairs based on music similarity (artist, album, year).
+    This ensures the encoder learns audio features without any rating bias.
+
+    Positive pairs are defined as songs that share:
+    - Same artist, OR
+    - Same album, OR
+    - Released within year_threshold years
+
+    Args:
+        temperature: Temperature scaling parameter
+        year_threshold: Max year difference for positive pairs (default: 5 years)
+        use_artist: Use same artist as positive signal
+        use_album: Use same album as positive signal
+        use_year: Use similar year as positive signal
+    """
+
+    def __init__(
+        self,
+        temperature: float = 0.5,
+        year_threshold: int = 5,
+        use_artist: bool = True,
+        use_album: bool = True,
+        use_year: bool = True
+    ):
+        super().__init__()
+        self.temperature = temperature
+        self.year_threshold = year_threshold
+        self.use_artist = use_artist
+        self.use_album = use_album
+        self.use_year = use_year
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        artists: list[str],
+        albums: list[str],
+        years: list[int]
+    ) -> torch.Tensor:
+        """Compute metadata-based contrastive loss.
+
+        Args:
+            embeddings: Shape (batch_size, embedding_dim)
+            artists: List of artist names (length: batch_size)
+            albums: List of album names (length: batch_size)
+            years: List of release years (length: batch_size)
+
+        Returns:
+            loss: Scalar loss value
+        """
+        device = embeddings.device
+        batch_size = embeddings.size(0)
+
+        if batch_size < 2:
+            # Need at least 2 songs for contrastive learning
+            return torch.zeros(1, device=device, requires_grad=True).mean()
+
+        # Normalize embeddings
+        embeddings = F.normalize(embeddings, dim=1)
+
+        # Compute similarity matrix
+        similarity_matrix = torch.matmul(embeddings, embeddings.T)
+        similarity_matrix = similarity_matrix / self.temperature
+
+        # Create positive pair mask based on metadata similarity
+        # IMPORTANT: Mask out unknown/placeholder metadata values
+        pos_mask = torch.zeros((batch_size, batch_size), device=device)
+
+        for i in range(batch_size):
+            for j in range(batch_size):
+                if i == j:
+                    continue  # Skip self
+
+                is_positive = False
+
+                # Same artist? (only if both have valid artist metadata)
+                if self.use_artist and not is_unknown_artist(artists[i]) and not is_unknown_artist(artists[j]):
+                    if artists[i] == artists[j]:
+                        is_positive = True
+
+                # Same album? (only if both have valid album metadata)
+                if self.use_album and not is_unknown_album(albums[i]) and not is_unknown_album(albums[j]):
+                    if albums[i] == albums[j]:
+                        is_positive = True
+
+                # Similar year? (only if both have valid year)
+                if self.use_year and years[i] is not None and years[j] is not None:
+                    if years[i] > 0 and years[j] > 0:  # Valid year check
+                        year_diff = abs(years[i] - years[j])
+                        if year_diff <= self.year_threshold:
+                            is_positive = True
+
+                if is_positive:
+                    pos_mask[i, j] = 1.0
+
+        # Check if we have any positive pairs
+        if pos_mask.sum() == 0:
+            # No positive pairs found - return zero loss with gradient
+            return torch.zeros(1, device=device, requires_grad=True).mean()
+
+        # Compute loss for each anchor
+        exp_sim = torch.exp(similarity_matrix)
+
+        # Sum over all similarities (excluding self)
+        sum_exp_sim = exp_sim.sum(dim=1, keepdim=True) - torch.diag(exp_sim).unsqueeze(1)
+
+        # For each anchor, sum over all positive pairs
+        losses = []
+
+        for i in range(batch_size):
+            num_pos = pos_mask[i].sum()
+            if num_pos > 0:
+                # Sum positive similarities
+                pos_sim = (exp_sim[i] * pos_mask[i]).sum()
+                # Loss: -log(pos / sum)
+                anchor_loss = -torch.log(pos_sim / (sum_exp_sim[i] + 1e-8))
+                losses.append(anchor_loss)
+
+        if len(losses) > 0:
+            loss = torch.stack(losses).mean()
+        else:
+            # No valid positive pairs - return zero loss with gradient
+            loss = torch.zeros(1, device=device, requires_grad=True).mean()
+
+        return loss
+
+
+class SimSiamLoss(nn.Module):
+    """SimSiam loss function for self-supervised contrastive learning.
+
+    SimSiam uses a symmetric loss with stop-gradient on the projection outputs.
+    This prevents representation collapse without requiring negative pairs,
+    large batch sizes, or momentum encoders.
+
+    The loss is:
+        L = D(p1, stopgrad(z2)) / 2 + D(p2, stopgrad(z1)) / 2
+
+    where D(p, z) = -cosine_similarity(p, z) = -(p·z) / (||p|| ||z||)
+
+    Reference:
+        "Exploring Simple Siamese Representation Learning" (Chen & He, 2020)
+        https://arxiv.org/abs/2011.10566
+
+    Args:
+        None - SimSiam loss has no hyperparameters
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        p1: torch.Tensor,
+        p2: torch.Tensor,
+        z1: torch.Tensor,
+        z2: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute SimSiam loss.
+
+        Args:
+            p1: Predictions from view 1, shape (batch_size, projection_dim)
+            p2: Predictions from view 2, shape (batch_size, projection_dim)
+            z1: Projections from view 1, shape (batch_size, projection_dim)
+            z2: Projections from view 2, shape (batch_size, projection_dim)
+
+        Returns:
+            loss: Scalar loss value (negative cosine similarity)
+
+        Note:
+            The stop-gradient (z.detach()) is CRITICAL to prevent collapse.
+            Without it, the network can trivially minimize loss by outputting
+            constant representations.
+        """
+        # CRITICAL: Stop gradient on projections (z) to prevent collapse
+        z1 = z1.detach()
+        z2 = z2.detach()
+
+        # L2 normalize all vectors
+        p1 = F.normalize(p1, dim=1)
+        p2 = F.normalize(p2, dim=1)
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1)
+
+        # Negative cosine similarity (symmetric)
+        # D(p1, z2) + D(p2, z1) where D = -cosine_sim
+        loss = -(p1 * z2).sum(dim=1).mean() / 2 \
+               -(p2 * z1).sum(dim=1).mean() / 2
+
+        return loss
+
+    def forward_single(
+        self,
+        p: torch.Tensor,
+        z: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute single-direction SimSiam loss (for asymmetric use cases).
+
+        Args:
+            p: Predictions, shape (batch_size, projection_dim)
+            z: Projections (will be detached), shape (batch_size, projection_dim)
+
+        Returns:
+            loss: Scalar loss value
+        """
+        # Stop gradient on z
+        z = z.detach()
+
+        # L2 normalize
+        p = F.normalize(p, dim=1)
+        z = F.normalize(z, dim=1)
+
+        # Negative cosine similarity
+        loss = -(p * z).sum(dim=1).mean()
+
+        return loss
+
+
 def build_album_mapping(songs: list) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Build album mappings for multi-album support.
 
@@ -364,12 +585,17 @@ def build_album_mapping(songs: list) -> tuple[dict[str, int], dict[str, list[str
 
     Note:
         Album key format: "artist|||album" (handles same album name by different artists)
+        Albums with unknown/placeholder metadata are excluded
     """
-    # Collect all unique albums
+    # Collect all unique albums (excluding unknown metadata)
     albums_set = set()
     filename_to_albums_list = {}
 
     for song in songs:
+        # Skip songs with unknown artist or album metadata
+        if is_unknown_artist(song.artist) or is_unknown_album(song.album):
+            continue
+
         # Create album key (artist|||album)
         album_key = f"{song.artist}|||{song.album}"
         albums_set.add(album_key)

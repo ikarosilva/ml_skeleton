@@ -44,6 +44,7 @@ IMPORTANT NOTES:
 
 from __future__ import annotations
 
+import gc
 import os
 from typing import Optional
 
@@ -162,6 +163,13 @@ def limit_gpu_memory(
 
 def _limit_pytorch_memory(max_memory_gb: float, device_id: int) -> bool:
     """Configure PyTorch memory limit."""
+    # Set allocation config BEFORE initializing CUDA context to avoid fragmentation
+    # This must be done before any CUDA call
+    if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            "max_split_size_mb:512,expandable_segments:True"
+        )
+
     try:
         import torch
 
@@ -181,12 +189,6 @@ def _limit_pytorch_memory(max_memory_gb: float, device_id: int) -> bool:
 
         # Set memory fraction
         torch.cuda.set_per_process_memory_fraction(fraction, device_id)
-
-        # Also set max_split_size to help with fragmentation
-        # This is set via environment variable
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
-            f"max_split_size_mb:512,expandable_segments:True"
-        )
 
         return True
 
@@ -305,3 +307,22 @@ def auto_configure_memory() -> None:
     """
     if os.environ.get(ENV_VAR_NAME):
         limit_gpu_memory()
+
+
+def cleanup_memory() -> None:
+    """
+    Force garbage collection and empty CUDA cache.
+
+    Useful to reclaim memory between training stages or experiments
+    without restarting the python process.
+    """
+    # Force Python garbage collection
+    gc.collect()
+
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except ImportError:
+        pass

@@ -111,10 +111,10 @@ class ExperimentConfig:
         config = ExperimentConfig(
             name="mnist_experiment",
             framework="pytorch",
-            hyperparameters={"epochs": 50, "patience": 5},
+            hyperparameters={"epochs": 20, "patience": 5},
             tuning=TuningConfig(
                 tuner_type=TunerType.OPTUNA,
-                n_trials=50
+                n_trials=20
             )
         )
     """

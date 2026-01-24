@@ -1,15 +1,28 @@
+*git push 
+
+*python examples/music_recommendation.py --encoder-type simsiam
+
+*fix mlflow logging
+
+*torch tensors @ 16bit resolution
+
+*what parametre of annealing can we tune?
+
+*review log for major issues
+
+
 
 *write a plan for an inference pipeline (CLI based). make batch size configurable
 with size of 500 files. The input argument should be the database location
 
-**
-Alot of files may have artist, filename, and albums with generic 
-unknown names in either English of Portuguese. For example:
-are name "Unknown", "Desconhecido"
-Check how the clementine handles these (we may be able to recycle their 
-code), and make sure we masks these labels from the encoder loss. In
-cases where everything is unknown, we may wish to skip those tracks for
-now.
+
+Dynamic augmentations transforms for the encoder (small noise) ?
+
+*Capture diversity of labels ? Generate a playlist that prioritizes songs that are in
+sparse location in the embeddings. Called recommender_sparse.xspf.
+
+Unlabelled songs?
+How leverage MusicBrainz?
 
 *Not sure if SQLite is best caching mechanism for features.
 Should we use Parquet files instead in a ./cache folder? Make 
@@ -22,17 +35,3 @@ interactive. Can you find a pleasant way to have a drop
 down menu where we can add select a meta tag to add 
 without making the graph to noisy ? The meta tags that 
 would be switched on/off would be : Genre and year.
-
-
-Dynamic augmentations transforms for the encoder (small noise) ?
-
-
-
-*Capture diversity of labels ? Option to prioritize labels that are in
-sparse location in the embeddings
-
-
-
-
-Unlabelled songs?
-How leverage MusicBrainz?

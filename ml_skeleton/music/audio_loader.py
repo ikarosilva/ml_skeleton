@@ -1,6 +1,23 @@
 """Audio loading utilities with multiprocessing support.
 
 CRITICAL: All operations are READ-ONLY. Audio files are NEVER modified.
+
+Performance optimizations:
+- Resampling uses cached torchaudio.transforms.Resample objects (LRU cache)
+- PyTorch DataLoader workers handle parallel loading automatically
+- prefetch_factor enables pre-loading multiple batches per worker
+- persistent_workers keeps workers alive between epochs (reduces startup overhead)
+
+Example usage with DataLoader:
+    from torch.utils.data import DataLoader
+    loader = DataLoader(
+        dataset,
+        batch_size=32,
+        num_workers=4,           # 4 parallel workers
+        prefetch_factor=4,       # Pre-load 4 batches per worker
+        persistent_workers=True, # Keep workers alive
+        pin_memory=True          # Speed up GPU transfer
+    )
 """
 
 import torch
@@ -8,12 +25,12 @@ import torchaudio
 from pathlib import Path
 from typing import Optional
 import multiprocessing
-from functools import partial
+from functools import partial, lru_cache
 
 
 def get_default_workers() -> int:
     """Get default number of workers (80% of CPU cores).
-    
+
     Returns:
         Number of worker processes (minimum 1)
     """
@@ -21,32 +38,59 @@ def get_default_workers() -> int:
     return max(1, int(cpu_count * 0.8))
 
 
+@lru_cache(maxsize=8)
+def get_resampler(orig_freq: int, new_freq: int) -> torchaudio.transforms.Resample:
+    """Get cached resampler for given frequency pair.
+
+    Caching resamplers improves performance when resampling many files
+    with the same source/target sample rates.
+
+    Args:
+        orig_freq: Original sample rate (Hz)
+        new_freq: Target sample rate (Hz)
+
+    Returns:
+        Cached Resample transform
+    """
+    return torchaudio.transforms.Resample(orig_freq, new_freq)
+
+
 def load_audio_file(
     filepath: str,
     sample_rate: int = 16000,
     mono: bool = True,
-    duration: Optional[float] = 30.0,
-    center_crop: bool = True,
-    max_duration: float = 900.0
+    duration: Optional[float] = 60.0,
+    crop_position: str = "end",
+    normalize: bool = True,
+    max_duration: float = 900.0,
+    center_crop: Optional[bool] = None,
+    noise_level: float = 0.0
 ) -> Optional[torch.Tensor]:
     """Load single audio file (READ-ONLY).
-    
+
     Args:
         filepath: Path to audio file
         sample_rate: Target sample rate (Hz)
         mono: Convert to mono if True
         duration: Duration in seconds to extract (None = full song)
-        center_crop: If True, extract from center; if False, from beginning
+        crop_position: Where to extract from - "start", "center", or "end" (default: "end")
+        normalize: Apply z-normalization (zero mean, unit variance) if True
         max_duration: Skip files longer than this (default: 900s = 15 minutes)
-    
+        center_crop: DEPRECATED - use crop_position instead (for backward compatibility)
+        noise_level: Standard deviation of Gaussian noise to add (0.0 = no noise)
+
     Returns:
         Audio tensor of shape (num_samples,) if mono, or None if file invalid/too long
-        
+
     Note:
         - This function is READ-ONLY - audio files are NEVER modified
         - Uses torchaudio.load() which opens files in read-only mode
         - Long files (>max_duration) are skipped to filter out live albums, DJ sets
+        - Z-normalization: (audio - mean) / std, prevents volume differences from affecting features
     """
+    # Handle deprecated center_crop parameter
+    if center_crop is not None:
+        crop_position = "center" if center_crop else "start"
     try:
         filepath = Path(filepath)
         
@@ -67,20 +111,29 @@ def load_audio_file(
             # Load full file
             waveform, sr = torchaudio.load(str(filepath))
         else:
-            # Calculate frame offset for center crop
+            # Calculate frame offset based on crop position
             target_frames = int(duration * info.sample_rate)
-            
-            if center_crop and file_duration > duration:
-                # Extract from center
-                start_frame = (info.num_frames - target_frames) // 2
+
+            if file_duration > duration:
+                # File is longer than target duration - extract segment
+                if crop_position == "center":
+                    # Extract from center
+                    start_frame = (info.num_frames - target_frames) // 2
+                elif crop_position == "end":
+                    # Extract from end
+                    start_frame = info.num_frames - target_frames
+                else:  # "start" or default
+                    # Extract from beginning
+                    start_frame = 0
+
                 waveform, sr = torchaudio.load(
                     str(filepath),
                     frame_offset=start_frame,
                     num_frames=target_frames
                 )
             else:
-                # Extract from beginning or load full file if shorter than duration
-                frames_to_load = min(target_frames, info.num_frames)
+                # File is shorter than target duration - load full file
+                frames_to_load = info.num_frames
                 waveform, sr = torchaudio.load(
                     str(filepath),
                     frame_offset=0,
@@ -92,17 +145,17 @@ def load_audio_file(
             waveform = waveform.mean(dim=0, keepdim=False)
         elif mono:
             waveform = waveform.squeeze(0)
-        
-        # Resample if needed
+
+        # Resample if needed (uses cached resampler for efficiency)
         if sr != sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, sample_rate)
+            resampler = get_resampler(sr, sample_rate)
             waveform = resampler(waveform)
         
         # Pad or truncate to exact duration if specified
         if duration is not None:
             target_length = int(duration * sample_rate)
             current_length = waveform.shape[-1] if waveform.dim() > 0 else len(waveform)
-            
+
             if current_length < target_length:
                 # Pad with zeros
                 padding = target_length - current_length
@@ -110,7 +163,23 @@ def load_audio_file(
             elif current_length > target_length:
                 # Truncate
                 waveform = waveform[:target_length]
-        
+
+        # Apply z-normalization (standardization) if requested
+        # This ensures consistent amplitude across different recordings
+        if normalize:
+            mean = waveform.mean()
+            std = waveform.std()
+            # Avoid division by zero for silent audio
+            if std > 1e-8:
+                waveform = (waveform - mean) / std
+            else:
+                # Silent audio - just center at zero
+                waveform = waveform - mean
+
+        # Add white noise (dynamic augmentation)
+        if noise_level > 0.0:
+            waveform = waveform + torch.randn_like(waveform) * noise_level
+
         return waveform
         
     except Exception as e:
@@ -123,26 +192,28 @@ def load_audio_batch(
     filepaths: list[str],
     sample_rate: int = 16000,
     mono: bool = True,
-    duration: Optional[float] = 30.0,
-    center_crop: bool = True,
+    duration: Optional[float] = 60.0,
+    crop_position: str = "end",
+    normalize: bool = True,
     max_duration: float = 900.0,
     num_workers: Optional[int] = None
 ) -> list[Optional[torch.Tensor]]:
     """Load multiple audio files in parallel (READ-ONLY).
-    
+
     Args:
         filepaths: List of audio file paths
         sample_rate: Target sample rate
         mono: Convert to mono
         duration: Duration to extract
-        center_crop: Extract from center or beginning
+        crop_position: Where to extract from - "start", "center", or "end"
+        normalize: Apply z-normalization
         max_duration: Skip files longer than this
         num_workers: Number of parallel workers (default: 80% CPU cores)
-    
+
     Returns:
         List of audio tensors (same order as filepaths)
         None entries for files that couldn't be loaded
-        
+
     Note:
         - All operations are READ-ONLY
         - Uses multiprocessing.Pool for parallel loading
@@ -150,14 +221,15 @@ def load_audio_batch(
     """
     if num_workers is None:
         num_workers = get_default_workers()
-    
+
     # Create partial function with fixed parameters
     load_fn = partial(
         load_audio_file,
         sample_rate=sample_rate,
         mono=mono,
         duration=duration,
-        center_crop=center_crop,
+        crop_position=crop_position,
+        normalize=normalize,
         max_duration=max_duration
     )
     
@@ -166,6 +238,145 @@ def load_audio_batch(
         results = pool.map(load_fn, filepaths)
     
     return results
+
+
+def load_audio_file_with_jitter(
+    filepath: str,
+    sample_rate: int = 16000,
+    mono: bool = True,
+    duration: float = 60.0,
+    crop_position: str = "end",
+    normalize: bool = True,
+    max_duration: float = 900.0,
+    jitter_seconds: float = 5.0,
+    noise_level: float = 0.0
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Load two different crops from the same audio file for contrastive learning.
+
+    Returns two views of the same song with different random offsets.
+    This creates guaranteed positive pairs for self-supervised learning.
+
+    Args:
+        filepath: Path to audio file
+        sample_rate: Target sample rate (Hz)
+        mono: Convert to mono if True
+        duration: Duration in seconds to extract
+        crop_position: Base position for extraction - "start", "center", or "end"
+        normalize: Apply z-normalization if True
+        max_duration: Skip files longer than this
+        jitter_seconds: Random offset range for second crop (±jitter_seconds)
+        noise_level: Standard deviation of Gaussian noise to add (0.0 = no noise)
+
+    Returns:
+        Tuple of (view1, view2) audio tensors, or (None, None) if loading fails
+
+    Note:
+        - view1: Standard crop at crop_position
+        - view2: Same song with random offset (within ±jitter_seconds of view1)
+    """
+    import random
+
+    try:
+        filepath = Path(filepath)
+
+        if not filepath.exists():
+            return None, None
+
+        # Get audio info
+        info = torchaudio.info(str(filepath))
+        file_duration = info.num_frames / info.sample_rate
+
+        # Skip very long files
+        if file_duration > max_duration:
+            return None, None
+
+        # Calculate target frames
+        target_frames = int(duration * info.sample_rate)
+        jitter_frames = int(jitter_seconds * info.sample_rate)
+
+        # Determine base start position
+        if file_duration > duration:
+            if crop_position == "center":
+                base_start = (info.num_frames - target_frames) // 2
+            elif crop_position == "end":
+                base_start = info.num_frames - target_frames
+            else:  # "start"
+                base_start = 0
+        else:
+            # File is shorter than target - use full file
+            base_start = 0
+            target_frames = info.num_frames
+
+        # View 1: Standard crop
+        waveform1, sr = torchaudio.load(
+            str(filepath),
+            frame_offset=base_start,
+            num_frames=min(target_frames, info.num_frames - base_start)
+        )
+
+        # View 2: Jittered crop (different random offset)
+        # Calculate valid jitter range
+        max_jitter_back = min(jitter_frames, base_start)
+        max_jitter_forward = min(jitter_frames, info.num_frames - base_start - target_frames)
+
+        # Random jitter within valid range
+        jitter_offset = random.randint(-max_jitter_back, max(0, max_jitter_forward))
+        jittered_start = max(0, base_start + jitter_offset)
+
+        # Ensure we don't exceed file bounds
+        frames_available = info.num_frames - jittered_start
+        frames_to_load = min(target_frames, frames_available)
+
+        waveform2, _ = torchaudio.load(
+            str(filepath),
+            frame_offset=jittered_start,
+            num_frames=frames_to_load
+        )
+
+        # Process both waveforms
+        processed = []
+        for waveform in [waveform1, waveform2]:
+            # Convert to mono
+            if mono and waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=False)
+            elif mono:
+                waveform = waveform.squeeze(0)
+
+            # Resample if needed
+            if sr != sample_rate:
+                resampler = get_resampler(sr, sample_rate)
+                waveform = resampler(waveform)
+
+            # Pad or truncate to exact duration
+            target_length = int(duration * sample_rate)
+            current_length = waveform.shape[-1] if waveform.dim() > 0 else len(waveform)
+
+            if current_length < target_length:
+                padding = target_length - current_length
+                waveform = torch.nn.functional.pad(waveform, (0, padding))
+            elif current_length > target_length:
+                waveform = waveform[:target_length]
+
+            # Z-normalization
+            if normalize:
+                mean = waveform.mean()
+                std = waveform.std()
+                if std > 1e-8:
+                    waveform = (waveform - mean) / std
+                else:
+                    waveform = waveform - mean
+
+            # Add white noise (dynamic augmentation)
+            if noise_level > 0.0:
+                waveform = waveform + torch.randn_like(waveform) * noise_level
+
+            processed.append(waveform)
+
+        return processed[0], processed[1]
+
+    except Exception as e:
+        print(f"Warning: Could not load {filepath} for augmentation: {e}")
+        return None, None
 
 
 def get_audio_info(filepath: str) -> Optional[dict]:

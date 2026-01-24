@@ -22,13 +22,16 @@ music:
 
   # Audio loading parameters
   sample_rate: 16000  # Hz
-  audio_duration: 30.0  # seconds
-  center_crop: true  # Extract from center of song
+  audio_duration: 60.0  # seconds (changed from 30s to capture more context from end of songs)
+  crop_position: "end"  # Extract from: "start", "center", or "end" (end = last 60s of song)
+  normalize: true  # Apply z-normalization (zero mean, unit variance) for consistent amplitude
   max_duration: 900.0  # Skip files >15 minutes (filters live albums, DJ sets, podcasts)
 
-  # Multiprocessing
-  num_workers: null  # null = 80% of CPU cores
-  dataloader_workers: 4  # Workers for DataLoader
+  # Multiprocessing (optimized for parallel audio loading and resampling)
+  num_workers: null  # null = 80% of CPU cores (for batch operations)
+  dataloader_workers: 16 #TODO  # Workers for DataLoader (each worker loads+resamples audio in parallel)
+  # Note: Audio resampling (e.g., 44100Hz -> 16000Hz) is done in parallel across workers
+  # with cached resamplers for efficiency and prefetch_factor=4 for better throughput
 
   # Speech detection filtering (optional)
   speech_threshold: 0.5  # Filter songs with speech probability > threshold
@@ -40,51 +43,146 @@ music:
   only_rated: false  # Include unrated songs in encoder training (masked in loss)
   train_split: 0.8  # Train/val split ratio
 
+  # Unknown metadata filtering (for encoder training only)
+  # Many tracks have generic placeholder values like "Unknown", "Desconhecido" (Portuguese), etc.
+  # These are masked in the loss functions, but if ALL metadata is unknown, the track is skipped.
+  # Classifier training will still use these tracks (only needs embeddings + ratings, not metadata)
+  skip_unknown_metadata: true  # Skip tracks where artist, album, and title are all unknown
+
   # Multi-album support
   use_multi_task: false  # If true, enables album classification loss
   album_weight: 0.5  # Weight for album classification loss
 
 # Stage 1: Encoder training hyperparameters
 encoder:
-  # Model architecture
+  # ============================================================
+  # ENCODER TYPE SELECTOR (A/B Testing)
+  # ============================================================
+  # Change this single value to switch encoder strategies:
+  #   - "simple"  : Current 1D CNN on raw waveform (baseline)
+  #   - "simsiam" : SimSiam with ResNet backbone on spectrograms (NEW)
+  # ============================================================
+  encoder_type: "simple"  # ← Change to "simsiam" for new approach
+
+  # ------------------------------------------------------------
+  # Common settings (used by all encoder types)
+  # ------------------------------------------------------------
   embedding_dim: 512
-  base_channels: 32  # For SimpleAudioEncoder
+  base_channels: 32  # For backwards compatibility with simple encoder
 
   # Training
-  epochs: 50
-  batch_size: 32
+  # epochs: Number of training epochs
+  #   - For hyperparameter tuning (HPO): Use 20 epochs for faster trial evaluation
+  #   - For final training with optimized hyperparameters: Use final_training_epochs (50 epochs)
+  epochs: 20  # Default for HPO trials
+  final_training_epochs: 50  # Use this for final training with best hyperparameters
+  batch_size: 32  # Reduced for testing
   learning_rate: 0.001
-  weight_decay: 0.0001
 
-  # Optimizer
-  optimizer: "adam"  # adam, sgd, adamw
-  scheduler: "reduce_on_plateau"  # reduce_on_plateau, cosine, step, null
-  scheduler_patience: 5
-  scheduler_factor: 0.5
+  # Early stopping (especially useful for hyperparameter tuning)
+  early_stopping_patience: 10  # Stop if no improvement for N epochs (null = disabled)
+  early_stopping_min_delta: 0.0001  # Minimum improvement to count as progress
 
-  # Loss function
-  loss_type: "supervised_contrastive"  # mse, contrastive, supervised_contrastive
+  # Optimizer (Always use Adam with cosine scheduler for hyperparameter tuning)
+  optimizer: "adam"  # Fixed: adam (with cosine scheduler)
+  scheduler: "cosine"  # Fixed: cosine annealing
+
+  # Adam optimizer parameters (all tunable via hyperparameter search)
+  adam_betas: [0.9, 0.999]  # Coefficients for computing running averages (beta1, beta2)
+  adam_eps: 1.0e-08  # Term added to denominator for numerical stability
+  adam_weight_decay: 0.0001  # Weight decay (L2 penalty)
+  adam_amsgrad: false  # Whether to use AMSGrad variant
+  adam_decoupled_weight_decay: false  # If true, uses AdamW-style decoupled weight decay
+
+  # Loss function (NO RATING INFORMATION!)
+  loss_type: "metadata_contrastive"  # metadata_contrastive, supervised_contrastive, contrastive, mse
   contrastive_temperature: 0.5
-  rating_threshold: 0.2  # For supervised contrastive loss
+
+  # Metadata contrastive loss parameters (uses artist/album/year, NOT ratings)
+  year_threshold: 5  # Songs within ±N years are considered similar (only if use_year=true)
+  use_artist: true   # Same artist = positive pair
+  use_album: true    # Same album = positive pair
+  use_year: false    # DISABLED: year matching is too weak a signal, causes mode collapse
+
+  # Augmentation-based contrastive learning (same song, different crops = positive pair)
+  use_augmentation: true  # Enable dual-crop augmentation for guaranteed positive pairs
+  crop_jitter: 5.0        # Random offset in seconds for second crop (creates variety)
+  noise_level: 0.005      # Add small white noise (std dev) to augmentations
+
+  # Supervised contrastive loss parameters (DEPRECATED: uses rating info!)
+  rating_threshold: 0.2  # Max rating difference for positive pairs
+
+  # ------------------------------------------------------------
+  # Simple encoder settings (encoder_type: "simple")
+  # These settings are only used when encoder_type is "simple"
+  # ------------------------------------------------------------
+  simple:
+    base_channels: 32  # Starting number of channels (doubles each block)
+
+  # ------------------------------------------------------------
+  # SimSiam encoder settings (encoder_type: "simsiam")
+  # These settings are only used when encoder_type is "simsiam"
+  # ------------------------------------------------------------
+  simsiam:
+    # Backbone architecture
+    backbone: "resnet50"        # "resnet18", "resnet34", "resnet50"
+    pretrained_backbone: false  # Use ImageNet weights for backbone?
+
+    # MLP architecture
+    projection_dim: 2048        # Output dimension of projection MLP (z)
+    predictor_hidden_dim: 512   # Bottleneck dimension in predictor MLP
+
+    # Spectrogram settings
+    n_mels: 128                 # Number of mel frequency bins
+    n_fft: 2048                 # FFT window size
+    hop_length: 512             # Hop length for STFT
+
+    # Audio augmentation pipeline
+    augmentation:
+      time_stretch_range: [0.8, 1.2]   # Speed up/slow down factor range
+      pitch_shift_range: [-2, 2]       # Semitones to shift
+      noise_snr_range: [15, 30]        # Signal-to-noise ratio in dB
+      spec_augment: true               # Enable SpecAugment (time/freq masking)
+      frequency_mask_param: 27         # Max frequency bins to mask
+      time_mask_param: 100             # Max time frames to mask
+      volume_change_db: 6              # Random gain ±N dB
+
+    # Training (SimSiam works better with SGD + momentum)
+    optimizer: "sgd"            # "sgd" or "adam"
+    sgd_momentum: 0.9           # Momentum for SGD
+    sgd_weight_decay: 0.0005    # Weight decay for SGD
+    sgd_learning_rate: 0.03     # Base learning rate for SGD (with cosine decay)
 
 # Stage 2: Classifier training hyperparameters
 classifier:
   # Model architecture
   hidden_dims: [256, 128]
   dropout: 0.3
-  use_batch_norm: false
+  use_batch_norm: False
 
   # Training
-  epochs: 20
-  batch_size: 256
-  learning_rate: 0.0001
-  weight_decay: 0.00001
+  # epochs: Number of training epochs
+  #   - For hyperparameter tuning (HPO): Use 20 epochs for faster trial evaluation
+  #   - For final training with optimized hyperparameters: Use final_training_epochs (50 epochs)
+  epochs: 20  # Default for HPO trials
+  final_training_epochs: 50  # Use this for final training with best hyperparameters
+  batch_size: 64
+  learning_rate: 0.0005
 
-  # Optimizer
-  optimizer: "adam"
-  scheduler: "reduce_on_plateau"
-  scheduler_patience: 3
-  scheduler_factor: 0.5
+  # Early stopping (especially useful for hyperparameter tuning)
+  early_stopping_patience: 10  # Stop if no improvement for N epochs (null = disabled)
+  early_stopping_min_delta: 0.0001  # Minimum improvement to count as progress
+
+  # Optimizer (Always use Adam with cosine scheduler for hyperparameter tuning)
+  optimizer: "adam"  # Fixed: adam (with cosine scheduler)
+  scheduler: "cosine"  # Fixed: cosine annealing
+
+  # Adam optimizer parameters (all tunable via hyperparameter search)
+  adam_betas: [0.9, 0.999]  # Coefficients for computing running averages (beta1, beta2)
+  adam_eps: 1.0e-08  # Term added to denominator for numerical stability
+  adam_weight_decay: 0.00001  # Weight decay (L2 penalty)
+  adam_amsgrad: false  # Whether to use AMSGrad variant
+  adam_decoupled_weight_decay: false  # If true, uses AdamW-style decoupled weight decay
 
   # Loss function
   loss_type: "mse"  # mse
@@ -100,7 +198,7 @@ mlflow:
 # Hyperparameter tuning configuration (optional)
 tuning:
   tuner_type: "optuna"
-  n_trials: 30
+  n_trials: 100
   timeout: null
 
   sampler: "TPESampler"
@@ -111,35 +209,83 @@ tuning:
     parameters:
       learning_rate:
         type: "loguniform"
-        low: 0.00001
-        high: 0.01
+        low: 0.0005
+        high: 0.001
       batch_size:
         type: "categorical"
-        choices: [16, 32, 64]
+        choices: [64,]
       embedding_dim:
         type: "categorical"
-        choices: [256, 512, 1024]
+        choices: [2048,]
       base_channels:
         type: "categorical"
-        choices: [16, 32, 64]
+        choices: [64,]
+
+      # Adam optimizer parameters (all tunable)
+      adam_beta1:
+        type: "uniform"
+        low: 0.85
+        high: 0.95
+      adam_beta2:
+        type: "uniform"
+        low: 0.99
+        high: 0.9999
+      adam_eps:
+        type: "loguniform"
+        low: 1.0e-10
+        high: 1.0e-06
+      adam_weight_decay:
+        type: "loguniform"
+        low: 1.0e-06
+        high: 1.0e-02
+      adam_amsgrad:
+        type: "categorical"
+        choices: [false, true]
+      adam_decoupled_weight_decay:
+        type: "categorical"
+        choices: [false, true]
 
   # Search space for classifier
   classifier_search_space:
     parameters:
       learning_rate:
         type: "loguniform"
-        low: 0.00001
+        low: 0.0005
         high: 0.001
       batch_size:
         type: "categorical"
-        choices: [128, 256, 512]
+        choices: [64,]
       dropout:
         type: "float"
-        low: 0.1
+        low: 0.01
         high: 0.5
       hidden_dims:
         type: "categorical"
-        choices: [[256, 128], [512, 256], [512, 256, 128]]
+        choices: [[512, 256, 128],]
+
+      # Adam optimizer parameters (all tunable)
+      adam_beta1:
+        type: "uniform"
+        low: 0.85
+        high: 0.95
+      adam_beta2:
+        type: "uniform"
+        low: 0.99
+        high: 0.9999
+      adam_eps:
+        type: "loguniform"
+        low: 1.0e-10
+        high: 1.0e-06
+      adam_weight_decay:
+        type: "loguniform"
+        low: 1.0e-07
+        high: 1.0e-03
+      adam_amsgrad:
+        type: "categorical"
+        choices: [false, true]
+      adam_decoupled_weight_decay:
+        type: "categorical"
+        choices: [false, true]
 
 # Reproducibility
 seed: 42
@@ -147,7 +293,8 @@ deterministic: true
 
 # Device configuration
 device: "cuda"  # cuda, cpu, mps
-gpu_memory_limit_gb: 24  # Limit GPU memory usage
+gpu_memory_limit_gb: 30  # Limit GPU memory usage
+precision: "bf16-mixed"  # Use "bf16-mixed" for RTX 5090 (Blackwell) to save memory
 
 # Paths
 checkpoint_dir: "./checkpoints"

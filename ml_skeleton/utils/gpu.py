@@ -265,3 +265,20 @@ def check_cuda_compatibility() -> Dict[str, Any]:
         result["warnings"].append("PyTorch not installed")
 
     return result
+
+
+def configure_optimizations() -> None:
+    """
+    Apply global hardware-specific optimizations.
+
+    Should be called at startup.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            # Enable TF32 for Ampere and newer (RTX 30xx, 40xx, 50xx)
+            if torch.cuda.get_device_capability()[0] >= 8:
+                torch.set_float32_matmul_precision("high")
+    except ImportError:
+        pass

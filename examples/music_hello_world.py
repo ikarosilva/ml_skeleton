@@ -299,14 +299,22 @@ def run_speech_detection_pipeline(config):
 
     # 3. Create Dataset with filtering
     print("\n--- Creating and Filtering Dataset ---")
+
+    # Build album mappings (required for MusicDataset)
+    from ml_skeleton.music.losses import build_album_mapping
+    album_to_idx, filename_to_albums = build_album_mapping(all_songs)
+
     dataset = MusicDataset(
         songs=all_songs,
+        album_to_idx=album_to_idx,
+        filename_to_albums=filename_to_albums,
         speech_results=speech_results,
         speech_threshold=config.music['speech_detection']['speech_threshold']
     )
 
     print(f"\nOriginal song count: {len(all_songs)}")
     print(f"Dataset size after filtering: {len(dataset)}")
+    print(f"Filter statistics: {dataset.filter_counts}")
     print("\n" + "="*70)
     print("✓ Pipeline finished successfully.")
     print("="*70)

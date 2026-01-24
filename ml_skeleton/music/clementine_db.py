@@ -20,10 +20,30 @@ class Song:
 
     @property
     def filepath(self) -> Path:
-        """Convert file:// URI to a filesystem Path object."""
-        if self.filename.startswith("file://"):
-            return Path(unquote(self.filename[7:]))
-        return Path(self.filename)
+        """Convert file:// URI to a filesystem Path object with path remapping.
+
+        Environment variable MUSIC_PATH_REMAP can be used to remap paths:
+        Format: "old_prefix:new_prefix"
+        Example: "/home/ikaro/Music:/Music"
+        """
+        import os
+
+        # Handle both bytes and str (SQLite can return either)
+        filename_str = self.filename.decode('utf-8') if isinstance(self.filename, bytes) else self.filename
+
+        if filename_str.startswith("file://"):
+            path_str = unquote(filename_str[7:])
+        else:
+            path_str = filename_str
+
+        # Apply path remapping if configured
+        remap = os.environ.get('MUSIC_PATH_REMAP')
+        if remap and ':' in remap:
+            old_prefix, new_prefix = remap.split(':', 1)
+            if path_str.startswith(old_prefix):
+                path_str = new_prefix + path_str[len(old_prefix):]
+
+        return Path(path_str)
 
     @property
     def is_rated(self) -> bool:
@@ -34,28 +54,120 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
     """
     Loads all songs from the Clementine database.
 
-    This is a placeholder implementation. It returns dummy Song objects
-    for development and testing purposes.
+    If the database exists, reads from SQLite. Otherwise, falls back to
+    placeholder mode for development and testing.
 
     Args:
         db_path: Path to the Clementine database
-        min_songs: Minimum number of songs to generate (for testing)
+        min_songs: Minimum number of songs to generate (for placeholder mode)
+
+    Returns:
+        List of Song objects from the database
+
+    Note:
+        - Clementine rating scale: 0.0-1.0 per star (0-5 stars total)
+        - Unrated songs have rating = -1
+        - This function is READ-ONLY
     """
     import os
-    print(f"--- WARNING: Using placeholder `load_all_songs` from clementine_db.py ---")
-    print(f"--- Would connect to: {db_path} ---")
-    print(f"--- Generating {min_songs} dummy songs for testing ---")
+    import sqlite3
+    from pathlib import Path
 
-    # In a real implementation, this would connect to SQLite and query the 'songs' table.
-    # For now, return dummy data.
-    # NOTE: Clementine uses 0-5 star rating scale (0.0-1.0 per star)
+    db_file = Path(db_path)
 
-    # Check for environment variable override
-    env_min_songs = os.environ.get('MIN_RATED_SONGS')
-    if env_min_songs:
-        min_songs = max(min_songs, int(env_min_songs))
-        print(f"--- MIN_RATED_SONGS env var set: generating {min_songs} songs ---")
+    # Check if database exists
+    if not db_file.exists():
+        print(f"--- WARNING: Database not found at {db_path} ---")
+        print(f"--- Using placeholder mode with dummy songs ---")
 
+        # Check for environment variable override
+        env_min_songs = os.environ.get('MIN_RATED_SONGS')
+        if env_min_songs:
+            min_songs = max(min_songs, int(env_min_songs))
+            print(f"--- MIN_RATED_SONGS env var set: generating {min_songs} songs ---")
+        else:
+            print(f"--- Generating {min_songs} dummy songs for testing ---")
+
+        # Return placeholder songs (see below)
+        return _generate_placeholder_songs(min_songs)
+
+    # Real database exists - read from SQLite
+    print(f"Loading songs from Clementine database: {db_path}")
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+
+        # Query the songs table
+        # Clementine schema: ROWID, title, artist, album, year, rating, filename, mtime
+        # Rating: -1 = unrated, 0-1 = 0-5 stars (0.2 per star)
+        query = """
+            SELECT
+                ROWID,
+                title,
+                artist,
+                album,
+                CAST(year AS INTEGER) as year,
+                CAST(rating AS REAL) as rating,
+                filename,
+                CAST(mtime AS REAL) as mtime
+            FROM songs
+            WHERE filename IS NOT NULL
+            ORDER BY ROWID
+        """
+
+        cursor.execute(query)
+        rows = cursor.fetchall()
+
+        songs = []
+        for row in rows:
+            rowid, title, artist, album, year, rating, filename, mtime = row
+
+            # Convert bytes to strings if needed (SQLite text_factory compatibility)
+            def to_str(val):
+                if isinstance(val, bytes):
+                    return val.decode('utf-8')
+                return val
+
+            # Convert Clementine rating to 0-5 scale
+            # Clementine: -1 = unrated, 0.0-1.0 = stars (0.2 per star)
+            # Our scale: -1 = unrated, 0.0-5.0 = stars
+            if rating is None or rating < 0:
+                rating_converted = -1.0
+            else:
+                rating_converted = rating * 5.0  # 0.0-1.0 -> 0.0-5.0
+
+            songs.append(Song(
+                rowid=rowid,
+                title=to_str(title) if title else "Unknown",
+                artist=to_str(artist) if artist else "Unknown Artist",
+                album=to_str(album) if album else "Unknown Album",
+                year=year or 0,
+                rating=rating_converted,
+                filename=to_str(filename) if filename else "",
+                mtime=mtime or 0.0
+            ))
+
+        conn.close()
+
+        print(f"Loaded {len(songs)} songs from database")
+        return songs
+
+    except sqlite3.Error as e:
+        print(f"--- ERROR: Failed to read database: {e} ---")
+        print(f"--- Falling back to placeholder mode ---")
+        return _generate_placeholder_songs(min_songs)
+
+
+def _generate_placeholder_songs(min_songs: int) -> List[Song]:
+    """Generate placeholder songs for testing when no real database exists.
+
+    Args:
+        min_songs: Minimum number of songs to generate
+
+    Returns:
+        List of dummy Song objects for testing
+    """
     dummy_songs = []
 
     # Always include the 3 actual placeholder files
