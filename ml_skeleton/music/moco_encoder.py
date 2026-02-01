@@ -96,26 +96,29 @@ class CQTTransform(nn.Module):
 class ProjectionMLP(nn.Module):
     """MoCo v2 projection MLP.
 
-    Two-layer MLP with hidden layer BN+ReLU.
-    Architecture: 2048 → 2048 (BN, ReLU) → 128
+    Two-layer MLP with hidden layer BN+ReLU+Dropout.
+    Architecture: 2048 → 2048 (BN, ReLU, Dropout) → 128
 
     Args:
         in_dim: Input dimension (backbone output)
         hidden_dim: Hidden layer dimension
         out_dim: Output projection dimension
+        dropout: Dropout probability (default: 0.1)
     """
 
     def __init__(
         self,
         in_dim: int = 2048,
         hidden_dim: int = 2048,
-        out_dim: int = 128
+        out_dim: int = 128,
+        dropout: float = 0.1
     ):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
             nn.Linear(hidden_dim, out_dim)
         )
 
@@ -203,7 +206,8 @@ class MoCoEncoder(nn.Module):
         self.projector = ProjectionMLP(
             in_dim=embedding_dim,
             hidden_dim=embedding_dim,
-            out_dim=projection_dim
+            out_dim=projection_dim,
+            dropout=0.1  # Add dropout to reduce overfitting
         )
 
         # Key encoder (momentum-updated copy)

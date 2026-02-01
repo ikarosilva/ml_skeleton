@@ -1,7 +1,7 @@
 """Factory functions for creating encoders, losses, and datasets.
 
 This module provides a unified interface for creating encoder-related components
-based on configuration.
+based on configuration. Currently supports MoCo v2 architecture.
 
 Usage:
     from ml_skeleton.music.encoder_factory import (
@@ -29,9 +29,9 @@ def get_encoder_type(config: dict) -> str:
         config: Configuration dictionary with 'encoder' section
 
     Returns:
-        Encoder type string (currently only "simsiam" supported)
+        Encoder type string ("moco")
     """
-    return config.get('encoder', {}).get('encoder_type', 'simsiam')
+    return config.get('encoder', {}).get('encoder_type', 'moco')
 
 
 def create_encoder(config: dict) -> nn.Module:
@@ -41,25 +41,31 @@ def create_encoder(config: dict) -> nn.Module:
         config: Configuration dictionary with 'encoder' and 'music' sections
 
     Returns:
-        SimSiamEncoder module
+        MoCoEncoder module
     """
     encoder_config = config['encoder']
     music_config = config['music']
-    simsiam_config = encoder_config.get('simsiam', {})
+    encoder_type = get_encoder_type(config)
 
-    from .simsiam_encoder import SimSiamEncoder
+    if encoder_type != 'moco':
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
 
-    return SimSiamEncoder(
+    from .moco_encoder import MoCoEncoder
+    moco_config = encoder_config.get('moco', {})
+    cqt_config = config.get('cqt', {})
+
+    return MoCoEncoder(
         sample_rate=music_config['sample_rate'],
-        duration=music_config['audio_duration'],
-        embedding_dim=encoder_config['embedding_dim'],
-        backbone=simsiam_config.get('backbone', 'resnet50'),
-        pretrained=simsiam_config.get('pretrained_backbone', False),
-        projection_dim=simsiam_config.get('projection_dim', 2048),
-        predictor_hidden_dim=simsiam_config.get('predictor_hidden_dim', 512),
-        n_mels=simsiam_config.get('n_mels', 128),
-        n_fft=simsiam_config.get('n_fft', 2048),
-        hop_length=simsiam_config.get('hop_length', 512)
+        embedding_dim=encoder_config.get('embedding_dim', 2048),
+        pretrained_backbone=encoder_config.get('pretrained_backbone', True),
+        queue_size=moco_config.get('queue_size', 4096),
+        momentum=moco_config.get('momentum', 0.999),
+        temperature=moco_config.get('temperature', 0.07),
+        projection_dim=moco_config.get('projection_dim', 128),
+        num_genres=encoder_config.get('genre', {}).get('num_categories', 7),
+        n_bins=cqt_config.get('n_bins', 84),
+        fmin=cqt_config.get('fmin', 32.7),
+        hop_length=cqt_config.get('hop_length', 512)
     )
 
 
@@ -70,10 +76,20 @@ def create_loss_fn(config: dict) -> nn.Module:
         config: Configuration dictionary with 'encoder' section
 
     Returns:
-        SimSiamLoss module
+        MoCoLoss module
     """
-    from .losses import SimSiamLoss
-    return SimSiamLoss()
+    encoder_type = get_encoder_type(config)
+
+    if encoder_type != 'moco':
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
+
+    from .moco_encoder import MoCoLoss
+    encoder_config = config['encoder']
+    loss_weights = encoder_config.get('loss_weights', {})
+    return MoCoLoss(
+        moco_weight=loss_weights.get('moco', 0.6),
+        genre_weight=loss_weights.get('genre_bce', 0.4)
+    )
 
 
 def create_dataset(
@@ -95,36 +111,45 @@ def create_dataset(
         speech_results: Optional speech detection scores for filtering
 
     Returns:
-        SimSiamMusicDataset instance
+        MoCoDataset instance
     """
     encoder_config = config['encoder']
     music_config = config['music']
-    simsiam_config = encoder_config.get('simsiam', {})
+    encoder_type = get_encoder_type(config)
 
-    from .dataset import SimSiamMusicDataset
-    from .augmentations import create_audio_augmentor
+    if encoder_type != 'moco':
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
 
-    # Create augmentor for training, None for validation/inference
-    augmentor = None
-    if is_training:
-        augmentor = create_audio_augmentor(
-            config=simsiam_config.get('augmentation', {}),
-            sample_rate=music_config['sample_rate']
-        )
+    from .moco_dataset import MoCoDataset, AudioAugmentor
+    chunk_cache_config = music_config.get('chunk_cache', {})
+    aug_config = encoder_config.get('augmentation', {})
 
-    return SimSiamMusicDataset(
-        songs=songs,
+    augmentor = AudioAugmentor(
         sample_rate=music_config['sample_rate'],
-        duration=music_config['audio_duration'],
-        crop_position=music_config.get('crop_position', 'end'),
-        normalize=music_config.get('normalize', True),
+        crop_duration_range=(
+            aug_config.get('crop_duration_min', 5.0),
+            aug_config.get('crop_duration_max', 15.0)
+        ),
+        gain_db_range=(
+            aug_config.get('gain_db_min', -2.0),
+            aug_config.get('gain_db_max', 2.0)
+        ),
+        noise_prob=aug_config.get('noise_prob', 0.5),
+        noise_snr_range=(
+            aug_config.get('noise_snr_min', 25.0),
+            aug_config.get('noise_snr_max', 35.0)
+        ),
+        mixup_prob=aug_config.get('mixup_prob', 0.5),
+        mixup_alpha=aug_config.get('mixup_alpha', 0.1)
+    )
+
+    return MoCoDataset(
+        songs=songs,
+        cache_dir=chunk_cache_config.get('directory', './cache/chunks'),
+        num_chunks=chunk_cache_config.get('num_chunks', 4),
+        sample_rate=music_config['sample_rate'],
         augmentor=augmentor,
-        n_mels=simsiam_config.get('n_mels', 128),
-        n_fft=simsiam_config.get('n_fft', 2048),
-        hop_length=simsiam_config.get('hop_length', 512),
-        skip_unknown_metadata=music_config.get('skip_unknown_metadata', False),
-        speech_results=speech_results,
-        speech_threshold=music_config.get('speech_threshold', 0.5)
+        same_album_prob=aug_config.get('same_album_positive_prob', 0.3)
     )
 
 
@@ -136,28 +161,19 @@ def create_optimizer(config: dict, model: nn.Module):
         model: Model to optimize
 
     Returns:
-        PyTorch optimizer (SGD for SimSiam)
+        PyTorch optimizer (Adam/AdamW for MoCo)
     """
     import torch.optim as optim
 
     encoder_config = config['encoder']
-    simsiam_config = encoder_config.get('simsiam', {})
-    optimizer_type = simsiam_config.get('optimizer', 'sgd')
 
-    if optimizer_type == 'sgd':
-        return optim.SGD(
-            model.parameters(),
-            lr=simsiam_config.get('sgd_learning_rate', 0.03),
-            momentum=simsiam_config.get('sgd_momentum', 0.9),
-            weight_decay=simsiam_config.get('sgd_weight_decay', 0.0005)
-        )
-
-    # Adam fallback
+    # Get beta values
     if 'adam_beta1' in encoder_config and 'adam_beta2' in encoder_config:
         betas = (encoder_config['adam_beta1'], encoder_config['adam_beta2'])
     else:
         betas = tuple(encoder_config.get('adam_betas', [0.9, 0.999]))
 
+    # Use AdamW if decoupled weight decay is enabled
     use_adamw = encoder_config.get('adam_decoupled_weight_decay', False)
     optimizer_cls = optim.AdamW if use_adamw else optim.Adam
 
@@ -181,13 +197,14 @@ def get_mlflow_tags(config: dict) -> dict[str, str]:
         Dictionary of MLflow tags
     """
     encoder_config = config['encoder']
-    simsiam_config = encoder_config.get('simsiam', {})
+    moco_config = encoder_config.get('moco', {})
 
     return {
-        'encoder_type': 'simsiam',
-        'loss_type': 'simsiam',
-        'backbone': simsiam_config.get('backbone', 'resnet50'),
-        'pretrained': str(simsiam_config.get('pretrained_backbone', False)),
-        'projection_dim': str(simsiam_config.get('projection_dim', 2048)),
-        'experiment_variant': f"simsiam_{simsiam_config.get('backbone', 'resnet50')}"
+        'encoder_type': 'moco',
+        'loss_type': 'moco_genre',
+        'backbone': encoder_config.get('backbone', 'resnet50'),
+        'pretrained': str(encoder_config.get('pretrained_backbone', True)),
+        'queue_size': str(moco_config.get('queue_size', 4096)),
+        'temperature': str(moco_config.get('temperature', 0.07)),
+        'experiment_variant': f"moco_{encoder_config.get('backbone', 'resnet50')}"
     }

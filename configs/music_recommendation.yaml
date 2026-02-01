@@ -94,6 +94,58 @@ music:
   use_multi_task: false  # If true, enables album classification loss
   album_weight: 0.5  # Weight for album classification loss
 
+  # 4-Chunk cache configuration (for fingerprinting and MoCo training)
+  # Each song is split into 4 evenly-spaced 30-second chunks
+  chunk_cache:
+    directory: "./cache/chunks"  # Directory for cached chunks
+    num_chunks: 4  # Number of chunks per song (evenly spaced)
+    chunk_duration: 30.0  # Duration of each chunk in seconds
+
+# Acoustic fingerprinting and metadata enrichment
+fingerprinting:
+  # Core fingerprinting
+  enabled: false  # Enable acoustic fingerprinting
+  fingerprint_db_path: "./cache/fingerprints.db"  # SQLite database for fingerprints
+  use_cached_chunks: true  # Use existing 30s chunk cache (must run build-cache first)
+  chunk_for_fingerprinting: 0  # Chunk index to use (0=first, 1=middle, 2=middle-late, 3=last)
+  # NOTE: Use chunk 0 (first) for AcoustID matching - their database expects song beginnings
+
+  # Fingerprinting parameters
+  num_workers: 4  # Parallel workers for fingerprint extraction (use --workers to override)
+  skip_existing: true  # Skip songs that already have fingerprints
+  prioritize_missing_metadata: true  # Process songs with incomplete metadata first
+  max_songs: 10  # Max songs to process per run (for free tier: 500/day limit)
+  max_duration: 300  # Maximum song duration in seconds (5 minutes, filters out long tracks)
+
+  # Duplicate detection (Phase 2 - not yet implemented)
+  deduplicate: false  # Enable duplicate detection via fingerprint similarity
+  similarity_threshold: 0.95  # Chromaprint similarity threshold for duplicates
+  duplicate_selection: "rated_recent"  # Keep most recent rated version
+  remove_non_canonical: true  # Remove duplicates from training datasets
+
+  # External metadata enrichment (AcoustID + MusicBrainz)
+  enable_external_lookup: false  # Enable external API lookups
+  acoustid_api_key: "${ACOUSTID_API_KEY}"  # Set via environment variable
+  acoustid_tier: "free"  # "free" (500/day) or "paid" ($10/year, unlimited)
+
+  # MusicBrainz database (separate from Clementine DB)
+  musicbrainz_db_path: "./musicbrainz_metadata.db"  # SQLite DB for enriched metadata
+
+  # Rate limits (free tier: 3 req/s AcoustID, 1 req/s MusicBrainz)
+  acoustid_rate_limit: 3.0  # Requests per second for AcoustID API
+  musicbrainz_rate_limit: 1.0  # Requests per second for MusicBrainz API
+
+  # Metadata source configuration
+  metadata_source: "both"  # "clementine", "musicbrainz", or "both"
+  prefer_musicbrainz_if_confidence_above: 0.7  # Override Clementine if MB confidence > 0.7
+
+  # Genre taxonomy
+  genre_system: "7categories"  # "7categories" (existing) or "30genres" (new MB-based)
+  genre_mapping_7to30: true  # Provide backward compatibility mapping
+
+  # Loss weighting (Phase 4 - not yet implemented)
+  weight_loss_by_confidence: false  # Downweight low-confidence metadata in training
+
 # Stage 1: Encoder training hyperparameters
 encoder:
   # SimSiam encoder with ResNet backbone on spectrograms
@@ -178,7 +230,7 @@ encoder:
 # Stage 2: Classifier training hyperparameters
 classifier:
   # Model architecture
-  hidden_dims: [256, 128]
+  hidden_dims: [512, 256, 128]
   dropout: 0.3
   use_batch_norm: False
 

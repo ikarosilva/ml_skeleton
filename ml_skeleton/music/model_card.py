@@ -250,6 +250,9 @@ This is a two-stage music recommendation system trained on personal music rating
         excluded_unknown_metadata = stats.get('songs_excluded_unknown_metadata', 0)
         final = stats.get('final_songs', 0)
 
+        rated = stats.get('rated_songs', 'N/A')
+        unrated = stats.get('unrated_songs', 'N/A')
+
         return f"""## Preprocessing
 
 ### Filtering Criteria
@@ -268,8 +271,8 @@ Songs were excluded based on the following criteria:
 ### Final Dataset
 
 - **Songs after filtering:** {final:,}
-- **Rated songs:** {stats.get('rated_songs', 'N/A'):,}
-- **Unrated songs:** {stats.get('unrated_songs', 'N/A'):,}
+- **Rated songs:** {rated if isinstance(rated, str) else f"{rated:,}"}
+- **Unrated songs:** {unrated if isinstance(unrated, str) else f"{unrated:,}"}
 - **Retention rate:** {(final / total * 100) if total > 0 else 0:.1f}%
 
 **Note:** Unknown metadata filtering only applies to encoder training (metadata-based contrastive loss). Classifier training uses all rated songs regardless of metadata quality.
@@ -298,9 +301,9 @@ Songs were excluded based on the following criteria:
             "",
             "### Training Data Statistics",
             "",
-            f"- **Total songs:** {stats.get('total_songs', 'N/A'):,}",
-            f"- **Unique artists:** {stats.get('total_artists', 'N/A'):,}",
-            f"- **Unique albums:** {stats.get('total_albums', 'N/A'):,}",
+            f"- **Total songs:** {format(stats.get('total_songs'), ',') if isinstance(stats.get('total_songs'), int) else stats.get('total_songs', 'N/A')}",
+            f"- **Unique artists:** {format(stats.get('total_artists'), ',') if isinstance(stats.get('total_artists'), int) else stats.get('total_artists', 'N/A')}",
+            f"- **Unique albums:** {format(stats.get('total_albums'), ',') if isinstance(stats.get('total_albums'), int) else stats.get('total_albums', 'N/A')}",
         ]
 
         # Year distribution
@@ -358,9 +361,9 @@ Songs were excluded based on the following criteria:
             "",
             "### Training Data Statistics (Rated Songs Only)",
             "",
-            f"- **Total rated songs:** {stats.get('total_rated_songs', 'N/A'):,}",
-            f"- **Unique artists:** {stats.get('total_artists', 'N/A'):,}",
-            f"- **Unique albums:** {stats.get('total_albums', 'N/A'):,}",
+            f"- **Total rated songs:** {format(stats.get('total_rated_songs'), ',') if isinstance(stats.get('total_rated_songs'), int) else stats.get('total_rated_songs', 'N/A')}",
+            f"- **Unique artists:** {format(stats.get('total_artists'), ',') if isinstance(stats.get('total_artists'), int) else stats.get('total_artists', 'N/A')}",
+            f"- **Unique albums:** {format(stats.get('total_albums'), ',') if isinstance(stats.get('total_albums'), int) else stats.get('total_albums', 'N/A')}",
         ]
 
         # Rating distribution

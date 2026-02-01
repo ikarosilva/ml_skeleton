@@ -9,7 +9,7 @@
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #   ./run_music_pipeline.sh hpo              # Full hyperparameter optimization pipeline
 #   ./run_music_pipeline.sh build-cache      # Build 4-chunk waveform cache (~30GB)
-#   ./run_music_pipeline.sh clear-cache      # Delete waveform cache (prompts for confirmation)
+#   ./run_music_pipeline.sh clcear-cache      # Delete waveform cache (prompts for confirmation)
 #
 # Architecture:
 #   Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D → 2048-dim
@@ -45,7 +45,7 @@ set -e  # Exit on error
 CONFIG="${CONFIG:-configs/music_moco.yaml}"
 SCRIPT="examples/music_recommendation.py"
 HPO_ENCODER_TRIALS="${HPO_ENCODER_TRIALS:-30}"
-HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-20}"
+HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-100}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"  # Optional: path to checkpoint to resume from
 ENCODER_VERSION="${ENCODER_VERSION:-}"  # Optional: encoder version for embeddings (e.g., "v2")
 CLASSIFIER_VERSION="${CLASSIFIER_VERSION:-}"  # Optional: classifier version (e.g., "v2")
@@ -108,7 +108,6 @@ check_prerequisites() {
 }
 
 run_encoder() {
-    local extra_args="$1"
     local resume_arg=""
     local version_arg=""
 
@@ -132,35 +131,215 @@ run_encoder() {
     echo "Loss: 0.6×MoCo(NT-Xent) + 0.4×Genre_BCE"
     echo ""
 
-    python "$SCRIPT" --stage encoder --config "$CONFIG" $resume_arg $version_arg $extra_args
-    print_success "Encoder training complete!"
+    # Track training time
+    local start_time=$(date +%s)
+    python "$SCRIPT" --stage encoder --config "$CONFIG" $resume_arg $version_arg "$@"
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    local minutes=$((elapsed / 60))
+
+    # Format time message
+    if [ $minutes -ge 60 ]; then
+        local hours_decimal=$(awk "BEGIN {printf \"%.1f\", $elapsed/3600}")
+        print_success "Encoder training complete in ${hours_decimal} hours!"
+    else
+        print_success "Encoder training complete in ${minutes} minutes!"
+    fi
     echo ""
 }
 
 run_classifier() {
-    local extra_args="$1"
     local classifier_version_arg=""
+    local is_final_training=false
 
     # Add classifier version if specified
     if [ -n "$CLASSIFIER_VERSION" ]; then
         classifier_version_arg="--classifier-version $CLASSIFIER_VERSION"
     fi
 
+    # Check if --final-training is in arguments
+    for arg in "$@"; do
+        if [ "$arg" = "--final-training" ]; then
+            is_final_training=true
+            break
+        fi
+    done
+
     # Print header with relevant info
     local header="Stage 2: Training Rating Classifier"
     [ -n "$CLASSIFIER_VERSION" ] && header="$header [classifier: $CLASSIFIER_VERSION]"
     print_header "$header"
 
-    python "$SCRIPT" --stage classifier --config "$CONFIG" $classifier_version_arg $extra_args
-    print_success "Classifier training complete!"
+    # Track training time
+    local start_time=$(date +%s)
+    python "$SCRIPT" --stage classifier --config "$CONFIG" $classifier_version_arg "$@"
+    local end_time=$(date +%s)
+    local elapsed=$((end_time - start_time))
+    local minutes=$((elapsed / 60))
+
+    # Format time message
+    if [ $minutes -ge 60 ]; then
+        local hours_decimal=$(awk "BEGIN {printf \"%.1f\", $elapsed/3600}")
+        print_success "Classifier training complete in ${hours_decimal} hours!"
+    else
+        print_success "Classifier training complete in ${minutes} minutes!"
+    fi
     echo ""
+
+    # Show A/B history after final training (if prod history exists)
+    if [ "$is_final_training" = true ]; then
+        display_ab_history
+    fi
 }
 
 run_recommend() {
-    print_header "Stage 3: Generating Recommendations"
-    python "$SCRIPT" --stage recommend --config "$CONFIG"
+    local use_prod=false
+    local extra_args=()
+
+    # Parse arguments
+    for arg in "$@"; do
+        if [ "$arg" = "--prod" ]; then
+            use_prod=true
+        else
+            # Collect other arguments to pass through (e.g., --low-rating-ratio)
+            extra_args+=("$arg")
+        fi
+    done
+
+    if [ "$use_prod" = true ]; then
+        print_header "Stage 3: Generating Recommendations (PRODUCTION)"
+        if [ ! -d "prod" ] || [ ! -f "prod/classifier_best.pt" ]; then
+            print_error "Production models not found in prod/"
+            echo "Run '$0 promote-to-prod' first to deploy models"
+            exit 1
+        fi
+        python "$SCRIPT" --stage recommend --config "$CONFIG" --prod-dir prod "${extra_args[@]}"
+    else
+        print_header "Stage 3: Generating Recommendations"
+        python "$SCRIPT" --stage recommend --config "$CONFIG" "${extra_args[@]}"
+    fi
     print_success "Recommendations generated!"
     echo ""
+}
+
+run_promote_to_prod() {
+    print_header "Promoting Models to Production"
+
+    # Create prod directory if it doesn't exist
+    mkdir -p prod
+    mkdir -p prod/history
+
+    # Check if source files exist
+    if [ ! -f "checkpoints/encoder_best.pt" ]; then
+        print_error "Encoder checkpoint not found: checkpoints/encoder_best.pt"
+        exit 1
+    fi
+    if [ ! -f "checkpoints/classifier_best.pt" ]; then
+        print_error "Classifier checkpoint not found: checkpoints/classifier_best.pt"
+        exit 1
+    fi
+    if [ ! -f "embeddings.db" ]; then
+        print_error "Embeddings database not found: embeddings.db"
+        exit 1
+    fi
+
+    # Archive existing model card before overwriting (for tracking A/B progress)
+    if [ -f "prod/MODEL_CARD.md" ]; then
+        TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+        echo "Archiving previous model card..."
+        cp prod/MODEL_CARD.md "prod/history/MODEL_CARD_${TIMESTAMP}.md"
+        if [ -f "prod/model_card.json" ]; then
+            cp prod/model_card.json "prod/history/model_card_${TIMESTAMP}.json"
+        fi
+        if [ -f "prod/training_manifest.json" ]; then
+            cp prod/training_manifest.json "prod/history/training_manifest_${TIMESTAMP}.json"
+        fi
+        print_success "Previous model card archived to prod/history/"
+    fi
+
+    # Copy models to prod
+    echo "Copying models to prod/..."
+    cp checkpoints/encoder_best.pt prod/
+    cp checkpoints/classifier_best.pt prod/
+    cp embeddings.db prod/
+
+    # Copy model card if exists
+    if [ -f "checkpoints/model_card.json" ]; then
+        cp checkpoints/model_card.json prod/
+    fi
+
+    # Copy best params if exist
+    if [ -f "checkpoints/best_encoder_params.json" ]; then
+        cp checkpoints/best_encoder_params.json prod/
+    fi
+    if [ -f "checkpoints/best_classifier_params.json" ]; then
+        cp checkpoints/best_classifier_params.json prod/
+    fi
+
+    # Copy training manifest (tracks which files were used for training)
+    if [ -f "checkpoints/training_manifest.json" ]; then
+        cp checkpoints/training_manifest.json prod/
+        print_success "Training manifest copied (for A/B testing)"
+    fi
+
+    # Generate model card with A/B test results
+    echo ""
+    python "$SCRIPT" --stage generate-model-card --config "$CONFIG"
+
+    print_success "Models promoted to production!"
+    echo ""
+    echo "Production files:"
+    ls -lh prod/
+    echo ""
+    echo "Model card: prod/MODEL_CARD.md"
+    if [ -d "prod/history" ] && [ "$(ls -A prod/history 2>/dev/null)" ]; then
+        echo ""
+        echo "Historical model cards: $(ls prod/history/MODEL_CARD_*.md 2>/dev/null | wc -l) archived"
+        echo "  View history: ls -la prod/history/"
+    fi
+    echo ""
+    echo "Now run: $0 recommend --prod"
+}
+
+run_sync_db() {
+    print_header "Syncing Database (Refreshing Ratings)"
+
+    # The Clementine database is always read fresh, so this command
+    # just verifies the database is accessible and shows stats
+    echo "Database path: ${CLEMENTINE_DB_PATH:-/Music/database/clementine_backup_2026-01.db}"
+    echo ""
+
+    python -c "
+from ml_skeleton.music.clementine_db import ClementineDB
+import os
+
+db_path = os.environ.get('CLEMENTINE_DB_PATH', '/Music/database/clementine_backup_2026-01.db')
+db = ClementineDB(db_path)
+songs = db.get_all_songs()
+
+rated = [s for s in songs if s.rating is not None and s.rating > 0]
+unrated = [s for s in songs if s.rating is None or s.rating <= 0]
+
+# Rating distribution
+from collections import Counter
+rating_dist = Counter(int(s.rating) for s in rated if s.rating)
+
+print(f'Total songs: {len(songs)}')
+print(f'Rated songs: {len(rated)}')
+print(f'Unrated songs: {len(unrated)}')
+print('')
+print('Rating distribution:')
+for r in sorted(rating_dist.keys()):
+    print(f'  {r} stars: {rating_dist[r]} songs')
+"
+
+    print_success "Database sync complete!"
+    echo ""
+    echo "NOTE: The Clementine database is always read fresh."
+    echo "To incorporate new ratings into the model:"
+    echo "  1. Rate songs in Clementine (or via recommender_help.xspf)"
+    echo "  2. Re-run classifier training: $0 classifier --final-training"
+    echo "  3. Promote to prod: $0 promote-to-prod"
 }
 
 run_build_cache() {
@@ -173,6 +352,113 @@ run_build_cache() {
     python "$SCRIPT" --stage build-cache --config "$CONFIG"
     print_success "Cache build complete!"
     echo ""
+}
+
+run_fingerprint() {
+    print_header "Extracting Acoustic Fingerprints"
+    echo "Generating chromaprint fingerprints from original audio files..."
+    echo "  - Fingerprints FULL songs (required for AcoustID matching)"
+    echo "  - Stores in fingerprint database (./cache/fingerprints.db)"
+    echo "  - Enables duplicate detection and metadata enrichment"
+    echo ""
+    python "$SCRIPT" --stage fingerprint --config "$CONFIG" "$@"
+    print_success "Fingerprinting complete!"
+    echo ""
+}
+
+run_fingerprint_stats() {
+    print_header "Fingerprint Database Statistics"
+    python -c "
+from ml_skeleton.music.fingerprint_db import FingerprintDB
+from pathlib import Path
+
+fp_db_path = './cache/fingerprints.db'
+if Path(fp_db_path).exists():
+    db = FingerprintDB(fp_db_path)
+    stats = db.get_stats()
+    print(f'  Total fingerprints: {stats[\"total_fingerprints\"]}')
+    print(f'  Unique songs: {stats[\"unique_songs\"]}')
+    print(f'  Complete fingerprints: {stats[\"songs_with_complete_fingerprints\"]}')
+    print(f'  Canonical songs: {stats[\"canonical_songs\"]}')
+    print(f'  Duplicate songs: {stats[\"duplicate_songs\"]}')
+    print(f'  Duplicate groups: {stats[\"duplicate_groups\"]}')
+    print(f'  DB size: {stats[\"db_size_mb\"]} MB')
+else:
+    print('  No fingerprint database found')
+    print('  Run: ./run_music_pipeline.sh fingerprint')
+"
+    echo ""
+}
+
+run_enrich_metadata() {
+    print_header "Enriching Metadata via AcoustID/MusicBrainz"
+    echo "Querying external APIs for high-confidence metadata..."
+    echo "  - Uses fingerprints to look up songs in AcoustID"
+    echo "  - Fetches artist, album, genre from MusicBrainz"
+    echo "  - Stores with confidence scores in separate database"
+    echo ""
+    echo "IMPORTANT: Requires ACOUSTID_API_KEY environment variable"
+    echo "  Free tier: 500 lookups/day @ 3 req/sec"
+    echo "  Register at: https://acoustid.org/new-application"
+    echo ""
+    python "$SCRIPT" --stage enrich-metadata --config "$CONFIG" "$@"
+    print_success "Metadata enrichment complete!"
+    echo ""
+}
+
+run_musicbrainz_stats() {
+    print_header "MusicBrainz Database Statistics"
+    python -c "
+from ml_skeleton.music.musicbrainz_db import MusicBrainzDB
+from pathlib import Path
+
+mb_db_path = './musicbrainz_metadata.db'
+if Path(mb_db_path).exists():
+    db = MusicBrainzDB(mb_db_path)
+    stats = db.get_stats()
+    print(f'  Total enriched songs: {stats[\"total_songs\"]}')
+    print(f'  With AcoustID: {stats[\"with_acoustid\"]}')
+    print(f'  With MusicBrainz ID: {stats[\"with_musicbrainz\"]}')
+    print(f'  High confidence artist: {stats[\"high_confidence_artist\"]}')
+    print(f'  High confidence album: {stats[\"high_confidence_album\"]}')
+    print(f'  Avg artist confidence: {stats[\"avg_artist_confidence\"]:.3f}')
+    print(f'  Avg album confidence: {stats[\"avg_album_confidence\"]:.3f}')
+    print(f'  DB size: {stats[\"db_size_mb\"]} MB')
+else:
+    print('  No MusicBrainz database found')
+    print('  Run: ./run_music_pipeline.sh enrich-metadata')
+"
+    echo ""
+}
+
+run_fingerprint_and_enrich() {
+    print_header "Complete Fingerprinting + Enrichment Pipeline"
+    echo "This will:"
+    echo "  1. Extract chromaprint fingerprints from cached chunks"
+    echo "  2. Enrich metadata via AcoustID/MusicBrainz APIs"
+    echo "  3. Display statistics"
+    echo ""
+
+    # Step 1: Fingerprint
+    run_fingerprint "${EXTRA_ARGS[@]}"
+
+    # Step 2: Enrich (if API key is set)
+    if [ -n "$ACOUSTID_API_KEY" ]; then
+        run_enrich_metadata "${EXTRA_ARGS[@]}"
+    else
+        print_warning "Skipping metadata enrichment: ACOUSTID_API_KEY not set"
+        echo "  Register for free API key at: https://acoustid.org/"
+        echo "  Then set it with: export ACOUSTID_API_KEY=your_key_here"
+        echo "  Free tier: 500 lookups/day (perfect for 10-song testing)"
+        echo "  Or run enrichment separately: ./run_music_pipeline.sh enrich-metadata"
+    fi
+
+    # Step 3: Display stats
+    echo ""
+    run_fingerprint_stats
+    run_musicbrainz_stats
+
+    print_success "Fingerprinting pipeline complete!"
 }
 
 # HPO functions
@@ -204,7 +490,7 @@ run_encoder_hpo() {
 run_classifier_hpo() {
     local n_trials="${1:-$HPO_CLASSIFIER_TRIALS}"
 
-    print_header "HPO Step 3: Classifier Hyperparameter Tuning"
+    print_header "Classifier Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials..."
     echo ""
 
@@ -234,6 +520,114 @@ display_model_card() {
     echo ""
 }
 
+display_ab_history() {
+    # Show A/B test history from current training and prod history
+    # Called automatically after --final-training and via 'ab-history' command
+
+    # Check if there's any history to show
+    local has_history=false
+    if [ -d "prod/history" ] && [ -n "$(ls -A prod/history/model_card_*.json 2>/dev/null)" ]; then
+        has_history=true
+    fi
+
+    # Check if current training has A/B results
+    local has_current=false
+    if [ -f "checkpoints/training_manifest.json" ]; then
+        if grep -q '"ab_test_result"' checkpoints/training_manifest.json 2>/dev/null; then
+            has_current=true
+        fi
+    fi
+
+    if [ "$has_history" = false ] && [ "$has_current" = false ]; then
+        return  # Nothing to show
+    fi
+
+    print_header "A/B Test History"
+    python -c "
+import json
+from pathlib import Path
+from datetime import datetime
+
+results = []
+
+# Parse all historical model cards from prod/history
+history_dir = Path('prod/history')
+if history_dir.exists():
+    for f in sorted(history_dir.glob('model_card_*.json')):
+        try:
+            with open(f) as fp:
+                data = json.load(fp)
+            ts_str = f.stem.replace('model_card_', '')
+            try:
+                ts = datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
+                date_str = ts.strftime('%Y-%m-%d %H:%M')
+            except:
+                date_str = ts_str
+            ab = data.get('classifier_stats', {}).get('metadata', {}).get('ab_test_result', {})
+            if ab:
+                results.append({
+                    'date': date_str,
+                    'n_samples': ab.get('n_samples', 0),
+                    'improvement': ab.get('improvement', 0),
+                    'p_value': ab.get('p_value', 1.0),
+                    'significant': ab.get('significant', False),
+                    'label': ''
+                })
+        except:
+            pass
+
+# Check current prod model card
+if Path('prod/model_card.json').exists():
+    try:
+        with open('prod/model_card.json') as fp:
+            data = json.load(fp)
+        ab = data.get('classifier_stats', {}).get('metadata', {}).get('ab_test_result', {})
+        if ab:
+            results.append({
+                'date': 'PROD',
+                'n_samples': ab.get('n_samples', 0),
+                'improvement': ab.get('improvement', 0),
+                'p_value': ab.get('p_value', 1.0),
+                'significant': ab.get('significant', False),
+                'label': '← current prod'
+            })
+    except:
+        pass
+
+# Check current training manifest (just trained model)
+if Path('checkpoints/training_manifest.json').exists():
+    try:
+        with open('checkpoints/training_manifest.json') as fp:
+            data = json.load(fp)
+        ab = data.get('metadata', {}).get('ab_test_result', {})
+        if ab:
+            results.append({
+                'date': 'NEW',
+                'n_samples': ab.get('n_samples', 0),
+                'improvement': ab.get('improvement', 0),
+                'p_value': ab.get('p_value', 1.0),
+                'significant': ab.get('significant', False),
+                'label': '← just trained'
+            })
+    except:
+        pass
+
+if results:
+    print(f\"{'Date':<20} {'Samples':>8} {'Δ Accuracy':>12} {'p-value':>10} {'Sig?':>6}  Notes\")
+    print('-' * 75)
+    for r in results:
+        sig = '✓' if r['significant'] else ''
+        imp = f\"{r['improvement']:+.4f}\" if r['improvement'] != 0 else '  0.0000'
+        print(f\"{r['date']:<20} {r['n_samples']:>8} {imp:>12} {r['p_value']:>10.4f} {sig:>6}  {r['label']}\")
+    print()
+    sig_count = sum(1 for r in results if r['significant'])
+    print(f'Models in history: {len(results)} | Significant improvements: {sig_count}')
+else:
+    print('No A/B test results found.')
+"
+    echo ""
+}
+
 run_hpo_pipeline() {
     print_header "FULL HYPERPARAMETER OPTIMIZATION PIPELINE"
     echo "Steps:"
@@ -253,11 +647,21 @@ run_hpo_pipeline() {
 
     # Step 2: Train encoder with best params - AUTOMATED
     BEST_ENCODER_PARAMS="checkpoints/best_encoder_params.json"
+    HPO_BEST_CHECKPOINT="checkpoints/encoder_hpo_best.pt"
     if [ -f "$BEST_ENCODER_PARAMS" ]; then
         print_header "HPO Step 2: Training Encoder with Best Parameters (100 epochs)"
         print_success "Using best parameters from: $BEST_ENCODER_PARAMS"
-        python "$SCRIPT" --stage encoder --config "$CONFIG" \
-            --final-training --best-params "$BEST_ENCODER_PARAMS"
+
+        # Resume from HPO best checkpoint if available
+        if [ -f "$HPO_BEST_CHECKPOINT" ]; then
+            print_success "Resuming from HPO best model: $HPO_BEST_CHECKPOINT"
+            python "$SCRIPT" --stage encoder --config "$CONFIG" \
+                --final-training --best-params "$BEST_ENCODER_PARAMS" \
+                --resume-checkpoint "$HPO_BEST_CHECKPOINT"
+        else
+            python "$SCRIPT" --stage encoder --config "$CONFIG" \
+                --final-training --best-params "$BEST_ENCODER_PARAMS"
+        fi
         print_success "Encoder training with best params complete!"
         echo ""
     else
@@ -326,6 +730,9 @@ main() {
     STAGE="${1:-all}"
     shift || true
 
+    # Collect extra arguments to pass through
+    EXTRA_ARGS=()
+
     # Parse additional arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -364,8 +771,14 @@ main() {
                 echo "NOTE: --model-version is deprecated, use --encoder-version instead"
                 shift
                 ;;
+            --exhaust)
+                # Process maximum songs for the day (respects API limits)
+                EXTRA_ARGS+=("--exhaust")
+                shift
+                ;;
             *)
-                # Unknown option, ignore
+                # Collect unknown arguments to pass through to Python script
+                EXTRA_ARGS+=("$1")
                 shift
                 ;;
         esac
@@ -376,20 +789,32 @@ main() {
     case "$STAGE" in
         all)
             [ "${MIN_RATED_SONGS}" = "500" ] && export MIN_RATED_SONGS=60000
-            run_encoder
-            run_classifier
+            run_encoder "${EXTRA_ARGS[@]}"
+            run_classifier "${EXTRA_ARGS[@]}"
             run_recommend
             display_model_card
             print_header "Pipeline Complete!"
             ;;
         encoder)
-            run_encoder
+            run_encoder "${EXTRA_ARGS[@]}"
             ;;
         classifier)
-            run_classifier
+            run_classifier "${EXTRA_ARGS[@]}"
             ;;
         recommend)
-            run_recommend
+            run_recommend "${EXTRA_ARGS[@]}"
+            ;;
+        promote-to-prod)
+            run_promote_to_prod
+            ;;
+        sync-db)
+            run_sync_db
+            ;;
+        init-baseline)
+            print_header "Creating Random Baseline for A/B Testing"
+            python "$SCRIPT" --stage init-baseline --config "$CONFIG" "${EXTRA_ARGS[@]}"
+            print_success "Random baseline created in prod/"
+            echo ""
             ;;
         quick)
             run_quick_test
@@ -397,8 +822,29 @@ main() {
         build-cache)
             run_build_cache
             ;;
+        fingerprint)
+            run_fingerprint "${EXTRA_ARGS[@]}"
+            ;;
+        fingerprint-stats)
+            run_fingerprint_stats
+            ;;
+        enrich-metadata)
+            run_enrich_metadata "${EXTRA_ARGS[@]}"
+            ;;
+        enrich)
+            run_fingerprint_and_enrich "${EXTRA_ARGS[@]}"
+            ;;
+        musicbrainz-stats)
+            run_musicbrainz_stats
+            ;;
         hpo)
             run_hpo_pipeline
+            ;;
+        hpo-encoder)
+            run_encoder_hpo
+            ;;
+        hpo-classifier)
+            run_classifier_hpo
             ;;
         clear-cache)
             print_header "Clearing Waveform Cache"
@@ -423,6 +869,9 @@ main() {
         model-card)
             display_model_card
             ;;
+        ab-history)
+            display_ab_history
+            ;;
         cache-stats)
             print_header "Cache Statistics"
             python -c "
@@ -438,31 +887,59 @@ else:
 "
             ;;
         *)
-            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|build-cache|clear-cache|cache-stats|model-card} [options]"
+            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|hpo-encoder|hpo-classifier|build-cache|fingerprint|enrich|enrich-metadata|fingerprint-stats|musicbrainz-stats|clear-cache|cache-stats|model-card|ab-history|promote-to-prod|sync-db} [options]"
             echo ""
             echo "Stages:"
-            echo "  all         - Run complete pipeline (encoder + classifier + recommend)"
-            echo "  encoder     - Train MoCo v2 + Genre BCE encoder"
-            echo "  classifier  - Train rating classifier"
-            echo "  recommend   - Generate recommendations"
-            echo "  quick       - Quick test (5 epochs, 500 songs)"
-            echo "  hpo         - Full hyperparameter optimization"
-            echo "  build-cache - Build 4-chunk waveform cache (~30GB)"
-            echo "  clear-cache - Delete waveform cache"
-            echo "  cache-stats - Show cache statistics"
-            echo "  model-card  - Display model card"
+            echo "  all                 - Run complete pipeline (encoder + classifier + recommend)"
+            echo "  encoder             - Train MoCo v2 + Genre BCE encoder"
+            echo "  classifier          - Train rating classifier"
+            echo "  recommend           - Generate recommendations"
+            echo "  quick               - Quick test (5 epochs, 500 songs)"
+            echo "  hpo                 - Full hyperparameter optimization (encoder + classifier)"
+            echo "  hpo-encoder         - Hyperparameter optimization for encoder only"
+            echo "  hpo-classifier      - Hyperparameter optimization for classifier only"
+            echo "  build-cache         - Build 4-chunk waveform cache (~30GB)"
+            echo "  fingerprint         - Extract acoustic fingerprints from original files (for AcoustID)"
+            echo "  enrich              - Complete pipeline: fingerprint + enrich + stats (recommended)"
+            echo "  enrich-metadata     - Enrich metadata via AcoustID/MusicBrainz (requires API key)"
+            echo "  fingerprint-stats   - Display fingerprint database statistics"
+            echo "  musicbrainz-stats   - Display MusicBrainz database statistics"
+            echo "  clear-cache         - Delete waveform cache"
+            echo "  cache-stats         - Show cache statistics"
+            echo "  model-card          - Display model card"
+            echo "  ab-history          - Show A/B test history from archived model cards"
+            echo ""
+            echo "Production:"
+            echo "  promote-to-prod     - Copy best models to prod/ folder (archives previous)"
+            echo "  init-baseline       - Create random baseline in prod/ for A/B testing workflow"
+            echo "  sync-db             - Check database status and rating counts"
+            echo "  recommend --prod    - Generate recommendations using prod models"
+            echo "  recommend --prod --low-rating-ratio 0.1  - Include 10% predicted dislikes"
             echo ""
             echo "Options:"
             echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
             echo "  --encoder-version VERSION  - Encoder version for embeddings (e.g., v2)"
             echo "  --classifier-version VER   - Classifier version (e.g., v2)"
+            echo "  --exhaust                  - Process max songs for the day (500 for free tier)"
+            echo "  --workers N                - Number of parallel workers for fingerprinting (default: 4)"
+            echo "  --low-rating-ratio N       - Include N% predicted dislikes in recommendations (0.0-1.0)"
+            echo "  --random-init              - Use random init instead of loading from prod model (default: prod init)"
+            echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 100)"
             echo ""
             echo "Environment Variables:"
             echo "  HPO_ENCODER_TRIALS=30"
             echo "  HPO_CLASSIFIER_TRIALS=20"
-            echo "  RESUME_CHECKPOINT=/path/to  - Resume from checkpoint"
-            echo "  ENCODER_VERSION=v2          - Encoder version for embeddings"
-            echo "  CLASSIFIER_VERSION=v2       - Classifier version"
+            echo "  RESUME_CHECKPOINT=/path/to   - Resume from checkpoint"
+            echo "  ENCODER_VERSION=v2           - Encoder version for embeddings"
+            echo "  CLASSIFIER_VERSION=v2        - Classifier version"
+            echo "  ACOUSTID_API_KEY=key         - AcoustID API key for metadata enrichment"
+            echo ""
+            echo "Getting AcoustID API Key (for metadata enrichment):"
+            echo "  1. Register free account at https://acoustid.org/"
+            echo "  2. Get your API key from account settings/API applications page"
+            echo "  3. Export it: export ACOUSTID_API_KEY=your_key_here"
+            echo "  4. Free tier: 500 lookups/day (perfect for 10-song testing)"
+            echo "  5. Paid tier: \$10/year for unlimited lookups (recommended for full collection)"
             echo ""
             echo "Architecture:"
             echo "  Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D"
@@ -470,10 +947,13 @@ else:
             echo "  └── Genre BCE head (7 categories)"
             echo ""
             echo "Examples:"
-            echo "  $0 build-cache                 # Build cache first (recommended)"
-            echo "  $0 all                         # Run complete pipeline"
-            echo "  $0 encoder                     # Train encoder only"
-            echo "  HPO_ENCODER_TRIALS=50 $0 hpo   # Run HPO with 50 encoder trials"
+            echo "  $0 build-cache                          # Build cache first (recommended)"
+            echo "  $0 all                                  # Run complete pipeline"
+            echo "  $0 encoder                              # Train encoder only"
+            echo "  HPO_ENCODER_TRIALS=50 $0 hpo            # Run HPO with 50 encoder trials"
+            echo "  $0 fingerprint --workers 8              # Fingerprint with 8 parallel workers"
+            echo "  ACOUSTID_API_KEY=key $0 enrich          # Fingerprint + enrich + stats (10 songs)"
+            echo "  ACOUSTID_API_KEY=key $0 enrich --exhaust --workers 8 # Process 500 songs with 8 workers"
             echo ""
             echo "Version Compatibility Rules:"
             echo "  - Encoder and Classifier have SEPARATE versions"

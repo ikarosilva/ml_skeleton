@@ -76,7 +76,11 @@ class OptunaTuner(BaseTuner):
             space_type = space_def["type"]
 
             if space_type == "categorical":
-                params[name] = trial.suggest_categorical(name, space_def["choices"])
+                # Convert choices to tuple for Optuna persistence
+                choices = space_def["choices"]
+                if isinstance(choices, list):
+                    choices = tuple(choices)
+                params[name] = trial.suggest_categorical(name, choices)
 
             elif space_type == "int":
                 params[name] = trial.suggest_int(
@@ -159,7 +163,9 @@ class OptunaTuner(BaseTuner):
                         "trial_number": str(trial.number),
                     }
                 )
-                ctx.tracker.log_params(merged_params)
+                # Only log the sampled hyperparameters (not the full merged config)
+                # This avoids logging nested dicts which cause MLflow errors
+                ctx.tracker.log_params(hyperparameters)
 
                 try:
                     # Execute user's train function

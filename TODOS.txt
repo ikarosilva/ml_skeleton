@@ -1,19 +1,16 @@
-*No utilizing the full GPU compute. 
- 
+Found the root cause!
 
-*save small sampples of processed audio so I can listen. 
+Category	Count
+Rated with embeddings	8,630
+Positive (rating ≥ 4)	2,480
+Negative (rating ≤ 2)	2,346
+EXCLUDED ambiguous (2 < rating < 4)	3,804
+Available for binary training	4,826
+44% of your ratings are in the "ambiguous" zone (ratings 2.5, 3.0, 3.5) and get excluded in binary classification mode.
 
+The vault shrunk from 100 → 59 because 41 of the original vault songs had ambiguous ratings.
 
-*backup computer state in case of loss of power? (create a quick recovery_plan.md)
-
-*make sure the whole pipeline will run and there are checkpoints at each
-stage in case something happens.
-
-
-
-
-*write a plan for an inference pipeline (CLI based). make batch size configurable
-with size of 500 files. The input argument should be the database location
+4,826 is still alot of songs!! going from 	4,826 to 159 is still not right. what are we missing?
 
 
 Dynamic augmentations transforms for the encoder (small noise) ?
@@ -21,8 +18,6 @@ Dynamic augmentations transforms for the encoder (small noise) ?
 *Capture diversity of labels ? Generate a playlist that prioritizes songs that are in
 sparse location in the embeddings. Called recommender_sparse.xspf.
 
-Unlabelled songs?
-How leverage MusicBrainz?
 
 *Not sure if SQLite is best caching mechanism for features.
 Should we use Parquet files instead in a ./cache folder? Make 
@@ -35,3 +30,68 @@ interactive. Can you find a pleasant way to have a drop
 down menu where we can add select a meta tag to add 
 without making the graph to noisy ? The meta tags that 
 would be switched on/off would be : Genre and year.
+
+
+v2 Iteration Workflow
+
+
+# 1. Listen & Rate songs from the playlists
+#    - Open recommender_help.xspf (high uncertainty) or recommender_best.xspf
+#    - Rate in Clementine
+#    - Update db with "~/git/clementine$ python main.py backup"
+
+# 2. Retrain classifier (picks up new ratings automatically)
+./run_music_pipeline.sh classifier --final-training -N 3
+
+# 3. Review A/B test results (printed after training)
+#    - New model vs prod model on held-out new ratings
+#    - Shows p-value for statistical significance
+
+# 4. If improved, promote to production
+./run_music_pipeline.sh promote-to-prod
+
+# 5. Generate new recommendations with some predicted dislikes
+./run_music_pipeline.sh recommend --prod --low-rating-ratio 0.1
+
+# 6. Repeat from step 1
+Key Files Updated Each Cycle:
+
+checkpoints/training_manifest.json - tracks train/val split
+checkpoints/classifier_best.pt - new model
+prod/ - production models (after promote)
+If encoder needs update (e.g., new architecture):
+
+
+./run_music_pipeline.sh encoder --final-training --encoder-version v2
+./run_music_pipeline.sh classifier --final-training  # Must retrain
+
+
+
+# 1. Listen & Rate songs (same as before)
+
+# 1b. (Optional) Retrain encoder if you want to improve embeddings
+./run_music_pipeline.sh encoder --final-training --encoder-version v2
+# This automatically regenerates embeddings for all songs
+
+# 1c. (Optional) Run encoder HPO if experimenting with architecture
+./run_music_pipeline.sh hpo-encoder
+./run_music_pipeline.sh encoder --final-training --best-params checkpoints/best_encoder_params.json
+
+# 2. Retrain classifier (required after encoder change)
+./run_music_pipeline.sh classifier --final-training --N 3
+
+# 3-6. Same as before...
+When to update encoder:
+
+New ratings won't improve encoder (it's self-supervised on audio, not ratings)
+Update encoder if: changing architecture, adding more songs to collection, or tweaking augmentations
+When to skip encoder:
+
+Just iterating on ratings → only retrain classifier
+Encoder is already good → classifier updates are fast (~2 min vs hours)
+Quick reference:
+
+Change	Encoder	Embeddings	Classifier
+New ratings only	Skip	Keep	Retrain
+New encoder params	Retrain	Regenerated	Retrain
+New songs added	Retrain	Regenerated	Retrain

@@ -18,6 +18,7 @@ class Song:
     filename: str  # file:// URI
     genre: str = ""  # Genre string (may contain "/" for multi-genre, e.g. "Rock/Alternative")
     mtime: float = 0.0  # Last modification time, to be filled in later
+    length: int = 0  # Duration in nanoseconds (Clementine format)
 
     @property
     def filepath(self) -> Path:
@@ -45,6 +46,11 @@ class Song:
                 path_str = new_prefix + path_str[len(old_prefix):]
 
         return Path(path_str)
+
+    @property
+    def duration_seconds(self) -> float:
+        """Get duration in seconds from nanoseconds."""
+        return self.length / 1e9 if self.length > 0 else 0.0
 
     @property
     def is_rated(self) -> bool:
@@ -100,8 +106,9 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
         cursor = conn.cursor()
 
         # Query the songs table
-        # Clementine schema: ROWID, title, artist, album, year, rating, filename, genre, mtime
+        # Clementine schema: ROWID, title, artist, album, year, rating, filename, genre, mtime, length
         # Rating: -1 = unrated, 0-1 = 0-5 stars (0.2 per star)
+        # Length: Duration in nanoseconds
         query = """
             SELECT
                 ROWID,
@@ -112,7 +119,8 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
                 CAST(rating AS REAL) as rating,
                 filename,
                 genre,
-                CAST(mtime AS REAL) as mtime
+                CAST(mtime AS REAL) as mtime,
+                CAST(length AS INTEGER) as length
             FROM songs
             WHERE filename IS NOT NULL
             ORDER BY ROWID
@@ -123,7 +131,7 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
 
         songs = []
         for row in rows:
-            rowid, title, artist, album, year, rating, filename, genre, mtime = row
+            rowid, title, artist, album, year, rating, filename, genre, mtime, length = row
 
             # Convert bytes to strings if needed (SQLite text_factory compatibility)
             def to_str(val):
@@ -148,7 +156,8 @@ def load_all_songs(db_path: str = "/home/ikaro/Music/clementine.db", min_songs: 
                 rating=rating_converted,
                 filename=to_str(filename) if filename else "",
                 genre=to_str(genre) if genre else "",
-                mtime=mtime or 0.0
+                mtime=mtime or 0.0,
+                length=length or 0
             ))
 
         conn.close()

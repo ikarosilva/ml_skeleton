@@ -68,8 +68,8 @@ class SimpleRatingClassifier(nn.Module):
 
         Returns:
             ratings: Predicted rating values in range [0, 1]
-                    Shape: (batch_size, 1)
-                    Example: (256, 1)
+                    Shape: (batch_size,)
+                    Example: (256,)
 
         Note:
             - Ratings in [0, 1] range where:
@@ -77,7 +77,7 @@ class SimpleRatingClassifier(nn.Module):
               - 1.0 = highest rating (like)
             - In Clementine DB: rating = -1 means unrated
         """
-        return self.mlp(embeddings)
+        return self.mlp(embeddings).squeeze(-1)
 
 
 class DeepRatingClassifier(nn.Module):
@@ -166,7 +166,7 @@ class DeepRatingClassifier(nn.Module):
             embeddings: Shape (batch_size, embedding_dim)
 
         Returns:
-            ratings: Shape (batch_size, 1) in [0, 1]
+            ratings: Shape (batch_size,) in [0, 1]
         """
         x = self.input_proj(embeddings)
 
@@ -175,7 +175,7 @@ class DeepRatingClassifier(nn.Module):
             x = block(x)
 
         # Output
-        return self.output(x)
+        return self.output(x).squeeze(-1)
 
 
 class ResidualBlock(nn.Module):
@@ -226,7 +226,7 @@ class EnsembleRatingClassifier(nn.Module):
 
         Returns:
             ratings: Weighted average of all classifiers
-                    Shape (batch_size, 1)
+                    Shape (batch_size,)
         """
         predictions = []
 
@@ -234,11 +234,11 @@ class EnsembleRatingClassifier(nn.Module):
             pred = classifier(embeddings)
             predictions.append(pred)
 
-        # Stack predictions: (num_classifiers, batch_size, 1)
+        # Stack predictions: (num_classifiers, batch_size)
         predictions = torch.stack(predictions, dim=0)
 
-        # Weighted average: (batch_size, 1)
-        weights = self.weights.view(-1, 1, 1)
+        # Weighted average: (batch_size,)
+        weights = self.weights.view(-1, 1)
         weighted_pred = (predictions * weights).sum(dim=0)
 
         return weighted_pred

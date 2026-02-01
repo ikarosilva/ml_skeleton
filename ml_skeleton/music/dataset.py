@@ -340,303 +340,6 @@ def music_collate_fn(batch: list[dict]) -> dict:
         }
 
 
-class SimSiamMusicDataset(torch.utils.data.Dataset):
-    """PyTorch Dataset for SimSiam self-supervised learning.
-
-    Returns two augmented views of the same audio for contrastive learning.
-    Waveforms are returned directly - mel-spectrogram conversion happens on GPU
-    in the encoder for much faster training.
-
-    Args:
-        songs: List of Song objects from Clementine DB
-        sample_rate: Target sample rate (Hz)
-        duration: Audio duration to extract (seconds)
-        crop_position: Where to extract from - "start", "center", or "end"
-        normalize: Apply z-normalization to waveform
-        augmentor: AudioAugmentor instance for creating augmented views
-        n_mels: Number of mel frequency bins (kept for compatibility, unused)
-        n_fft: FFT window size (kept for compatibility, unused)
-        hop_length: Hop length for STFT (kept for compatibility, unused)
-        skip_unknown_metadata: If True, skip songs with all-unknown metadata
-        speech_results: Optional speech detection scores for filtering
-        speech_threshold: Threshold for speech filtering
-        cache_dir: Directory for caching resampled waveforms (None = no caching)
-        cache_max_gb: Maximum cache size in GB (deletes oldest files when exceeded)
-    """
-
-    def __init__(
-        self,
-        songs: list[Song],
-        sample_rate: int = 16000,
-        duration: float = 60.0,
-        crop_position: str = "end",
-        normalize: bool = True,
-        augmentor=None,
-        n_mels: int = 128,
-        n_fft: int = 2048,
-        hop_length: int = 512,
-        skip_unknown_metadata: bool = False,
-        speech_results: Optional[dict[str, float]] = None,
-        speech_threshold: float = 0.5,
-        cache_dir: Optional[str] = None,
-        cache_max_gb: float = 140.0
-    ):
-        super().__init__()
-        self.sample_rate = sample_rate
-        self.duration = duration
-        self.crop_position = crop_position
-        self.normalize = normalize
-        self.augmentor = augmentor
-        # These are kept for compatibility but mel-spectrogram is computed on GPU
-        self.n_mels = n_mels
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-
-        # Waveform caching setup
-        self.cache_dir = Path(cache_dir) if cache_dir else None
-        self.cache_max_bytes = int(cache_max_gb * 1024 * 1024 * 1024)  # Convert GB to bytes
-        self._cache_cleanup_counter = 0  # Only check size periodically
-        if self.cache_dir:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            # Include settings in cache key to invalidate on config change
-            self._cache_key = f"sr{sample_rate}_dur{duration}_{crop_position}_norm{normalize}"
-
-        # Filter songs
-        self.songs, self.filter_counts = self._filter_songs(
-            songs,
-            speech_results,
-            speech_threshold,
-            skip_unknown_metadata
-        )
-
-    def _filter_songs(
-        self,
-        songs: list[Song],
-        speech_results: Optional[dict[str, float]],
-        threshold: float,
-        skip_unknown_metadata: bool
-    ) -> tuple[list[Song], dict[str, int]]:
-        """Filter songs by various criteria."""
-        filtered = []
-        counts = {
-            "speech": 0,
-            "missing_file": 0,
-            "unknown_metadata": 0
-        }
-
-        # Load exclusion lists if filtering by metadata
-        if skip_unknown_metadata:
-            load_exclusion_lists()
-
-        for song in songs:
-            # Filter by speech detection
-            if speech_results:
-                prob = speech_results.get(song.filename, 0.0)
-                if prob > threshold:
-                    counts["speech"] += 1
-                    continue
-
-            # Check file exists
-            if not song.filepath.exists():
-                counts["missing_file"] += 1
-                continue
-
-            # Filter by metadata validity
-            if skip_unknown_metadata:
-                if has_excluded_metadata(song.artist, song.album):
-                    counts["unknown_metadata"] += 1
-                    continue
-                if not has_valid_metadata(song.artist, song.album, song.title):
-                    counts["unknown_metadata"] += 1
-                    continue
-
-            filtered.append(song)
-
-        # Print filtering statistics
-        if len(filtered) < len(songs):
-            removed = len(songs) - len(filtered)
-            print(f"SimSiam dataset: Filtered {removed} songs:")
-            if counts["speech"] > 0:
-                print(f"  - {counts['speech']} speech-detected songs")
-            if counts["missing_file"] > 0:
-                print(f"  - {counts['missing_file']} missing files")
-            if counts["unknown_metadata"] > 0:
-                print(f"  - {counts['unknown_metadata']} songs with excluded metadata")
-
-        return filtered, counts
-
-    def __len__(self) -> int:
-        return len(self.songs)
-
-    def _get_cache_path(self, filename: str) -> Optional[Path]:
-        """Get cache file path for a song."""
-        if self.cache_dir is None:
-            return None
-        # Create safe filename from original path
-        safe_name = filename.replace("/", "_").replace("\\", "_")
-        return self.cache_dir / self._cache_key / f"{safe_name}.npy"
-
-    def _get_cache_size(self) -> int:
-        """Get total size of cache directory in bytes."""
-        if self.cache_dir is None or not self.cache_dir.exists():
-            return 0
-        total = 0
-        for f in self.cache_dir.rglob("*.npy"):
-            try:
-                total += f.stat().st_size
-            except OSError:
-                pass
-        return total
-
-    def _cleanup_cache(self, target_bytes: int) -> None:
-        """Delete oldest cache files until size is below target.
-
-        Args:
-            target_bytes: Target cache size in bytes
-        """
-        if self.cache_dir is None or not self.cache_dir.exists():
-            return
-
-        # Get all cache files with their modification times
-        cache_files = []
-        for f in self.cache_dir.rglob("*.npy"):
-            try:
-                stat = f.stat()
-                cache_files.append((f, stat.st_mtime, stat.st_size))
-            except OSError:
-                pass
-
-        # Sort by modification time (oldest first)
-        cache_files.sort(key=lambda x: x[1])
-
-        # Calculate current size
-        current_size = sum(f[2] for f in cache_files)
-
-        # Delete oldest files until under target
-        deleted_count = 0
-        deleted_bytes = 0
-        for filepath, _, size in cache_files:
-            if current_size <= target_bytes:
-                break
-            try:
-                filepath.unlink()
-                current_size -= size
-                deleted_count += 1
-                deleted_bytes += size
-            except OSError:
-                pass
-
-        if deleted_count > 0:
-            print(f"  Cache cleanup: deleted {deleted_count} files ({deleted_bytes / 1e9:.1f} GB)")
-
-    def _load_from_cache(self, cache_path: Path) -> Optional[torch.Tensor]:
-        """Load waveform from cache (numpy .npy format for speed)."""
-        try:
-            if cache_path.exists():
-                # Memory-map for faster loading
-                arr = np.load(cache_path, mmap_mode='r')
-                return torch.from_numpy(arr.copy()).float()
-        except Exception:
-            pass
-        return None
-
-    def _save_to_cache(self, cache_path: Path, waveform: torch.Tensor) -> None:
-        """Save waveform to cache with periodic size check."""
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.save(cache_path, waveform.numpy())
-
-            # Check cache size every 100 saves to avoid I/O overhead
-            self._cache_cleanup_counter += 1
-            if self._cache_cleanup_counter >= 100:
-                self._cache_cleanup_counter = 0
-                current_size = self._get_cache_size()
-                if current_size > self.cache_max_bytes:
-                    # Delete oldest files to get to 90% of max (leave some headroom)
-                    target = int(self.cache_max_bytes * 0.9)
-                    self._cleanup_cache(target)
-        except Exception:
-            pass  # Silently fail on cache write errors
-
-    def __getitem__(self, idx: int) -> dict:
-        """Load audio and return two augmented waveform views.
-
-        Returns:
-            Dictionary with:
-            - view1: First augmented waveform
-            - view2: Second augmented waveform
-            - filename: Song filename
-        """
-        song = self.songs[idx]
-        audio = None
-
-        # Try loading from cache first
-        cache_path = self._get_cache_path(song.filename)
-        if cache_path is not None:
-            audio = self._load_from_cache(cache_path)
-
-        # Load from original file if not cached
-        if audio is None:
-            audio = load_audio_file(
-                str(song.filepath),
-                sample_rate=self.sample_rate,
-                mono=True,
-                duration=self.duration,
-                crop_position=self.crop_position,
-                normalize=self.normalize
-            )
-
-            # Fallback to zeros if loading fails
-            if audio is None:
-                audio = torch.zeros(int(self.sample_rate * self.duration))
-            elif cache_path is not None:
-                # Save to cache for next time
-                self._save_to_cache(cache_path, audio)
-
-        # Create two augmented views
-        if self.augmentor is not None:
-            view1_waveform = self.augmentor(audio)
-            view2_waveform = self.augmentor(audio)
-        else:
-            # No augmentation (for validation)
-            view1_waveform = audio
-            view2_waveform = audio
-
-        return {
-            "view1": view1_waveform,
-            "view2": view2_waveform,
-            "filename": song.filename
-        }
-
-
-def simsiam_collate_fn(batch: list[dict]) -> dict:
-    """Custom collate function for SimSiamMusicDataset.
-
-    Args:
-        batch: List of dictionaries from SimSiamMusicDataset.__getitem__
-
-    Returns:
-        Batched dictionary with:
-        - view1: Stacked tensor (batch_size, num_samples)
-        - view2: Stacked tensor (batch_size, num_samples)
-        - filename: List of strings
-    """
-    view1_list = []
-    view2_list = []
-    filename_list = []
-
-    for item in batch:
-        view1_list.append(item["view1"])
-        view2_list.append(item["view2"])
-        filename_list.append(item["filename"])
-
-    return {
-        "view1": torch.stack(view1_list),
-        "view2": torch.stack(view2_list),
-        "filename": filename_list
-    }
-
-
 class EmbeddingDataset(torch.utils.data.Dataset):
     """PyTorch Dataset for pre-extracted embeddings with ratings.
 
@@ -647,18 +350,28 @@ class EmbeddingDataset(torch.utils.data.Dataset):
         embeddings: Dictionary mapping filename -> embedding array
         songs: List of Song objects
         only_rated: If True, only include rated songs
+        classification_mode: "regression" (0-1 continuous) or "binary" (0/1 labels)
+        binary_positive_threshold: Rating >= this is positive class (default: 4)
+        binary_negative_threshold: Rating <= this is negative class (default: 2)
     """
 
     def __init__(
         self,
         embeddings: dict[str, np.ndarray],
         songs: list[Song],
-        only_rated: bool = True
+        only_rated: bool = True,
+        classification_mode: str = "regression",
+        binary_positive_threshold: float = 4.0,
+        binary_negative_threshold: float = 2.0
     ):
         super().__init__()
 
+        self.classification_mode = classification_mode
+
         # Filter songs that have embeddings and meet criteria
         self.data = []
+        excluded_ambiguous = 0
+
         for song in songs:
             if only_rated and not song.is_rated:
                 continue
@@ -666,17 +379,37 @@ class EmbeddingDataset(torch.utils.data.Dataset):
             if song.filename not in embeddings:
                 continue
 
-            # Normalize rating to [0, 1]
-            rating = song.rating / 5.0
+            # Handle classification mode
+            if classification_mode == "binary":
+                # Binary: positive (>=4), negative (<=2), exclude middle
+                if song.rating >= binary_positive_threshold:
+                    label = 1.0
+                elif song.rating <= binary_negative_threshold:
+                    label = 0.0
+                else:
+                    # Exclude ambiguous ratings (between thresholds)
+                    excluded_ambiguous += 1
+                    continue
+            else:
+                # Regression: normalize rating to [0, 1]
+                label = song.rating / 5.0
 
             self.data.append({
                 "embedding": embeddings[song.filename],
-                "rating": rating,
+                "rating": label,
                 "filename": song.filename,
                 "song": song
             })
 
-        print(f"EmbeddingDataset: {len(self.data)} songs with embeddings")
+        if classification_mode == "binary":
+            pos_count = sum(1 for d in self.data if d["rating"] == 1.0)
+            neg_count = sum(1 for d in self.data if d["rating"] == 0.0)
+            print(f"EmbeddingDataset (binary): {len(self.data)} songs")
+            print(f"  Positive (rating >= {binary_positive_threshold}): {pos_count}")
+            print(f"  Negative (rating <= {binary_negative_threshold}): {neg_count}")
+            print(f"  Excluded (ambiguous): {excluded_ambiguous}")
+        else:
+            print(f"EmbeddingDataset: {len(self.data)} songs with embeddings")
 
     def __len__(self) -> int:
         return len(self.data)
@@ -697,3 +430,64 @@ class EmbeddingDataset(torch.utils.data.Dataset):
             "rating": torch.tensor(item["rating"], dtype=torch.float32),
             "filename": item["filename"]
         }
+
+    def get_all_filenames(self) -> list[str]:
+        """Get all filenames in the dataset.
+
+        Returns:
+            List of filenames
+        """
+        return [d["filename"] for d in self.data]
+
+    def get_all_ratings(self) -> list[float]:
+        """Get all ratings in the dataset.
+
+        Returns:
+            List of rating values
+        """
+        return [d["rating"] for d in self.data]
+
+    def get_file_ratings_dict(self) -> dict[str, int]:
+        """Get dict mapping filename to binary rating (0 or 1).
+
+        Returns:
+            Dict of {filename: binary_rating}
+        """
+        return {d["filename"]: int(d["rating"]) for d in self.data}
+
+    def subset_by_filenames(self, filenames: set[str]) -> "EmbeddingDataset":
+        """Create a subset containing only specified filenames.
+
+        Args:
+            filenames: Set of filenames to include
+
+        Returns:
+            New EmbeddingDataset with only the specified files
+        """
+        # Create a new dataset with filtered data
+        subset = EmbeddingDataset.__new__(EmbeddingDataset)
+        subset.classification_mode = self.classification_mode
+        subset.data = [d for d in self.data if d["filename"] in filenames]
+        return subset
+
+    def split_by_filenames(
+        self,
+        train_files: list[str],
+        val_files: list[str]
+    ) -> tuple["EmbeddingDataset", "EmbeddingDataset"]:
+        """Split dataset by filename lists.
+
+        Args:
+            train_files: List of filenames for training
+            val_files: List of filenames for validation
+
+        Returns:
+            Tuple of (train_dataset, val_dataset)
+        """
+        train_set = set(train_files)
+        val_set = set(val_files)
+
+        return (
+            self.subset_by_filenames(train_set),
+            self.subset_by_filenames(val_set)
+        )

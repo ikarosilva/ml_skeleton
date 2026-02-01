@@ -35,6 +35,7 @@ Usage:
 import argparse
 import sys
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -49,16 +50,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from ml_skeleton.music.clementine_db import ClementineDB
 from ml_skeleton.music.dataset import MusicDataset, EmbeddingDataset, music_collate_fn
 from ml_skeleton.music.embedding_store import EmbeddingStore
-from ml_skeleton.music.losses import RatingLoss, build_album_mapping
+from ml_skeleton.music.losses import RatingLoss, WeightedRatingLoss, BinaryRatingLoss, compute_class_weights, build_album_mapping
 from ml_skeleton.music.encoder_factory import (
     create_encoder,
     create_loss_fn,
+    create_dataset,
     create_optimizer,
     get_encoder_type,
     get_mlflow_tags
 )
-from ml_skeleton.music.dataset import SimSiamMusicDataset, simsiam_collate_fn
-from ml_skeleton.music.augmentations import create_audio_augmentor
 from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
 from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists
 from ml_skeleton.training.encoder_trainer import EncoderTrainer
@@ -73,6 +73,8 @@ from ml_skeleton.music.dataset_stats import (
     collect_dataset_stats,
     collect_training_stats
 )
+from ml_skeleton.music.training_manifest import TrainingManifest
+from ml_skeleton.music.ab_testing import run_ab_test, format_ab_test_summary
 
 # Framework imports for hyperparameter tuning and MLflow tracking
 from ml_skeleton import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
@@ -115,8 +117,24 @@ def apply_hyperparameters_to_config(config: dict, hyperparameters: dict, stage: 
 
     # Apply hyperparameters to the appropriate stage
     stage_config = config[stage]
+
     for key, value in hyperparameters.items():
-        if key in stage_config:
+        # Special handling for encoder loss weights
+        if stage == 'encoder' and key == 'loss_weights_moco':
+            stage_config['loss_weights']['moco'] = value
+            stage_config['loss_weights']['genre_bce'] = 1.0 - value
+            print(f"  Tuning: loss_weights.moco = {value:.3f}, genre_bce = {1.0-value:.3f}")
+        # Special handling for encoder augmentation parameters
+        elif stage == 'encoder' and key in ['gain_db_max', 'noise_prob', 'mixup_alpha']:
+            if 'augmentation' not in stage_config:
+                stage_config['augmentation'] = {}
+            stage_config['augmentation'][key] = value
+            # For symmetric gain, also set min
+            if key == 'gain_db_max':
+                stage_config['augmentation']['gain_db_min'] = -value
+            print(f"  Tuning: augmentation.{key} = {value}")
+        # Direct parameter mapping
+        elif key in stage_config:
             stage_config[key] = value
             print(f"  Tuning: {key} = {value}")
 
@@ -135,12 +153,13 @@ _hpo_classifier_best_value: float = float('inf')
 _hpo_classifier_best_trial: int = -1
 
 
-def create_encoder_training_fn(base_config: dict, n_trials: int = None):
+def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs: int = 1):
     """Create encoder training function for hyperparameter tuning.
 
     Args:
         base_config: Base configuration dictionary
         n_trials: Total number of HPO trials (for progress logging)
+        hpo_runs: Number of runs per trial with different seeds (default: 1)
 
     Returns:
         Training function that accepts TrainingContext and returns TrainingResult
@@ -154,6 +173,7 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None):
         Returns:
             TrainingResult with primary metric (validation loss)
         """
+        import numpy as np
         global _global_model_card
 
         # Get trial info for logging
@@ -173,19 +193,57 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None):
         if ctx.device:
             config['device'] = ctx.device
 
-        # Run training (skip embeddings during HPO to save ~10 min per trial)
-        model_card = train_encoder(
-            config,
-            model_card=_global_model_card,
-            skip_embeddings=True,  # Skip during HPO
-            trial_info=trial_info,
-            verbose=False  # Minimal logging during HPO
-        )
-        _global_model_card = model_card
+        # Multi-run HPO: run multiple times with different seeds, use best (min) loss
+        # NOTE: config['seed'] stays constant for train/val split consistency across trials
+        if hpo_runs > 1:
+            base_seed = config.get('seed', 42)
+            run_losses = []
+            best_run_idx = 0
+            best_run_loss = float('inf')
 
-        # Get best validation loss from encoder stats
-        encoder_stats = model_card.encoder_stats
-        best_val_loss = encoder_stats.get('best_val_loss', encoder_stats.get('final_val_loss', float('inf')))
+            for run_idx in range(hpo_runs):
+                training_seed = base_seed + run_idx * 1000  # Different seed for model init/training
+
+                if run_idx == 0:
+                    print(f"  HPO multi-run: {hpo_runs} runs per trial (objective = min loss, split fixed)")
+
+                model_card = train_encoder(
+                    config,
+                    model_card=_global_model_card,
+                    skip_embeddings=True,
+                    trial_info=trial_info,
+                    verbose=False,
+                    training_seed=training_seed  # Only model init varies, split stays constant
+                )
+
+                encoder_stats = model_card.encoder_stats
+                run_loss = encoder_stats.get('best_val_loss', encoder_stats.get('final_val_loss', float('inf')))
+                run_losses.append(run_loss)
+                print(f"    Run {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_loss={run_loss:.6f}")
+
+                # Track best run
+                if run_loss < best_run_loss:
+                    best_run_loss = run_loss
+                    best_run_idx = run_idx
+
+            # Use minimum loss as objective (find best single model)
+            best_val_loss = np.min(run_losses)
+            print(f"    Best: {best_val_loss:.6f} (run {best_run_idx + 1}), Mean: {np.mean(run_losses):.6f} +/- {np.std(run_losses):.6f}")
+            _global_model_card = model_card
+        else:
+            # Single run (original behavior)
+            model_card = train_encoder(
+                config,
+                model_card=_global_model_card,
+                skip_embeddings=True,  # Skip during HPO
+                trial_info=trial_info,
+                verbose=False  # Minimal logging during HPO
+            )
+            _global_model_card = model_card
+
+            # Get best validation loss from encoder stats
+            encoder_stats = model_card.encoder_stats
+            best_val_loss = encoder_stats.get('best_val_loss', encoder_stats.get('final_val_loss', float('inf')))
 
         # Track and report new best trials
         global _hpo_best_value, _hpo_best_trial
@@ -198,8 +256,16 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None):
                   f"wd={ctx.hyperparameters.get('adam_weight_decay', 'N/A'):.2e}, "
                   f"amsgrad={ctx.hyperparameters.get('adam_amsgrad', 'N/A')}")
 
-        # Log to MLflow
-        ctx.tracker.log_params(ctx.hyperparameters)
+            # Save best HPO model checkpoint for resume in final training
+            checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
+            current_checkpoint = checkpoint_dir / 'encoder_best.pt'
+            hpo_best_checkpoint = checkpoint_dir / 'encoder_hpo_best.pt'
+            if current_checkpoint.exists():
+                shutil.copy(current_checkpoint, hpo_best_checkpoint)
+                print(f"    Saved best HPO model to: {hpo_best_checkpoint}")
+
+        # Log to MLflow (skip params during HPO - optuna_tuner already logged them)
+        # Only log metrics here
         ctx.tracker.log_metric('best_val_loss', best_val_loss)
         ctx.tracker.log_metric('epochs_run', encoder_stats.get('epochs_run', 0))
         ctx.tracker.log_metric('training_time', encoder_stats.get('training_time_seconds', 0))
@@ -221,12 +287,13 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None):
     return train_encoder_fn
 
 
-def create_classifier_training_fn(base_config: dict, n_trials: int = None):
+def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_runs: int = 1):
     """Create classifier training function for hyperparameter tuning.
 
     Args:
         base_config: Base configuration dictionary
         n_trials: Total number of HPO trials (for progress logging)
+        hpo_runs: Number of runs per trial with different seeds (default: 1)
 
     Returns:
         Training function that accepts TrainingContext and returns TrainingResult
@@ -240,6 +307,7 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None):
         Returns:
             TrainingResult with primary metric (validation MAE)
         """
+        import numpy as np
         global _global_model_card
 
         # Get trial info for logging
@@ -259,19 +327,57 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None):
         if ctx.device:
             config['device'] = ctx.device
 
-        # Run training
-        model_card = train_classifier(config, model_card=_global_model_card, trial_info=trial_info, verbose=False)
-        _global_model_card = model_card
+        # Multi-run HPO: run multiple times with different seeds, use best (min) MAE
+        # NOTE: config['seed'] stays constant for train/val split consistency across trials
+        if hpo_runs > 1:
+            base_seed = config.get('seed', 42)
+            run_maes = []
+            best_run_idx = 0
+            best_run_mae = float('inf')
 
-        # Get metrics from classifier stats
-        classifier_stats = model_card.classifier_stats
-        best_val_loss = classifier_stats.get('best_val_loss', classifier_stats.get('final_val_loss', float('inf')))
+            for run_idx in range(hpo_runs):
+                training_seed = base_seed + run_idx * 1000  # Different seed for model init/training
 
-        # For classifier, we optimize MAE instead of loss
-        # Calculate best MAE from history if available
-        best_val_mae = best_val_loss  # Fallback
-        if 'val_mae' in classifier_stats:
-            best_val_mae = classifier_stats['val_mae']
+                if run_idx == 0:
+                    print(f"  HPO multi-run: {hpo_runs} runs per trial (objective = min MAE, split fixed)")
+
+                model_card = train_classifier(
+                    config,
+                    model_card=_global_model_card,
+                    trial_info=trial_info,
+                    verbose=False,
+                    training_seed=training_seed  # Only model init varies, split stays constant
+                )
+
+                classifier_stats = model_card.classifier_stats
+                run_mae = classifier_stats.get('val_mae', classifier_stats.get('best_val_loss', float('inf')))
+                run_maes.append(run_mae)
+                print(f"    Run {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_mae={run_mae:.6f}")
+
+                # Track best run
+                if run_mae < best_run_mae:
+                    best_run_mae = run_mae
+                    best_run_idx = run_idx
+
+            # Use minimum MAE as objective (find best single model)
+            best_val_mae = np.min(run_maes)
+            print(f"    Best: {best_val_mae:.6f} (run {best_run_idx + 1}), Mean: {np.mean(run_maes):.6f} +/- {np.std(run_maes):.6f}")
+            _global_model_card = model_card
+            best_val_loss = best_val_mae  # Use MAE as loss for consistency
+        else:
+            # Single run (original behavior)
+            model_card = train_classifier(config, model_card=_global_model_card, trial_info=trial_info, verbose=False)
+            _global_model_card = model_card
+
+            # Get metrics from classifier stats
+            classifier_stats = model_card.classifier_stats
+            best_val_loss = classifier_stats.get('best_val_loss', classifier_stats.get('final_val_loss', float('inf')))
+
+            # For classifier, we optimize MAE instead of loss
+            # Calculate best MAE from history if available
+            best_val_mae = best_val_loss  # Fallback
+            if 'val_mae' in classifier_stats:
+                best_val_mae = classifier_stats['val_mae']
 
         # Track and report new best trials
         global _hpo_classifier_best_value, _hpo_classifier_best_trial
@@ -283,8 +389,8 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None):
                   f"dropout={ctx.hyperparameters.get('dropout', 'N/A')}, "
                   f"wd={ctx.hyperparameters.get('adam_weight_decay', 'N/A'):.2e}")
 
-        # Log to MLflow
-        ctx.tracker.log_params(ctx.hyperparameters)
+        # Log to MLflow (skip params during HPO - optuna_tuner already logged them)
+        # Only log metrics here
         ctx.tracker.log_metric('best_val_loss', best_val_loss)
         ctx.tracker.log_metric('best_val_mae', best_val_mae)
         ctx.tracker.log_metric('epochs_run', classifier_stats.get('epochs_run', 0))
@@ -308,6 +414,187 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None):
     return train_classifier_fn
 
 
+def _perform_encoder_training_run(
+    config: dict,
+    full_dataset,
+    all_songs: list,
+    album_to_idx: dict,
+    filename_to_albums: dict,
+    music_config: dict,
+    encoder_config: dict,
+    tracker,
+    num_epochs: int,
+    use_augmentation: bool,
+    device: str,
+    model_version: str,
+    run_seed: int,
+    checkpoint_dir: Path,
+    checkpoint_suffix: str = "",
+    verbose: bool = True,
+    resume_checkpoint: str = None
+) -> dict:
+    """Perform a single encoder training run with a specific seed.
+
+    Returns:
+        dict with keys: best_val_loss, best_epoch, history, checkpoint_path, training_time
+    """
+    import time
+    import random
+    import numpy as np
+
+    # Set random seeds for this run
+    random.seed(run_seed)
+    np.random.seed(run_seed)
+    torch.manual_seed(run_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(run_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Train/val split with this run's seed
+    train_split = music_config.get('train_split', 0.8)
+    train_size = int(len(full_dataset) * train_split)
+    val_size = len(full_dataset) - train_size
+
+    train_dataset, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(run_seed)
+    )
+
+    if verbose:
+        print(f"  Train: {len(train_dataset)} songs")
+        print(f"  Val: {len(val_dataset)} songs")
+
+    # Create data loaders
+    num_workers = music_config.get('dataloader_workers', 4)
+
+    def worker_init_fn(worker_id):
+        worker_seed = run_seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    from ml_skeleton.music.moco_dataset import MoCoCollator
+    crop_duration_max = encoder_config.get('augmentation', {}).get('crop_duration_max', 15.0)
+    moco_collator = MoCoCollator(
+        sample_rate=music_config.get('sample_rate', 16000),
+        crop_duration=crop_duration_max
+    )
+
+    loader_kwargs = {
+        'batch_size': encoder_config['batch_size'],
+        'num_workers': num_workers,
+        'pin_memory': True,
+        'collate_fn': moco_collator,
+        'worker_init_fn': worker_init_fn if num_workers > 0 else None,
+    }
+    if num_workers > 0:
+        loader_kwargs['prefetch_factor'] = 8
+        loader_kwargs['persistent_workers'] = True
+
+    train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+
+    # Create model
+    encoder = create_encoder(config)
+
+    # Create loss function
+    loss_fn = create_loss_fn(config)
+
+    # Create optimizer
+    if 'adam_beta1' in encoder_config and 'adam_beta2' in encoder_config:
+        betas = (encoder_config['adam_beta1'], encoder_config['adam_beta2'])
+    else:
+        betas = tuple(encoder_config.get('adam_betas', [0.9, 0.999]))
+
+    use_adamw = encoder_config.get('adam_decoupled_weight_decay', False)
+    optimizer_cls = torch.optim.AdamW if use_adamw else torch.optim.Adam
+    optimizer = optimizer_cls(
+        encoder.parameters(),
+        lr=encoder_config['learning_rate'],
+        betas=betas,
+        eps=encoder_config.get('adam_eps', 1e-08),
+        weight_decay=encoder_config.get('adam_weight_decay', 0.0),
+        amsgrad=encoder_config.get('adam_amsgrad', False)
+    )
+
+    # Create scheduler
+    scheduler = None
+    scheduler_type = encoder_config.get('scheduler', 'cosine')
+    if scheduler_type == 'cosine':
+        t_max = encoder_config.get('cosine_t_max', num_epochs)
+        eta_min = encoder_config.get('cosine_eta_min', 1e-6)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=t_max, eta_min=eta_min
+        )
+
+    # Create embedding store and trainer
+    embedding_store = EmbeddingStore(music_config['embedding_db_path'])
+    trainer = EncoderTrainer(
+        encoder=encoder,
+        device=device,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        embedding_store=embedding_store,
+        model_version=model_version,
+        tracker=tracker,
+        scheduler=scheduler
+    )
+
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if resume_checkpoint:
+        checkpoint_path = Path(resume_checkpoint)
+        if checkpoint_path.exists():
+            trainer.load_checkpoint(checkpoint_path)
+            start_epoch = trainer.current_epoch + 1
+
+    # Train
+    training_start_time = time.time()
+    history = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=num_epochs,
+        checkpoint_dir=str(checkpoint_dir),
+        use_multi_task=False,
+        use_augmentation=use_augmentation,
+        use_moco=True,
+        save_best_only=True,
+        early_stopping_patience=encoder_config.get('early_stopping_patience'),
+        early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
+        verbose=verbose,
+        start_epoch=start_epoch
+    )
+    training_time = time.time() - training_start_time
+
+    # Calculate metrics
+    best_val_loss = min(history['val_loss']) if history['val_loss'] else float('inf')
+    best_epoch = history['val_loss'].index(best_val_loss) + 1 if history['val_loss'] else 0
+    epochs_run = len(history['train_loss'])
+
+    # Copy checkpoint with suffix if specified
+    src_checkpoint = checkpoint_dir / "encoder_best.pt"
+    if checkpoint_suffix and src_checkpoint.exists():
+        dst_checkpoint = checkpoint_dir / f"encoder_best{checkpoint_suffix}.pt"
+        shutil.copy(src_checkpoint, dst_checkpoint)
+        checkpoint_path = dst_checkpoint
+    else:
+        checkpoint_path = src_checkpoint
+
+    # Cleanup
+    del train_loader, val_loader, train_dataset, val_dataset, trainer, encoder, optimizer
+    cleanup_memory()
+
+    return {
+        'best_val_loss': best_val_loss,
+        'best_epoch': best_epoch,
+        'epochs_run': epochs_run,
+        'history': history,
+        'checkpoint_path': checkpoint_path,
+        'training_time': training_time
+    }
+
+
 def train_encoder(
     config: dict,
     model_card: ModelCardGenerator = None,
@@ -316,7 +603,9 @@ def train_encoder(
     trial_info: tuple[int, int] = None,
     verbose: bool = True,
     resume_checkpoint: str = None,
-    model_version_override: str = None
+    model_version_override: str = None,
+    num_runs: int = 1,
+    training_seed: int = None
 ):
     """Stage 1: Train audio encoder.
 
@@ -329,14 +618,35 @@ def train_encoder(
         verbose: If True, print detailed setup info (set False during HPO to reduce noise)
         resume_checkpoint: Path to checkpoint to resume training from
         model_version_override: Override model version for embeddings (e.g., 'v2')
+        num_runs: Number of training runs with different seeds (default: 1)
+        training_seed: Seed for model init/training (if None, uses config seed).
+                      Split always uses config seed for consistency across HPO trials.
 
     Returns:
         ModelCardGenerator with encoder statistics
     """
     import time
+    import random
+    import numpy as np
 
     # Ensure clean memory state at start of stage
     cleanup_memory()
+
+    # Seed for data split (always constant from config for fair HPO comparison)
+    split_seed = config.get('seed', 42)
+
+    # Seed for model init/training (can be overridden for multi-run)
+    model_seed = training_seed if training_seed is not None else split_seed
+
+    # Set random seeds for model initialization and training
+    random.seed(model_seed)
+    np.random.seed(model_seed)
+    torch.manual_seed(model_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(model_seed)
+        # Make CuDNN deterministic (may reduce performance slightly)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     print("=" * 80)
     if trial_info:
@@ -372,20 +682,23 @@ def train_encoder(
     mlflow_config = config.get('mlflow', {})
     mlflow_enabled = mlflow_config.get('auto_start', True)
 
-    if False and mlflow_enabled:  #TODO DEBUG
+    if False and mlflow_enabled:  # TODO DEBUG - disabled for now
         # Start MLflow server if configured
-        mlflow_server = MLflowServer(
-            tracking_uri=mlflow_config.get('tracking_uri', 'http://localhost:5000'),
+        tracking_uri = mlflow_config.get('tracking_uri', 'http://localhost:5000')
+        # Extract port from tracking_uri
+        port = int(tracking_uri.split(':')[-1].rstrip('/'))
+
+        mlflow_server = MLflowServer.ensure_running(
+            port=port,
             backend_store_uri=mlflow_config.get('backend_store_uri', 'sqlite:///mlflow.db'),
-            artifact_location=mlflow_config.get('artifact_location', './mlruns')
+            artifact_root=mlflow_config.get('artifact_location', './mlruns')
         )
-        mlflow_server.ensure_started()
 
         # Create run name
         run_name = f"encoder_{'final' if final_training else 'regular'}_{int(time.time())}"
 
         tracker = ExplrTracker(
-            tracking_uri=mlflow_config.get('tracking_uri', 'http://localhost:5000'),
+            tracking_uri=tracking_uri,
             experiment_name=mlflow_config.get('experiment_name', 'music_recommendation'),
             run_name=run_name
         )
@@ -434,35 +747,20 @@ def train_encoder(
 
     # Determine encoder type early (needed for dataset creation)
     encoder_type = get_encoder_type(config)
-    use_simsiam = (encoder_type == "simsiam")
+    use_moco = (encoder_type == "moco")
 
-    if use_simsiam:
-        # Create SimSiam dataset with augmentations
-        simsiam_config = encoder_config.get('simsiam', {})
-        augmentor = create_audio_augmentor(simsiam_config.get('augmentation', {}))
-
-        # Waveform cache for faster loading (skips audio decode + resample)
-        cache_dir = music_config.get('waveform_cache_dir')
-        cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
-        if verbose and cache_dir:
-            print(f"  Waveform cache: {cache_dir} (max {cache_max_gb} GB)")
-
-        full_dataset = SimSiamMusicDataset(
+    # MoCo uses MoCoDataset (created by factory)
+    if use_moco:
+        from ml_skeleton.music.moco_dataset import MoCoDataset
+        full_dataset = create_dataset(
+            config=config,
             songs=all_songs,
-            sample_rate=music_config['sample_rate'],
-            duration=music_config['audio_duration'],
-            crop_position=music_config.get('crop_position', 'end'),
-            normalize=music_config.get('normalize', True),
-            skip_unknown_metadata=skip_unknown,
-            augmentor=augmentor,
-            n_mels=simsiam_config.get('n_mels', 128),
-            n_fft=simsiam_config.get('n_fft', 2048),
-            hop_length=simsiam_config.get('hop_length', 512),
-            cache_dir=cache_dir,
-            cache_max_gb=cache_max_gb
+            album_to_idx=album_to_idx,
+            filename_to_albums=filename_to_albums,
+            is_training=True
         )
         if verbose:
-            print(f"  Using SimSiamMusicDataset with dual views")
+            print(f"  Using MoCoDataset with chunk cache")
     else:
         full_dataset = MusicDataset(
             songs=all_songs,
@@ -480,7 +778,8 @@ def train_encoder(
         )
 
     # Collect preprocessing stats from dataset filtering
-    filter_counts = full_dataset.filter_counts
+    # MoCoDataset doesn't track filter_counts, so we use defaults
+    filter_counts = getattr(full_dataset, 'filter_counts', {})
     preprocessing_stats = collect_preprocessing_stats(
         total_loaded=total_loaded,
         excluded_missing=filter_counts.get('missing_file', 0),
@@ -494,6 +793,153 @@ def train_encoder(
     )
     model_card.set_preprocessing_stats(preprocessing_stats)
 
+    # Multi-run training for statistical validation
+    if num_runs > 1:
+        import numpy as np
+        base_seed = config.get('seed', 42)
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        run_results = []
+
+        # Apply model version override if provided
+        model_version = model_version_override if model_version_override else music_config['encoder_version']
+
+        print(f"\n{'='*60}")
+        print(f"MULTI-RUN TRAINING: {num_runs} runs with different seeds")
+        print(f"{'='*60}")
+
+        for run_idx in range(num_runs):
+            run_seed = base_seed + run_idx * 1000  # e.g., 42, 1042, 2042...
+            print(f"\n{'='*60}")
+            print(f"RUN {run_idx + 1}/{num_runs} (seed={run_seed})")
+            print(f"{'='*60}")
+
+            result = _perform_encoder_training_run(
+                config=config,
+                full_dataset=full_dataset,
+                all_songs=all_songs,
+                album_to_idx=album_to_idx,
+                filename_to_albums=filename_to_albums,
+                music_config=music_config,
+                encoder_config=encoder_config,
+                tracker=tracker,
+                num_epochs=num_epochs,
+                use_augmentation=use_augmentation,
+                device=device,
+                model_version=model_version,
+                run_seed=run_seed,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_suffix=f"_run{run_idx + 1}",
+                verbose=verbose,
+                resume_checkpoint=resume_checkpoint if run_idx == 0 else None
+            )
+
+            run_results.append({
+                'run': run_idx + 1,
+                'seed': run_seed,
+                'best_val_loss': result['best_val_loss'],
+                'best_epoch': result['best_epoch'],
+                'epochs_run': result['epochs_run'],
+                'checkpoint_path': result['checkpoint_path'],
+                'training_time': result['training_time']
+            })
+
+            print(f"\n  Run {run_idx + 1} complete: best_val_loss={result['best_val_loss']:.6f} (epoch {result['best_epoch']})")
+
+        # Report multi-run statistics
+        losses = [r['best_val_loss'] for r in run_results]
+        total_time = sum(r['training_time'] for r in run_results)
+
+        print(f"\n{'='*60}")
+        print("MULTI-RUN STATISTICS")
+        print(f"{'='*60}")
+        for r in run_results:
+            print(f"  Run {r['run']}: val_loss={r['best_val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
+        print(f"\n  Mean: {np.mean(losses):.6f} +/- {np.std(losses):.6f}")
+        print(f"  Min:  {np.min(losses):.6f}")
+        print(f"  Max:  {np.max(losses):.6f}")
+
+        # Identify and copy best model
+        best_run = min(run_results, key=lambda x: x['best_val_loss'])
+        print(f"\n  Best: Run {best_run['run']} (val_loss={best_run['best_val_loss']:.6f}, seed={best_run['seed']})")
+
+        # Copy best run's checkpoint to encoder_best.pt
+        best_checkpoint = checkpoint_dir / f"encoder_best.pt"
+        shutil.copy(best_run['checkpoint_path'], best_checkpoint)
+        print(f"  Best model saved to: {best_checkpoint}")
+        print(f"\n  Total training time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+
+        # Extract embeddings using best model
+        if not skip_embeddings:
+            print(f"\n{'='*60}")
+            print("EXTRACTING EMBEDDINGS (using best model)")
+            print(f"{'='*60}")
+
+            # Create embedding store and load best model
+            embedding_store = EmbeddingStore(music_config['embedding_db_path'])
+            encoder = create_encoder(config)
+            loss_fn = create_loss_fn(config)
+
+            # Minimal optimizer just for trainer initialization
+            optimizer = torch.optim.Adam(encoder.parameters(), lr=1e-4)
+
+            trainer = EncoderTrainer(
+                encoder=encoder,
+                device=device,
+                loss_fn=loss_fn,
+                optimizer=optimizer,
+                embedding_store=embedding_store,
+                model_version=model_version,
+                tracker=None,
+                scheduler=None
+            )
+            trainer.load_checkpoint(best_checkpoint)
+
+            # Create extraction dataset
+            from ml_skeleton.music.moco_dataset import MoCoCollator
+            crop_duration_max = encoder_config.get('augmentation', {}).get('crop_duration_max', 15.0)
+            moco_collator = MoCoCollator(
+                sample_rate=music_config.get('sample_rate', 16000),
+                crop_duration=crop_duration_max
+            )
+
+            extraction_dataset = create_dataset(
+                config=config,
+                songs=all_songs,
+                album_to_idx=album_to_idx,
+                filename_to_albums=filename_to_albums,
+                is_training=False
+            )
+
+            num_workers = music_config.get('dataloader_workers', 4)
+            all_loader = DataLoader(
+                extraction_dataset,
+                batch_size=encoder_config['batch_size'],
+                shuffle=False,
+                num_workers=num_workers,
+                prefetch_factor=4,
+                pin_memory=True,
+                collate_fn=moco_collator
+            )
+
+            embeddings = trainer.extract_embeddings(
+                all_loader,
+                save_to_store=True,
+                use_moco=True
+            )
+
+            print(f"\nExtracted {len(embeddings)} embeddings")
+            print(f"Saved to: {music_config['embedding_db_path']}")
+
+            stats = embedding_store.get_stats()
+            print(f"\nEmbedding Store Stats:")
+            print(f"  Total embeddings: {stats['total_embeddings']}")
+            print(f"  Unique songs: {stats['unique_songs']}")
+            print(f"  Model versions: {stats['model_versions']}")
+            print(f"  DB size: {stats['db_size_mb']:.2f} MB")
+
+        return model_card
+
+    # Single run (existing code path)
     # Train/val split
     train_split = music_config.get('train_split', 0.8)
     train_size = int(len(full_dataset) * train_split)
@@ -502,7 +948,7 @@ def train_encoder(
     train_dataset, val_dataset = random_split(
         full_dataset,
         [train_size, val_size],
-        generator=torch.Generator().manual_seed(config.get('seed', 42))
+        generator=torch.Generator().manual_seed(split_seed)
     )
 
     if verbose:
@@ -511,14 +957,29 @@ def train_encoder(
 
     # Create data loaders with optimized parallel loading
     num_workers = music_config.get('dataloader_workers', 4)
-    collate_fn = simsiam_collate_fn if use_simsiam else music_collate_fn
 
-    # DataLoader kwargs - prefetch and persistent_workers only work with num_workers > 0
+    # Worker initialization function for reproducible DataLoader workers (use model_seed)
+    def worker_init_fn(worker_id):
+        worker_seed = model_seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    # MoCo needs custom collator to handle memory-mapped arrays
+    from ml_skeleton.music.moco_dataset import MoCoCollator
+
+    # Get crop duration from augmentation config
+    crop_duration_max = encoder_config.get('augmentation', {}).get('crop_duration_max', 15.0)
+    moco_collator = MoCoCollator(
+        sample_rate=music_config.get('sample_rate', 16000),
+        crop_duration=crop_duration_max
+    )
+
     loader_kwargs = {
         'batch_size': encoder_config['batch_size'],
         'num_workers': num_workers,
         'pin_memory': True,
-        'collate_fn': collate_fn,
+        'collate_fn': moco_collator,
+        'worker_init_fn': worker_init_fn if num_workers > 0 else None,
     }
     if num_workers > 0:
         loader_kwargs['prefetch_factor'] = 8  # Increased for better GPU utilization
@@ -527,36 +988,36 @@ def train_encoder(
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
-    # Multi-task is only for simple encoder (incompatible with SimSiam)
-    use_multi_task = music_config.get('use_multi_task', False) and not use_simsiam
+    # Multi-task is only for simple encoder (not used with MoCo)
+    use_multi_task = False
 
     # Create model using factory
     if verbose:
         print("\n[4/7] Creating encoder model...")
 
-    # Create SimSiam encoder using factory
+    # Create MoCo encoder using factory
     encoder = create_encoder(config)
     if verbose:
-        print(f"  Using SimSiamEncoder")
-        simsiam_config = encoder_config.get('simsiam', {})
-        print(f"  Backbone: {simsiam_config.get('backbone', 'resnet50')}")
-        print(f"  Projection dim: {simsiam_config.get('projection_dim', 2048)}")
-        print(f"  Predictor hidden dim: {simsiam_config.get('predictor_hidden_dim', 512)}")
+        print(f"  Using MoCoEncoder")
+        moco_config = encoder_config.get('moco', {})
+        print(f"  Backbone: {encoder_config.get('backbone', 'resnet50')}")
+        print(f"  Queue size: {moco_config.get('queue_size', 4096)}")
+        print(f"  Temperature: {moco_config.get('temperature', 0.07)}")
+        print(f"  Projection dim: {moco_config.get('projection_dim', 128)}")
 
     if verbose:
-        print(f"  Embedding dim: {encoder.get_embedding_dim()}")
+        print(f"  Embedding dim: {encoder_config.get('embedding_dim', 2048)}")
 
     # Create loss function
     if verbose:
         print("\n[5/7] Creating loss function...")
 
-    # SimSiam loss
-    from ml_skeleton.music.losses import SimSiamLoss
-    loss_fn = SimSiamLoss()
+    # MoCo loss (using factory)
+    loss_fn = create_loss_fn(config)
     if verbose:
-        print(f"  Using SimSiamLoss (self-supervised)")
-        print(f"    - No negative pairs needed")
-        print(f"    - Stop-gradient prevents collapse")
+        print(f"  Using MoCoLoss")
+        print(f"    - Contrastive loss with queue")
+        print(f"    - Genre BCE auxiliary task")
 
     # Create optimizer with full Adam parameters
     # Handle betas - can be list from config or separate beta1/beta2 from HPO
@@ -586,6 +1047,22 @@ def train_encoder(
         print(f"    weight_decay={encoder_config.get('adam_weight_decay', 0.0)}")
         print(f"    amsgrad={encoder_config.get('adam_amsgrad', False)}")
 
+    # Create learning rate scheduler
+    scheduler = None
+    scheduler_type = encoder_config.get('scheduler', 'cosine')
+    if scheduler_type == 'cosine':
+        t_max = encoder_config.get('cosine_t_max', num_epochs)
+        eta_min = encoder_config.get('cosine_eta_min', 1e-6)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=eta_min
+        )
+        if verbose:
+            print(f"  Using CosineAnnealingLR scheduler:")
+            print(f"    T_max={t_max}")
+            print(f"    eta_min={eta_min}")
+
     # Create embedding store
     embedding_store = EmbeddingStore(music_config['embedding_db_path'])
 
@@ -611,7 +1088,8 @@ def train_encoder(
         optimizer=optimizer,
         embedding_store=embedding_store,
         model_version=model_version,
-        tracker=tracker  # Pass tracker for MLflow learning curves
+        tracker=tracker,  # Pass tracker for MLflow learning curves
+        scheduler=scheduler  # Pass learning rate scheduler
     )
 
     # Load checkpoint if resuming from previous training
@@ -662,7 +1140,7 @@ def train_encoder(
                 checkpoint_dir=config['checkpoint_dir'],
                 use_multi_task=use_multi_task,
                 use_augmentation=use_augmentation,
-                use_simsiam=use_simsiam,
+                use_moco=True,
                 save_best_only=True,
                 early_stopping_patience=encoder_config.get('early_stopping_patience'),
                 early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
@@ -693,7 +1171,7 @@ def train_encoder(
             checkpoint_dir=config['checkpoint_dir'],
             use_multi_task=use_multi_task,
             use_augmentation=use_augmentation,
-            use_simsiam=use_simsiam,
+            use_moco=True,
             save_best_only=True,
             early_stopping_patience=encoder_config.get('early_stopping_patience'),
             early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
@@ -743,23 +1221,14 @@ def train_encoder(
         trainer.load_checkpoint(best_checkpoint)
 
         # Create a non-augmented dataset for embedding extraction
-        # (we need single embeddings per song, not dual views)
-        # For SimSiam and augmentation mode, we need a regular dataset
-        if use_simsiam or use_augmentation:
-            extraction_dataset = MusicDataset(
-                songs=all_songs,
-                album_to_idx=album_to_idx,
-                filename_to_albums=filename_to_albums,
-                sample_rate=music_config['sample_rate'],
-                duration=music_config['audio_duration'],
-                crop_position=music_config.get('crop_position', 'end'),
-                normalize=music_config.get('normalize', True),
-                only_rated=False,
-                skip_unknown_metadata=skip_unknown,
-                use_augmentation=False  # No augmentation for extraction
-            )
-        else:
-            extraction_dataset = full_dataset
+        # MoCo dataset is suitable for extraction (no augmentation during inference)
+        extraction_dataset = create_dataset(
+            config=config,
+            songs=all_songs,
+            album_to_idx=album_to_idx,
+            filename_to_albums=filename_to_albums,
+            is_training=False  # No augmentation for extraction
+        )
 
         # Extract embeddings for all songs (optimized for throughput)
         all_loader = DataLoader(
@@ -767,14 +1236,15 @@ def train_encoder(
             batch_size=encoder_config['batch_size'],
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=music_collate_fn,
             prefetch_factor=4,  # Pre-load batches for better throughput
-            pin_memory=True  # Speed up GPU transfer
+            pin_memory=True,  # Speed up GPU transfer
+            collate_fn=moco_collator  # Need custom collator for memory-mapped arrays
         )
 
         embeddings = trainer.extract_embeddings(
             all_loader,
-            save_to_store=True
+            save_to_store=True,
+            use_moco=True
         )
 
         print(f"\nExtracted {len(embeddings)} embeddings")
@@ -791,13 +1261,262 @@ def train_encoder(
     return model_card
 
 
+def _get_ratings_from_dataset(dataset) -> list:
+    """Get ratings from an EmbeddingDataset or a Subset.
+
+    Args:
+        dataset: Either an EmbeddingDataset or a torch Subset
+
+    Returns:
+        List of ratings
+    """
+    from torch.utils.data import Subset
+
+    if isinstance(dataset, Subset):
+        # For Subset, access underlying dataset via indices
+        underlying = dataset.dataset
+        return [underlying.data[i]["rating"] for i in dataset.indices]
+    else:
+        # For EmbeddingDataset, use the method directly
+        return dataset.get_all_ratings()
+
+
+def _perform_classifier_training_run(
+    config: dict,
+    full_dataset,
+    classifier_config: dict,
+    music_config: dict,
+    embedding_dim: int,
+    encoder_version: str,
+    classifier_version: str,
+    tracker,
+    num_epochs: int,
+    device: str,
+    run_seed: int,
+    checkpoint_dir: Path,
+    checkpoint_suffix: str = "",
+    verbose: bool = True,
+    class_weight_strategy: str = "none",
+    classification_mode: str = "regression",
+    init_from_prod: bool = True
+) -> dict:
+    """Perform a single classifier training run with a specific seed.
+
+    Args:
+        class_weight_strategy: Strategy for class weighting to handle imbalance.
+        classification_mode: "regression" (MSE loss) or "binary" (BCE loss).
+            - "none": No weighting (standard MSE)
+            - "inverse": Weight = N / (n_classes * count_i)
+            - "sqrt_inverse": Weight = sqrt(N / (n_classes * count_i))
+        init_from_prod: If True, initialize from prod/classifier_best.pt if architecture matches.
+
+    Returns:
+        dict with keys: best_val_loss, best_val_mae, best_epoch, history, checkpoint_path, training_time
+    """
+    import time
+    import random
+    import numpy as np
+
+    # Set random seeds for this run
+    random.seed(run_seed)
+    np.random.seed(run_seed)
+    torch.manual_seed(run_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(run_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    # Train/val split with this run's seed
+    train_split = music_config.get('train_split', 0.8)
+    train_size = int(len(full_dataset) * train_split)
+    val_size = len(full_dataset) - train_size
+
+    train_dataset, val_dataset = random_split(
+        full_dataset,
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(run_seed)
+    )
+
+    if verbose:
+        print(f"  Train: {len(train_dataset)} songs")
+        print(f"  Val: {len(val_dataset)} songs")
+
+    # Compute class weights from training data if requested
+    class_weights = None
+    if class_weight_strategy != "none":
+        # Extract ratings from training dataset
+        train_ratings = []
+        for idx in train_dataset.indices:
+            item = full_dataset[idx]
+            train_ratings.append(item['rating'].item())
+
+        class_weights = compute_class_weights(train_ratings, strategy=class_weight_strategy)
+        if verbose:
+            print(f"  Class weight strategy: {class_weight_strategy}")
+            for bucket, weight in sorted(class_weights.items()):
+                print(f"    {bucket} stars: weight={weight:.3f}")
+
+    # Worker init function
+    def worker_init_fn(worker_id):
+        worker_seed = run_seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=classifier_config['batch_size'],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=classifier_config['batch_size'],
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn
+    )
+
+    # Create model
+    classifier = SimpleRatingClassifier(
+        embedding_dim=embedding_dim,
+        hidden_dims=classifier_config['hidden_dims'],
+        dropout=classifier_config['dropout']
+    )
+
+    # Try to initialize from production model if requested
+    prod_checkpoint_path = Path("prod") / "classifier_best.pt"
+    if init_from_prod and prod_checkpoint_path.exists():
+        try:
+            prod_checkpoint = torch.load(prod_checkpoint_path, map_location='cpu', weights_only=False)
+            prod_state_dict = prod_checkpoint['model_state_dict']
+
+            # Check if architectures match by comparing state dict keys and shapes
+            current_state = classifier.state_dict()
+            arch_matches = True
+            for key in current_state:
+                if key not in prod_state_dict:
+                    arch_matches = False
+                    break
+                if current_state[key].shape != prod_state_dict[key].shape:
+                    arch_matches = False
+                    break
+
+            if arch_matches:
+                classifier.load_state_dict(prod_state_dict)
+                if verbose:
+                    print(f"  Initialized from production model: {prod_checkpoint_path}")
+            else:
+                if verbose:
+                    print(f"  Architecture mismatch with prod model - using random init")
+        except Exception as e:
+            if verbose:
+                print(f"  Could not load prod model ({e}) - using random init")
+    elif init_from_prod and verbose:
+        print(f"  No production model found - using random init")
+
+    # Create loss function based on classification mode
+    if classification_mode == "binary":
+        # Compute pos_weight from training data for class imbalance
+        train_labels = _get_ratings_from_dataset(train_dataset)
+        pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels)
+        loss_fn = BinaryRatingLoss(pos_weight=pos_weight)
+        if verbose:
+            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}")
+    elif class_weights is not None:
+        loss_fn = WeightedRatingLoss(class_weights=class_weights)
+    else:
+        loss_fn = RatingLoss()
+
+    if 'adam_beta1' in classifier_config and 'adam_beta2' in classifier_config:
+        betas = (classifier_config['adam_beta1'], classifier_config['adam_beta2'])
+    else:
+        betas = tuple(classifier_config.get('adam_betas', [0.9, 0.999]))
+
+    use_adamw = classifier_config.get('adam_decoupled_weight_decay', False)
+    optimizer_cls = torch.optim.AdamW if use_adamw else torch.optim.Adam
+    optimizer = optimizer_cls(
+        classifier.parameters(),
+        lr=classifier_config['learning_rate'],
+        betas=betas,
+        eps=classifier_config.get('adam_eps', 1e-08),
+        weight_decay=classifier_config.get('adam_weight_decay', 0.0),
+        amsgrad=classifier_config.get('adam_amsgrad', False)
+    )
+
+    # Create trainer
+    trainer = ClassifierTrainer(
+        classifier=classifier,
+        device=device,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        tracker=tracker,
+        encoder_version=encoder_version,
+        classifier_version=classifier_version,
+        classification_mode=classification_mode
+    )
+
+    # Train
+    training_start_time = time.time()
+    history = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=num_epochs,
+        checkpoint_dir=str(checkpoint_dir),
+        save_best_only=True,
+        early_stopping_patience=classifier_config.get('early_stopping_patience'),
+        early_stopping_min_delta=classifier_config.get('early_stopping_min_delta', 0.0)
+    )
+    training_time = time.time() - training_start_time
+
+    # Calculate metrics
+    best_val_loss = min(history['val_loss']) if history['val_loss'] else float('inf')
+    best_val_mae = min(history['val_mae']) if history['val_mae'] else float('inf')
+    best_epoch = history['val_mae'].index(best_val_mae) + 1 if history['val_mae'] else 0
+    epochs_run = len(history['train_loss'])
+
+    # Copy checkpoint with suffix if specified
+    src_checkpoint = checkpoint_dir / "classifier_best.pt"
+    if checkpoint_suffix and src_checkpoint.exists():
+        dst_checkpoint = checkpoint_dir / f"classifier_best{checkpoint_suffix}.pt"
+        shutil.copy(src_checkpoint, dst_checkpoint)
+        checkpoint_path = dst_checkpoint
+    else:
+        checkpoint_path = src_checkpoint
+
+    # Cleanup
+    del train_loader, val_loader, train_dataset, val_dataset, trainer, classifier, optimizer
+    cleanup_memory()
+
+    return {
+        'best_val_loss': best_val_loss,
+        'best_val_mae': best_val_mae,
+        'best_epoch': best_epoch,
+        'epochs_run': epochs_run,
+        'history': history,
+        'checkpoint_path': checkpoint_path,
+        'training_time': training_time
+    }
+
+
 def train_classifier(
     config: dict,
     model_card: ModelCardGenerator = None,
     final_training: bool = False,
     trial_info: tuple[int, int] = None,
     verbose: bool = True,
-    classifier_version_override: str = None
+    classifier_version_override: str = None,
+    num_runs: int = 1,
+    training_seed: int = None,
+    init_from_prod: bool = True,
+    vault_size: int = 100
 ):
     """Stage 2: Train rating classifier.
 
@@ -808,14 +1527,39 @@ def train_classifier(
         trial_info: Optional tuple of (trial_number, n_trials) for HPO logging
         verbose: If True, print detailed setup info (set False during HPO to reduce noise)
         classifier_version_override: Override classifier version (e.g., 'v2')
+        num_runs: Number of training runs with different seeds (default: 1)
+        training_seed: Seed for model init/training (if None, uses config seed).
+                      Split always uses config seed for consistency across HPO trials.
+        init_from_prod: If True (default), initialize from prod/classifier_best.pt if
+                       architecture matches. If False, use random initialization.
+        vault_size: Number of ratings to reserve for A/B testing vault (default: 100).
+                   Vault files are never used for training, only for comparing models.
 
     Returns:
         ModelCardGenerator with complete statistics
     """
     import time
+    import random
+    import numpy as np
 
     # Ensure clean memory state at start of stage
     cleanup_memory()
+
+    # Seed for data split (always constant from config for fair HPO comparison)
+    split_seed = config.get('seed', 42)
+
+    # Seed for model init/training (can be overridden for multi-run)
+    model_seed = training_seed if training_seed is not None else split_seed
+
+    # Set random seeds for model initialization and training
+    random.seed(model_seed)
+    np.random.seed(model_seed)
+    torch.manual_seed(model_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(model_seed)
+        # Make CuDNN deterministic (may reduce performance slightly)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
     print("=" * 80)
     if trial_info:
@@ -850,20 +1594,23 @@ def train_classifier(
     mlflow_config = config.get('mlflow', {})
     mlflow_enabled = mlflow_config.get('auto_start', True)
 
-    if mlflow_enabled:
+    if False and mlflow_enabled:  # TODO DEBUG - disabled for now like encoder
         # Start MLflow server if configured
-        mlflow_server = MLflowServer(
-            tracking_uri=mlflow_config.get('tracking_uri', 'http://localhost:5000'),
+        tracking_uri = mlflow_config.get('tracking_uri', 'http://localhost:5000')
+        # Extract port from tracking_uri
+        port = int(tracking_uri.split(':')[-1].rstrip('/'))
+
+        mlflow_server = MLflowServer.ensure_running(
+            port=port,
             backend_store_uri=mlflow_config.get('backend_store_uri', 'sqlite:///mlflow.db'),
-            artifact_location=mlflow_config.get('artifact_location', './mlruns')
+            artifact_root=mlflow_config.get('artifact_location', './mlruns')
         )
-        mlflow_server.ensure_started()
 
         # Create run name
         run_name = f"classifier_{'final' if final_training else 'regular'}_{int(time.time())}"
 
         tracker = ExplrTracker(
-            tracking_uri=mlflow_config.get('tracking_uri', 'http://localhost:5000'),
+            tracking_uri=tracking_uri,
             experiment_name=mlflow_config.get('experiment_name', 'music_recommendation'),
             run_name=run_name
         )
@@ -915,26 +1662,243 @@ def train_classifier(
     # Create dataset
     if verbose:
         print("\n[3/6] Creating dataset...")
+
+    # Get classification mode from config
+    classification_mode = classifier_config.get('classification_mode', 'regression')
+    binary_positive_threshold = classifier_config.get('binary_positive_threshold', 4.0)
+    binary_negative_threshold = classifier_config.get('binary_negative_threshold', 2.0)
+
     full_dataset = EmbeddingDataset(
         embeddings=embeddings_dict,
         songs=all_songs,
-        only_rated=True
+        only_rated=True,
+        classification_mode=classification_mode,
+        binary_positive_threshold=binary_positive_threshold,
+        binary_negative_threshold=binary_negative_threshold
     )
 
-    # Train/val split
+    # Get version information (needed for multi-run)
+    encoder_checkpoint_path = Path(config['checkpoint_dir']) / "encoder_best.pt"
+    if encoder_checkpoint_path.exists():
+        encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
+    else:
+        encoder_version = music_config.get('encoder_version', 'v1')
+
+    classifier_version = classifier_version_override if classifier_version_override else music_config.get('classifier_version', 'v1')
+
+    # Multi-run training for statistical validation
+    if num_runs > 1:
+        base_seed = config.get('seed', 42)
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        run_results = []
+
+        print(f"\n{'='*60}")
+        print(f"MULTI-RUN TRAINING: {num_runs} runs with different seeds")
+        print(f"{'='*60}")
+
+        for run_idx in range(num_runs):
+            run_seed = base_seed + run_idx * 1000
+            print(f"\n{'='*60}")
+            print(f"RUN {run_idx + 1}/{num_runs} (seed={run_seed})")
+            print(f"{'='*60}")
+
+            result = _perform_classifier_training_run(
+                config=config,
+                full_dataset=full_dataset,
+                classifier_config=classifier_config,
+                music_config=music_config,
+                embedding_dim=embedding_dim,
+                encoder_version=encoder_version,
+                classifier_version=classifier_version,
+                tracker=tracker,
+                num_epochs=num_epochs,
+                device=device,
+                run_seed=run_seed,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_suffix=f"_run{run_idx + 1}",
+                verbose=verbose,
+                class_weight_strategy=classifier_config.get('class_weight_strategy', 'none'),
+                classification_mode=classification_mode,
+                init_from_prod=init_from_prod
+            )
+
+            run_results.append({
+                'run': run_idx + 1,
+                'seed': run_seed,
+                'best_val_loss': result['best_val_loss'],
+                'best_val_mae': result['best_val_mae'],
+                'best_epoch': result['best_epoch'],
+                'epochs_run': result['epochs_run'],
+                'checkpoint_path': result['checkpoint_path'],
+                'training_time': result['training_time']
+            })
+
+            print(f"\n  Run {run_idx + 1} complete: best_val_mae={result['best_val_mae']:.6f} (epoch {result['best_epoch']})")
+
+        # Report multi-run statistics
+        maes = [r['best_val_mae'] for r in run_results]
+        losses = [r['best_val_loss'] for r in run_results]
+        total_time = sum(r['training_time'] for r in run_results)
+
+        print(f"\n{'='*60}")
+        print("MULTI-RUN STATISTICS")
+        print(f"{'='*60}")
+        for r in run_results:
+            print(f"  Run {r['run']}: val_mae={r['best_val_mae']:.6f}, val_loss={r['best_val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
+        print(f"\n  MAE  - Mean: {np.mean(maes):.6f} +/- {np.std(maes):.6f}, Min: {np.min(maes):.6f}, Max: {np.max(maes):.6f}")
+        print(f"  Loss - Mean: {np.mean(losses):.6f} +/- {np.std(losses):.6f}")
+
+        # Identify and copy best model (by MAE)
+        best_run = min(run_results, key=lambda x: x['best_val_mae'])
+        print(f"\n  Best: Run {best_run['run']} (val_mae={best_run['best_val_mae']:.6f}, seed={best_run['seed']})")
+
+        # Copy best run's checkpoint to classifier_best.pt
+        best_checkpoint = checkpoint_dir / "classifier_best.pt"
+        shutil.copy(best_run['checkpoint_path'], best_checkpoint)
+        print(f"  Best model saved to: {best_checkpoint}")
+        print(f"\n  Total training time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
+
+        # Collect stats for model card (use best run's stats)
+        classifier_stats = {
+            'best_val_loss': best_run['best_val_loss'],
+            'best_val_mae': best_run['best_val_mae'],
+            'val_mae': best_run['best_val_mae'],
+            'best_epoch': best_run['best_epoch'],
+            'epochs_run': best_run['epochs_run'],
+            'training_time_seconds': total_time,
+            'num_runs': num_runs,
+            'mae_mean': np.mean(maes),
+            'mae_std': np.std(maes)
+        }
+        model_card.set_classifier_stats(classifier_stats)
+
+        # Save training manifest for multi-run (use consistent split with vault for A/B testing)
+        manifest_path = checkpoint_dir / "training_manifest.json"
+        manifest = TrainingManifest.load_or_create(str(manifest_path))
+
+        # Get all filenames and do manifest-based split with vault for A/B testing
+        all_filenames = full_dataset.get_all_filenames()
+        file_ratings = full_dataset.get_file_ratings_dict()
+        train_files, val_files, vault_files = manifest.split_with_vault(
+            all_filenames,
+            train_ratio=music_config.get('train_split', 0.8),
+            vault_size=vault_size,
+            seed=base_seed,
+            file_ratings=file_ratings
+        )
+
+        manifest.set_version_info(
+            encoder_version=encoder_version,
+            classifier_version=classifier_version,
+            classification_mode=classification_mode
+        )
+        manifest.save()
+
+        if verbose:
+            print(f"\nTraining manifest saved to: {manifest_path}")
+            print(f"  Vault files (A/B test only): {len(vault_files)}")
+
+        # A/B test against production model using vault files (always available)
+        prod_classifier_path = Path("prod") / "classifier_best.pt"
+        new_classifier_path = checkpoint_dir / "classifier_best.pt"
+
+        if prod_classifier_path.exists() and len(vault_files) > 0 and verbose:
+            print("\n" + "=" * 60)
+            print("A/B TEST: New Model vs Production (using vault)")
+            print("=" * 60)
+
+            # Create test dataset from vault files (reserved for A/B testing only)
+            vault_files_set = set(vault_files)
+            test_dataset = full_dataset.subset_by_filenames(vault_files_set)
+
+            if len(test_dataset) >= 10:
+                ab_result = run_ab_test(
+                    new_classifier_path=str(new_classifier_path),
+                    prod_classifier_path=str(prod_classifier_path),
+                    test_dataset=test_dataset,
+                    classification_mode=classification_mode,
+                    device=device,
+                    verbose=True
+                )
+                manifest.set_metadata('ab_test_result', {
+                    'n_samples': int(ab_result.get('n_samples', 0)),
+                    'improvement': float(ab_result.get('improvement', 0)),
+                    'p_value': float(ab_result.get('p_value', 1.0)),
+                    'significant': bool(ab_result.get('significant', False))
+                })
+                manifest.save()
+            else:
+                print(f"  Skipping A/B test: only {len(test_dataset)} vault samples (need >= 10)")
+        elif verbose and len(vault_files) == 0:
+            print(f"\n  No vault files available for A/B testing")
+            print(f"  Need at least {vault_size} rated files to create vault")
+        elif verbose:
+            print(f"\n  No production model found at {prod_classifier_path}")
+            print(f"  Run 'promote-to-prod' after initial training to enable A/B testing")
+
+        print("\nNext step: Run with --stage recommend to generate recommendations")
+
+        return model_card
+
+    # Single run (existing code path)
+    # Train/val split using manifest to track files with vault for A/B testing
     train_split = music_config.get('train_split', 0.8)
-    train_size = int(len(full_dataset) * train_split)
-    val_size = len(full_dataset) - train_size
+    checkpoint_dir = Path(config['checkpoint_dir'])
 
-    train_dataset, val_dataset = random_split(
-        full_dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(config.get('seed', 42))
+    # Load or create training manifest
+    manifest_path = checkpoint_dir / "training_manifest.json"
+    manifest = TrainingManifest.load_or_create(str(manifest_path))
+
+    # Get all filenames from dataset
+    all_filenames = full_dataset.get_all_filenames()
+
+    if verbose:
+        print(f"\n[4/6] Splitting dataset with manifest tracking (vault_size={vault_size})...")
+
+    # Get file ratings for class-balanced vault
+    file_ratings = full_dataset.get_file_ratings_dict()
+
+    # Split using manifest with vault for A/B testing
+    train_files, val_files, vault_files = manifest.split_with_vault(
+        all_filenames,
+        train_ratio=train_split,
+        vault_size=vault_size,
+        seed=split_seed,
+        file_ratings=file_ratings
     )
+
+    # Update manifest with version info
+    manifest.set_version_info(
+        encoder_version=encoder_version,
+        classifier_version=classifier_version,
+        classification_mode=classification_mode
+    )
+
+    # Create train/val datasets from filename lists
+    train_dataset, val_dataset = full_dataset.split_by_filenames(train_files, val_files)
 
     if verbose:
         print(f"  Train: {len(train_dataset)} songs")
         print(f"  Val: {len(val_dataset)} songs")
+        print(f"  Vault (A/B test only): {len(vault_files)} songs")
+
+    # Compute class weights from training data if requested
+    class_weight_strategy = classifier_config.get('class_weight_strategy', 'none')
+    class_weights = None
+    if class_weight_strategy != "none":
+        train_ratings = _get_ratings_from_dataset(train_dataset)
+
+        class_weights = compute_class_weights(train_ratings, strategy=class_weight_strategy)
+        if verbose:
+            print(f"  Class weight strategy: {class_weight_strategy}")
+            for bucket, weight in sorted(class_weights.items()):
+                print(f"    {bucket} stars: weight={weight:.3f}")
+
+    # Worker initialization function for reproducible DataLoader workers (use model_seed)
+    def worker_init_fn(worker_id):
+        worker_seed = model_seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
 
     # Create data loaders (embeddings are cheap to load, so smaller prefetch)
     train_loader = DataLoader(
@@ -944,7 +1908,8 @@ def train_classifier(
         num_workers=4,
         pin_memory=True,
         prefetch_factor=2,  # Embeddings load fast, so 2 batches is enough
-        persistent_workers=True
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn
     )
     val_loader = DataLoader(
         val_dataset,
@@ -953,7 +1918,8 @@ def train_classifier(
         num_workers=4,
         pin_memory=True,
         prefetch_factor=2,
-        persistent_workers=True
+        persistent_workers=True,
+        worker_init_fn=worker_init_fn
     )
 
     # Create model
@@ -970,8 +1936,18 @@ def train_classifier(
         print(f"  Hidden dims: {classifier_config['hidden_dims']}")
         print(f"  Dropout: {classifier_config['dropout']}")
 
-    # Create loss and optimizer with full Adam parameters
-    loss_fn = RatingLoss()
+    # Create loss function based on classification mode
+    if classification_mode == "binary":
+        # Compute pos_weight from training data for class imbalance
+        train_labels = _get_ratings_from_dataset(train_dataset)
+        pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels)
+        loss_fn = BinaryRatingLoss(pos_weight=pos_weight)
+        if verbose:
+            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}")
+    elif class_weights is not None:
+        loss_fn = WeightedRatingLoss(class_weights=class_weights)
+    else:
+        loss_fn = RatingLoss()
 
     # Handle betas - can be list from config or separate beta1/beta2 from HPO
     if 'adam_beta1' in classifier_config and 'adam_beta2' in classifier_config:
@@ -999,21 +1975,7 @@ def train_classifier(
         print(f"    eps={classifier_config.get('adam_eps', 1e-08)}")
         print(f"    weight_decay={classifier_config.get('adam_weight_decay', 0.0)}")
         print(f"    amsgrad={classifier_config.get('adam_amsgrad', False)}")
-
-    # Get version information
-    encoder_checkpoint_path = Path(config['checkpoint_dir']) / "encoder_best.pt"
-    if encoder_checkpoint_path.exists():
-        encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
-        if verbose:
-            print(f"\n  Encoder version (from checkpoint): {encoder_version}")
-    else:
-        encoder_version = music_config.get('encoder_version', 'v1')
-        if verbose:
-            print(f"\n  Encoder version (from config): {encoder_version}")
-            print(f"  WARNING: No encoder checkpoint found at {encoder_checkpoint_path}")
-
-    classifier_version = classifier_version_override if classifier_version_override else music_config.get('classifier_version', 'v1')
-    if verbose:
+        print(f"\n  Encoder version: {encoder_version}")
         print(f"  Classifier version: {classifier_version}")
 
     # Create trainer
@@ -1026,7 +1988,8 @@ def train_classifier(
         optimizer=optimizer,
         tracker=tracker,  # Pass tracker for MLflow learning curves
         encoder_version=encoder_version,
-        classifier_version=classifier_version
+        classifier_version=classifier_version,
+        classification_mode=classification_mode
     )
 
     # Train with time tracking and MLflow logging
@@ -1126,23 +2089,90 @@ def train_classifier(
         print(f"Model card saved to: {model_card_path}")
     # Skip model card generation during HPO (verbose=False)
 
+    # Save training manifest (tracks which files were used for training)
+    manifest.set_metadata('best_val_loss', best_val_loss)
+    manifest.set_metadata('best_val_mae', best_val_mae)
+    manifest.set_metadata('training_time_seconds', training_time)
+    manifest.set_metadata('epochs_run', epochs_run)
+    manifest.set_metadata('train_size', len(train_dataset))
+    manifest.set_metadata('val_size', len(val_dataset))
+    manifest.set_metadata('vault_size', len(vault_files))
+    manifest.save()
+
+    if verbose:
+        print(f"\nTraining manifest saved to: {manifest_path}")
+        print(f"  Training files: {len(manifest.training_files)}")
+        print(f"  Validation files: {len(manifest.validation_files)}")
+        print(f"  Vault files (A/B test): {len(manifest.vault_files)}")
+
+    # A/B test against production model using vault files (always available)
+    prod_classifier_path = Path("prod") / "classifier_best.pt"
+    new_classifier_path = checkpoint_dir / "classifier_best.pt"
+
+    if prod_classifier_path.exists() and len(vault_files) > 0 and verbose:
+        print("\n" + "=" * 60)
+        print("A/B TEST: New Model vs Production (using vault)")
+        print("=" * 60)
+
+        # Create test dataset from vault files (reserved for A/B testing only)
+        vault_files_set = set(vault_files)
+        test_dataset = full_dataset.subset_by_filenames(vault_files_set)
+
+        if len(test_dataset) >= 10:  # Need minimum samples for meaningful test
+            ab_result = run_ab_test(
+                new_classifier_path=str(new_classifier_path),
+                prod_classifier_path=str(prod_classifier_path),
+                test_dataset=test_dataset,
+                classification_mode=classification_mode,
+                device=device,
+                verbose=True
+            )
+
+            # Store A/B test result in manifest
+            manifest.set_metadata('ab_test_result', {
+                'n_samples': int(ab_result.get('n_samples', 0)),
+                'improvement': float(ab_result.get('improvement', 0)),
+                'p_value': float(ab_result.get('p_value', 1.0)),
+                'significant': bool(ab_result.get('significant', False))
+            })
+            manifest.save()
+        else:
+            print(f"  Skipping A/B test: only {len(test_dataset)} vault samples (need >= 10)")
+    elif verbose and len(vault_files) == 0:
+        print(f"\n  No vault files available for A/B testing")
+        print(f"  Need at least {vault_size} rated files to create vault")
+    elif verbose:
+        print(f"\n  No production model found at {prod_classifier_path}")
+        print(f"  Run 'promote-to-prod' after initial training to enable A/B testing")
+
     return model_card
 
 
-def generate_recommendations(config: dict):
+def generate_recommendations(config: dict, prod_dir: str = None, low_rating_ratio: float = 0.0):
     """Generate recommendations for unrated songs.
 
     Args:
         config: Configuration dictionary
+        prod_dir: Optional path to production models directory. If specified,
+                  loads models from this directory instead of checkpoint_dir.
+        low_rating_ratio: Ratio of low-ranked (predicted dislike) songs to include
+                         in recommendations (0.0-1.0). Useful for A/B testing to
+                         ensure negative labels and force careful listening.
 
     Raises:
         ValueError: If classifier was trained with a different encoder version
     """
+    import json
+    import numpy as np
+
     # Ensure clean memory state at start of stage
     cleanup_memory()
 
     print("=" * 80)
-    print("GENERATING RECOMMENDATIONS")
+    if prod_dir:
+        print("GENERATING RECOMMENDATIONS (PRODUCTION)")
+    else:
+        print("GENERATING RECOMMENDATIONS")
     print("=" * 80)
 
     # Load configuration
@@ -1150,9 +2180,18 @@ def generate_recommendations(config: dict):
     rec_config = config.get('recommendations', {})
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
+    # Determine model directory (prod or dev)
+    if prod_dir:
+        model_dir = Path(prod_dir)
+        embeddings_db_path = model_dir / "embeddings.db"
+        print(f"\n  Using production models from: {model_dir}")
+    else:
+        model_dir = Path(config['checkpoint_dir'])
+        embeddings_db_path = Path(music_config['embedding_db_path'])
+
     # Validate model compatibility BEFORE proceeding
-    encoder_checkpoint = Path(config['checkpoint_dir']) / "encoder_best.pt"
-    classifier_checkpoint = Path(config['checkpoint_dir']) / "classifier_best.pt"
+    encoder_checkpoint = model_dir / "encoder_best.pt"
+    classifier_checkpoint = model_dir / "classifier_best.pt"
 
     if encoder_checkpoint.exists() and classifier_checkpoint.exists():
         print("\n[0/5] Validating model compatibility...")
@@ -1181,7 +2220,7 @@ def generate_recommendations(config: dict):
 
     # Load embeddings
     print("\n[2/5] Loading embeddings...")
-    embedding_store = EmbeddingStore(music_config['embedding_db_path'])
+    embedding_store = EmbeddingStore(str(embeddings_db_path))
 
     filenames = [s.filename for s in unrated_songs]
     # Use encoder_version for embedding lookup (with fallback to model_version for backwards compatibility)
@@ -1217,47 +2256,124 @@ def generate_recommendations(config: dict):
     print("\n[3/5] Loading classifier...")
     embedding_dim = len(next(iter(embeddings_dict.values())))
 
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=config['classifier']['hidden_dims'],
-        dropout=config['classifier']['dropout']
-    )
-
-    checkpoint_path = Path(config['checkpoint_dir']) / "classifier_best.pt"
+    checkpoint_path = classifier_checkpoint  # Already set above based on model_dir
     if not checkpoint_path.exists():
         print(f"  Classifier checkpoint not found: {checkpoint_path}")
-        print("  Run classifier training first!")
+        if prod_dir:
+            print("  Run 'promote-to-prod' first to deploy models!")
+        else:
+            print("  Run classifier training first!")
         return
 
+    # Load checkpoint first to infer architecture from state dict
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    classifier.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = checkpoint['model_state_dict']
+
+    # Infer hidden_dims from checkpoint state dict
+    # Layer weights are named mlp.0.weight, mlp.3.weight, mlp.6.weight, etc.
+    # Each weight shape is [out_features, in_features]
+    hidden_dims = []
+    layer_idx = 0
+    while f"mlp.{layer_idx}.weight" in state_dict:
+        weight = state_dict[f"mlp.{layer_idx}.weight"]
+        out_features = weight.shape[0]
+        # Skip the final output layer (size 1)
+        if out_features > 1:
+            hidden_dims.append(out_features)
+        layer_idx += 3  # Each block is Linear + ReLU + Dropout (3 layers)
+
+    dropout = config['classifier'].get('dropout', 0.3)  # Dropout doesn't affect loading
+    print(f"  Inferred architecture from checkpoint: hidden_dims={hidden_dims}")
+
+    classifier = SimpleRatingClassifier(
+        embedding_dim=embedding_dim,
+        hidden_dims=hidden_dims,
+        dropout=dropout
+    )
+
+    classifier.load_state_dict(state_dict)
     classifier = classifier.to(device)
+
+    # Get classification mode from config
+    classifier_config = config['classifier']
+    classification_mode = classifier_config.get('classification_mode', 'regression')
 
     # Generate predictions
     print("\n[4/5] Generating predictions...")
-    loss_fn = RatingLoss()
+    if classification_mode == "binary":
+        loss_fn = BinaryRatingLoss()
+        print(f"  Mode: Binary classification (like/dislike)")
+    else:
+        loss_fn = RatingLoss()
+        print(f"  Mode: Regression (continuous ratings)")
+
     trainer = ClassifierTrainer(
         classifier=classifier,
         device=device,
         loss_fn=loss_fn,
-        optimizer=torch.optim.Adam(classifier.parameters())  # Dummy optimizer
+        optimizer=torch.optim.Adam(classifier.parameters()),  # Dummy optimizer
+        classification_mode=classification_mode
     )
 
     predictions, pred_filenames = trainer.predict(data_loader)
+
+    # Diagnostic: Show prediction statistics
+    if predictions:
+        pred_array = np.array(predictions)
+        if classification_mode == "binary":
+            print(f"  Prediction statistics (probability of 'like', where 1.0 = definitely like):")
+            print(f"    Min: {pred_array.min():.4f}")
+            print(f"    Max: {pred_array.max():.4f}")
+            print(f"    Mean: {pred_array.mean():.4f}")
+            print(f"    Std: {pred_array.std():.4f}")
+            print(f"    Predicted 'likes' (>0.5): {(pred_array > 0.5).sum()} songs")
+        else:
+            print(f"  Prediction statistics (normalized 0-1 scale, where 1.0 = 5 stars):")
+            print(f"    Min: {pred_array.min():.4f} ({pred_array.min() * 5:.2f} stars)")
+            print(f"    Max: {pred_array.max():.4f} ({pred_array.max() * 5:.2f} stars)")
+            print(f"    Mean: {pred_array.mean():.4f} ({pred_array.mean() * 5:.2f} stars)")
+            print(f"    Std: {pred_array.std():.4f}")
 
     # Sort by predicted rating
     results = list(zip(predictions, pred_filenames))
     results.sort(reverse=True)  # Highest ratings first
 
-    # Apply threshold
+    # Apply threshold (only for high-predicted songs)
     min_threshold = rec_config.get('min_rating_threshold', 0.0)
-    results = [(r, f) for r, f in results if r >= min_threshold]
+    above_threshold = sum(1 for r, _ in results if r >= min_threshold)
+    print(f"  Threshold: {min_threshold} ({min_threshold * 5:.1f} stars) - {above_threshold}/{len(results)} songs pass")
 
-    # Get top-N
+    # Get top-N with optional low-rating ratio
     top_n = rec_config.get('top_n', 100)
-    results = results[:top_n]
 
-    print(f"  Generated {len(results)} recommendations")
+    if low_rating_ratio > 0.0:
+        # Include some predicted "dislikes" for A/B testing balance
+        n_low = int(top_n * low_rating_ratio)
+        n_high = top_n - n_low
+
+        # High-predicted songs (above threshold)
+        high_results = [(r, f) for r, f in results if r >= min_threshold][:n_high]
+
+        # Low-predicted songs (from the bottom, below threshold preferred)
+        results_sorted_low = sorted(results, key=lambda x: x[0])  # Lowest first
+        low_results = results_sorted_low[:n_low]
+
+        # Combine: high predictions + low predictions (marked for identification)
+        print(f"\n  Low-rating ratio: {low_rating_ratio:.1%}")
+        print(f"    High-predicted songs: {len(high_results)}")
+        print(f"    Low-predicted songs: {len(low_results)}")
+
+        # Mark low-predicted songs with negative rating for identification
+        # (The actual prediction value is stored, sign indicates category)
+        final_results = high_results + low_results
+        # Sort by absolute prediction for display, but keep track of which are "low"
+        low_filenames = {f for _, f in low_results}
+        results = final_results
+    else:
+        results = [(r, f) for r, f in results if r >= min_threshold][:top_n]
+        low_filenames = set()
+
+    print(f"  Generated {len(results)} recommendations (top {top_n})")
 
     # Save recommendations
     print("\n[5/5] Saving recommendations...")
@@ -1265,13 +2381,17 @@ def generate_recommendations(config: dict):
 
     with open(output_path, 'w') as f:
         f.write(f"Top {len(results)} Recommendations\n")
+        if low_rating_ratio > 0.0:
+            f.write(f"(includes {low_rating_ratio:.0%} predicted dislikes marked with [LOW])\n")
         f.write("=" * 80 + "\n\n")
 
         for i, (rating, filename) in enumerate(results, 1):
             # Find song metadata
             song = next((s for s in unrated_songs if s.filename == filename), None)
             if song:
-                f.write(f"{i}. [{rating:.3f}] {song.artist} - {song.title}\n")
+                is_low = filename in low_filenames
+                marker = " [LOW]" if is_low else ""
+                f.write(f"{i}. [{rating:.3f}]{marker} {song.artist} - {song.title}\n")
                 f.write(f"   Album: {song.album} ({song.year})\n")
                 f.write(f"   Path: {filename}\n\n")
 
@@ -1282,7 +2402,9 @@ def generate_recommendations(config: dict):
     for i, (rating, filename) in enumerate(results[:10], 1):
         song = next((s for s in unrated_songs if s.filename == filename), None)
         if song:
-            print(f"  {i}. [{rating:.3f}] {song.artist} - {song.title}")
+            is_low = filename in low_filenames
+            marker = " [LOW]" if is_low else ""
+            print(f"  {i}. [{rating:.3f}]{marker} {song.artist} - {song.title}")
 
     # Generate human feedback playlists (for reinforcement learning loop)
     print("\n" + "=" * 80)
@@ -1389,59 +2511,307 @@ def build_waveform_cache(config: dict):
         print(f"  Cache size: {final_stats['size_gb']:.1f} GB")
 
     else:
-        # Legacy mode: Use original SimSiam caching
-        from tqdm import tqdm
-        from ml_skeleton.music.dataset import SimSiamMusicDataset
+        # No legacy mode - MoCo chunk cache is the only supported method
+        print("\nERROR: chunk_cache.enabled must be True in config")
+        print("MoCo v2 encoder requires 4-chunk cache. Update your config:")
+        print("  music:")
+        print("    chunk_cache:")
+        print("      enabled: true")
+        print("      directory: ./cache/chunks")
+        print("      num_chunks: 4")
+        print("      chunk_duration: 30.0")
+        return
 
-        sample_rate = music_config.get('sample_rate', 16000)
-        duration = music_config.get('audio_duration', 60.0)
-        crop_position = music_config.get('crop_position', 'end')
-        normalize = music_config.get('normalize', True)
-        cache_dir = music_config.get('waveform_cache_dir', './cache')
-        cache_max_gb = music_config.get('waveform_cache_max_gb', 140.0)
 
-        print(f"\n[2/3] Legacy Cache configuration:")
-        print(f"  Cache dir: {cache_dir}")
-        print(f"  Sample rate: {sample_rate} Hz")
-        print(f"  Duration: {duration}s")
-        print(f"  Crop position: {crop_position}")
-        print(f"  Max cache size: {cache_max_gb} GB")
+def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Optional[int] = None):
+    """Extract acoustic fingerprints from original audio files.
 
-        print("\n[3/3] Building cache...")
-        print("  This iterates through all audio files to populate the cache.")
-        print("  Files that fail to load will be logged but won't stop the process.")
-        print("")
+    Args:
+        config: Configuration dictionary with music and fingerprinting settings
+        exhaust: If True, process up to daily API limit (500 for free tier)
+        workers: Number of parallel workers (default: from config or 4)
+    """
+    from ml_skeleton.music.file_fingerprinter import fingerprint_songs_from_files
+    from ml_skeleton.music.fingerprint_db import FingerprintDB
 
-        dataset = SimSiamMusicDataset(
-            songs=all_songs,
-            sample_rate=sample_rate,
-            duration=duration,
-            crop_position=crop_position,
-            normalize=normalize,
-            augmentor=None,
-            skip_unknown_metadata=music_config.get('skip_unknown_metadata', True),
-            cache_dir=cache_dir,
-            cache_max_gb=cache_max_gb
-        )
+    print("=" * 80)
+    print("EXTRACTING ACOUSTIC FINGERPRINTS")
+    print("=" * 80)
 
-        cached = 0
-        failed = 0
-        for i in tqdm(range(len(dataset)), desc="Caching audio files"):
-            try:
-                _ = dataset[i]
-                cached += 1
-            except Exception:
-                failed += 1
+    # Get configurations
+    music_config = config.get('music', {})
+    fp_config = config.get('fingerprinting', {})
 
-        print(f"\n  Cached: {cached} files")
-        print(f"  Failed: {failed} files")
-        if cache_dir:
-            import os
-            cache_size = sum(
-                os.path.getsize(os.path.join(cache_dir, f))
-                for f in os.listdir(cache_dir) if f.endswith('.npy')
-            ) / (1024 ** 3)
-            print(f"  Cache size: {cache_size:.1f} GB")
+    # Check if fingerprinting is enabled
+    if not fp_config.get('enabled', False):
+        print("\nWARNING: Fingerprinting is disabled in config")
+        print("Enable in config:")
+        print("  fingerprinting:")
+        print("    enabled: true")
+        return
+
+    # Load songs from Clementine database
+    print("\n[1/4] Loading songs from database...")
+    from ml_skeleton.music.clementine_db import ClementineDB
+
+    # Support both 'database_path' (new) and 'clementine_db_path' (legacy) config keys
+    db_path = os.getenv('CLEMENTINE_DB_PATH',
+                       music_config.get('database_path') or music_config.get('clementine_db_path'))
+    clementine_db = ClementineDB(db_path)
+    all_songs = clementine_db.get_all_songs()
+    print(f"  Loaded {len(all_songs)} songs")
+
+    # Initialize fingerprint database
+    print("\n[2/4] Initializing fingerprint database...")
+    fp_db_path = fp_config.get('fingerprint_db_path', './cache/fingerprints.db')
+    fp_db = FingerprintDB(fp_db_path)
+    print(f"  Database: {fp_db_path}")
+
+    # Get existing stats
+    existing_stats = fp_db.get_stats()
+    if existing_stats['total_fingerprints'] > 0:
+        print(f"  Existing fingerprints: {existing_stats['total_fingerprints']}")
+        print(f"  Existing songs: {existing_stats['unique_songs']}")
+
+    # Get fingerprinting parameters
+    # Use CLI override if provided, otherwise config (default: 4)
+    num_workers = workers if workers is not None else fp_config.get('num_workers', 4)
+    skip_existing = fp_config.get('skip_existing', True)
+    max_duration = fp_config.get('max_duration', 300)  # Default: 5 minutes
+
+    # Get prioritization and limit settings
+    prioritize_missing = fp_config.get('prioritize_missing_metadata', True)
+
+    # Determine max_songs based on exhaust flag
+    if exhaust:
+        # Use daily API limit for the tier
+        tier = fp_config.get('acoustid_tier', 'free')
+        max_songs = 500 if tier == 'free' else None  # 500 for free tier, unlimited for paid
+        print("\n⚡ EXHAUST MODE: Processing up to daily API limit")
+        if tier == 'free':
+            print(f"  Free tier: 500 songs/day max")
+        else:
+            print(f"  Paid tier: unlimited (rate-limited to 3 req/s)")
+    else:
+        max_songs = fp_config.get('max_songs', 10)  # Default: 10 for testing
+
+    print(f"\n[3/4] Fingerprinting configuration:")
+    print(f"  Source: Original audio files (full duration)")
+    print(f"  Workers: {num_workers}")
+    print(f"  Skip existing: {skip_existing}")
+    print(f"  Max duration: {max_duration}s (filters out long tracks)")
+    print(f"  Prioritize missing metadata: {prioritize_missing}")
+    print(f"  Max songs: {max_songs if max_songs else 'unlimited'}")
+
+    # Extract fingerprints from original audio files
+    print(f"\n[4/4] Extracting fingerprints from original files...")
+    print(f"  NOTE: This fingerprints FULL audio files, not 30s chunks")
+    print(f"  This is required for AcoustID API matching")
+    stats = fingerprint_songs_from_files(
+        songs=all_songs,
+        fp_db=fp_db,
+        num_workers=num_workers,
+        skip_existing=skip_existing,
+        prioritize_missing_metadata=prioritize_missing,
+        max_songs=max_songs,
+        max_duration=max_duration,
+        verbose=True
+    )
+
+    # Display results
+    print("\n" + "=" * 80)
+    print("FINGERPRINTING COMPLETE")
+    print("=" * 80)
+    print(f"  Total songs processed: {stats['total_songs']}")
+    print(f"  Successfully fingerprinted: {stats['fingerprinted']}")
+    print(f"  Skipped (existing): {stats['skipped']}")
+    if stats.get('skipped_duration', 0) > 0:
+        print(f"  Skipped (too long): {stats['skipped_duration']}")
+    print(f"  Failed: {stats['failed']}")
+    if stats['processed'] > 0:
+        print(f"  Rated songs processed: {stats['rated']}")
+        print(f"  Unrated songs processed: {stats['unrated']}")
+
+    if stats['failed'] > 0 and stats['errors']:
+        print(f"\n  First 5 errors:")
+        for error in stats['errors'][:5]:
+            print(f"    - {error}")
+
+    # Show final database stats
+    final_stats = fp_db.get_stats()
+    print(f"\nFingerprint Database Statistics:")
+    print(f"  Total fingerprints: {final_stats['total_fingerprints']}")
+    print(f"  Unique songs: {final_stats['unique_songs']}")
+    print(f"  Complete fingerprints: {final_stats['songs_with_complete_fingerprints']}")
+    print(f"  Database size: {final_stats['db_size_mb']:.2f} MB")
+    print(f"  Database path: {fp_db_path}")
+    print("")
+
+
+def enrich_metadata_stage(config: dict, exhaust: bool = False):
+    """Enrich song metadata using AcoustID and MusicBrainz APIs.
+
+    Args:
+        config: Configuration dictionary with music and fingerprinting settings
+        exhaust: If True, process up to daily API limit (500 for free tier)
+    """
+    from ml_skeleton.music.metadata_enrichment import enrich_songs_metadata
+    from ml_skeleton.music.fingerprint_db import FingerprintDB
+    from ml_skeleton.music.musicbrainz_db import MusicBrainzDB
+
+    print("=" * 80)
+    print("ENRICHING METADATA VIA ACOUSTID/MUSICBRAINZ")
+    print("=" * 80)
+
+    # Get configurations
+    music_config = config.get('music', {})
+    fp_config = config.get('fingerprinting', {})
+
+    # Check if external lookup is enabled
+    if not fp_config.get('enable_external_lookup', False):
+        print("\nWARNING: External lookup is disabled in config")
+        print("Enable in config:")
+        print("  fingerprinting:")
+        print("    enable_external_lookup: true")
+        print("    acoustid_api_key: YOUR_API_KEY")
+        return
+
+    # Get API key from environment variable
+    acoustid_api_key = os.getenv('ACOUSTID_API_KEY', fp_config.get('acoustid_api_key'))
+    if not acoustid_api_key or acoustid_api_key.startswith('${'):
+        print("\nERROR: AcoustID API key not configured")
+        print("Set environment variable: export ACOUSTID_API_KEY=your_key_here")
+        print("Or add to config: fingerprinting.acoustid_api_key")
+        print("\nRegister for free API key at: https://acoustid.org/new-application")
+        return
+
+    # Load songs from Clementine database
+    print("\n[1/5] Loading songs from database...")
+    from ml_skeleton.music.clementine_db import ClementineDB
+
+    # Support both 'database_path' (new) and 'clementine_db_path' (legacy) config keys
+    db_path = os.getenv('CLEMENTINE_DB_PATH',
+                       music_config.get('database_path') or music_config.get('clementine_db_path'))
+    clementine_db = ClementineDB(db_path)
+    all_songs = clementine_db.get_all_songs()
+    print(f"  Loaded {len(all_songs)} songs")
+
+    # Initialize databases
+    print("\n[2/5] Initializing databases...")
+    fp_db_path = fp_config.get('fingerprint_db_path', './cache/fingerprints.db')
+    mb_db_path = fp_config.get('musicbrainz_db_path', './musicbrainz_metadata.db')
+
+    fp_db = FingerprintDB(fp_db_path)
+    mb_db = MusicBrainzDB(mb_db_path)
+
+    print(f"  Fingerprint DB: {fp_db_path}")
+    print(f"  MusicBrainz DB: {mb_db_path}")
+
+    # Get existing stats
+    fp_stats = fp_db.get_stats()
+    mb_stats = mb_db.get_stats()
+
+    print(f"  Songs with fingerprints: {fp_stats['unique_songs']}")
+    print(f"  Songs with enrichment: {mb_stats['total_songs']}")
+
+    # Get enrichment parameters
+    chunk_idx = fp_config.get('chunk_for_fingerprinting', 1)
+    acoustid_rate_limit = fp_config.get('acoustid_rate_limit', 3.0)
+    mb_rate_limit = fp_config.get('musicbrainz_rate_limit', 1.0)
+    skip_existing = fp_config.get('skip_existing', True)
+
+    # Determine max_songs based on exhaust flag
+    if exhaust:
+        # Use daily API limit for the tier
+        tier = fp_config.get('acoustid_tier', 'free')
+        max_songs = 500 if tier == 'free' else None  # 500 for free tier, unlimited for paid
+        print("\n⚡ EXHAUST MODE: Processing up to daily API limit")
+        if tier == 'free':
+            print(f"  Free tier: 500 songs/day max")
+        else:
+            print(f"  Paid tier: unlimited (rate-limited to 3 req/s)")
+    else:
+        max_songs = fp_config.get('max_songs', 10)  # Default: 10 for testing
+
+    print(f"\n[3/5] Enrichment configuration:")
+    print(f"  Chunk index: {chunk_idx}")
+    print(f"  AcoustID rate limit: {acoustid_rate_limit} req/s")
+    print(f"  MusicBrainz rate limit: {mb_rate_limit} req/s")
+    print(f"  Skip existing: {skip_existing}")
+    print(f"  Max songs: {max_songs if max_songs else 'unlimited'}")
+
+    # Estimate time for free tier
+    if max_songs and max_songs <= 500:
+        estimated_time_sec = max_songs / min(acoustid_rate_limit, mb_rate_limit)
+        estimated_time_min = estimated_time_sec / 60
+        print(f"  Estimated time: ~{estimated_time_min:.1f} minutes")
+
+    # Enrich metadata
+    print(f"\n[4/5] Enriching metadata...")
+    print("NOTE: This queries external APIs (AcoustID + MusicBrainz)")
+    print("Free tier limit: 500 lookups/day")
+    print("")
+
+    stats = enrich_songs_metadata(
+        songs=all_songs,
+        fp_db=fp_db,
+        mb_db=mb_db,
+        acoustid_api_key=acoustid_api_key,
+        chunk_idx=chunk_idx,
+        acoustid_rate_limit=acoustid_rate_limit,
+        musicbrainz_rate_limit=mb_rate_limit,
+        skip_existing=skip_existing,
+        max_songs=max_songs,
+        verbose=True
+    )
+
+    # Display results
+    print("\n" + "=" * 80)
+    print("METADATA ENRICHMENT COMPLETE")
+    print("=" * 80)
+    print(f"  Total songs: {stats['total_songs']}")
+    print(f"  Processed: {stats['processed']}")
+    print(f"  Successfully enriched: {stats['enriched']}")
+    print(f"  Skipped (existing): {stats['skipped']}")
+    print(f"  Failed: {stats['failed']}")
+    print(f"  No fingerprint: {stats['no_fingerprint']}")
+    print(f"  API lookups performed: {stats['api_lookups']}")
+    if stats['processed'] > 0:
+        print(f"  Rated songs processed: {stats['rated']}")
+        print(f"  Unrated songs processed: {stats['unrated']}")
+
+    if stats['failed'] > 0 and stats['errors']:
+        print(f"\n  First 5 errors:")
+        for error in stats['errors'][:5]:
+            print(f"    - {error}")
+
+    # Show API usage summary for exhaust mode
+    if exhaust:
+        tier = fp_config.get('acoustid_tier', 'free')
+        if tier == 'free':
+            remaining = 500 - stats['api_lookups']
+            print(f"\n  Daily API quota (free tier):")
+            print(f"    Used today: {stats['api_lookups']}/500 lookups")
+            print(f"    Remaining: {remaining} lookups")
+            if remaining > 0:
+                print(f"    ℹ️  You can run enrichment again today to use remaining quota")
+        else:
+            print(f"\n  API usage (paid tier):")
+            print(f"    Lookups performed: {stats['api_lookups']} (unlimited)")
+
+    # Show final MusicBrainz database stats
+    print("\n[5/5] MusicBrainz Database Statistics:")
+    final_mb_stats = mb_db.get_stats()
+    print(f"  Total enriched songs: {final_mb_stats['total_songs']}")
+    print(f"  With AcoustID: {final_mb_stats['with_acoustid']}")
+    print(f"  With MusicBrainz ID: {final_mb_stats['with_musicbrainz']}")
+    print(f"  High confidence artist: {final_mb_stats['high_confidence_artist']}")
+    print(f"  High confidence album: {final_mb_stats['high_confidence_album']}")
+    print(f"  Avg artist confidence: {final_mb_stats['avg_artist_confidence']:.3f}")
+    print(f"  Avg album confidence: {final_mb_stats['avg_album_confidence']:.3f}")
+    print(f"  Database size: {final_mb_stats['db_size_mb']:.2f} MB")
+    print(f"  Database path: {mb_db_path}")
+    print("")
 
 
 def main():
@@ -1453,8 +2823,8 @@ def main():
         '--stage',
         type=str,
         required=True,
-        choices=['encoder', 'classifier', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache'],
-        help='Training stage, recommendation generation, cache building, or hyperparameter tuning'
+        choices=['encoder', 'classifier', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache', 'fingerprint', 'enrich-metadata', 'init-baseline', 'generate-model-card'],
+        help='Training stage, recommendation generation, cache building, fingerprinting, metadata enrichment, or hyperparameter tuning'
     )
     parser.add_argument(
         '--config',
@@ -1495,9 +2865,9 @@ def main():
     parser.add_argument(
         '--encoder-type',
         type=str,
-        choices=['simple', 'simsiam'],
+        choices=['moco'],
         default=None,
-        help='Override encoder type from config (for A/B testing)'
+        help='Override encoder type from config (only moco supported)'
     )
     parser.add_argument(
         '--resume-checkpoint',
@@ -1522,6 +2892,53 @@ def main():
         type=str,
         default=None,
         help='Override classifier version (e.g., v2, v3). Defaults to config value.'
+    )
+    parser.add_argument(
+        '--exhaust',
+        action='store_true',
+        help='Process maximum songs for the day (500 for free tier, respects API rate limits)'
+    )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=None,
+        help='Number of parallel workers for fingerprinting (default: 4, or from config)'
+    )
+    parser.add_argument(
+        '-N', '--num-runs',
+        type=int,
+        default=1,
+        dest='num_runs',
+        help='Number of training runs with different seeds (reports mean/std, saves best model)'
+    )
+    parser.add_argument(
+        '--prod-dir',
+        type=str,
+        default=None,
+        help='Use production models from specified directory (e.g., prod/) for recommendations'
+    )
+    parser.add_argument(
+        '--low-rating-ratio',
+        type=float,
+        default=0.0,
+        dest='low_rating_ratio',
+        help='Ratio of low-ranked (predicted dislike) songs to include in recommendations (e.g., 0.1 for 10%%). '
+             'Useful for A/B testing to ensure negative labels and force careful listening.'
+    )
+    parser.add_argument(
+        '--random-init',
+        action='store_true',
+        dest='random_init',
+        help='Initialize classifier with random weights instead of loading from production model. '
+             'Default is to warm-start from prod/classifier_best.pt if architecture matches.'
+    )
+    parser.add_argument(
+        '--vault-size',
+        type=int,
+        default=100,
+        dest='vault_size',
+        help='Number of ratings to reserve in vault for A/B testing only (default: 100). '
+             'Vault files are never used for training, only for comparing models.'
     )
 
     args = parser.parse_args()
@@ -1566,7 +2983,8 @@ def main():
             config,
             final_training=args.final_training,
             resume_checkpoint=args.resume_checkpoint,
-            model_version_override=args.encoder_version
+            model_version_override=args.encoder_version,
+            num_runs=args.num_runs
         )
         cleanup_memory()
         print("\nNext step: Run with --stage classifier to train the rating predictor")
@@ -1575,13 +2993,16 @@ def main():
         model_card = train_classifier(
             config,
             final_training=args.final_training,
-            classifier_version_override=args.classifier_version
+            classifier_version_override=args.classifier_version,
+            num_runs=args.num_runs,
+            init_from_prod=not args.random_init,
+            vault_size=args.vault_size
         )
         cleanup_memory()
         print("\nNext step: Run with --stage recommend to generate recommendations")
 
     elif args.stage == 'recommend':
-        generate_recommendations(config)
+        generate_recommendations(config, prod_dir=args.prod_dir, low_rating_ratio=args.low_rating_ratio)
         cleanup_memory()
 
     elif args.stage == 'build-cache':
@@ -1596,6 +3017,16 @@ def main():
         build_waveform_cache(config)
         cleanup_memory()
         print("\nCache build complete! Training will now have consistent speed.")
+
+    elif args.stage == 'fingerprint':
+        # Extract acoustic fingerprints from original files
+        fingerprint_songs_stage(config, exhaust=args.exhaust, workers=args.workers)
+        cleanup_memory()
+
+    elif args.stage == 'enrich-metadata':
+        # Enrich metadata using AcoustID/MusicBrainz APIs
+        enrich_metadata_stage(config, exhaust=args.exhaust)
+        cleanup_memory()
 
     elif args.stage == 'all':
         # Run complete pipeline: encoder -> classifier -> model card
@@ -1613,7 +3044,8 @@ def main():
             config,
             final_training=args.final_training,
             resume_checkpoint=args.resume_checkpoint,
-            model_version_override=args.encoder_version
+            model_version_override=args.encoder_version,
+            num_runs=args.num_runs
         )
         cleanup_memory()
 
@@ -1622,7 +3054,9 @@ def main():
             config,
             model_card=model_card,
             final_training=args.final_training,
-            classifier_version_override=args.classifier_version
+            classifier_version_override=args.classifier_version,
+            num_runs=args.num_runs,
+            vault_size=args.vault_size
         )
         cleanup_memory()
 
@@ -1675,11 +3109,13 @@ def main():
 
         print(f"Tuner: {args.tuner}")
         print(f"Trials: {n_trials}")
+        if args.num_runs > 1:
+            print(f"Runs per trial: {args.num_runs} (min loss used as objective)")
         print(f"Search space parameters: {list(exp_config.tuning.search_space.parameters.keys())}")
         print("")
 
         # Create training function (pass n_trials for progress logging)
-        train_fn = create_encoder_training_fn(config, n_trials=n_trials)
+        train_fn = create_encoder_training_fn(config, n_trials=n_trials, hpo_runs=args.num_runs)
 
         # Run hyperparameter tuning
         results = run_experiment(train_fn, exp_config, tune=True)
@@ -1694,14 +3130,23 @@ def main():
 
         # Save best parameters to file for automated pipeline
         import json
-        best_params_file = Path(config.get('checkpoint_dir', './checkpoints')) / 'best_encoder_params.json'
+        checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
+        best_params_file = checkpoint_dir / 'best_encoder_params.json'
         best_params_file.parent.mkdir(parents=True, exist_ok=True)
         with open(best_params_file, 'w') as f:
             json.dump(results['best_params'], f, indent=2)
         print(f"\nBest parameters saved to: {best_params_file}")
 
-        print("\nUpdate your config file with these parameters and run:")
-        print("  python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml --final-training")
+        # Check if HPO best checkpoint exists
+        hpo_best_checkpoint = checkpoint_dir / 'encoder_hpo_best.pt'
+        if hpo_best_checkpoint.exists():
+            print(f"Best HPO model saved to: {hpo_best_checkpoint}")
+            print("\nTo continue training from best HPO model with best parameters:")
+            print(f"  python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml \\")
+            print(f"      --final-training --best-params {best_params_file} --resume-checkpoint {hpo_best_checkpoint}")
+        else:
+            print("\nTo run final training with best parameters:")
+            print("  python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml --final-training")
 
     elif args.stage == 'tune-classifier':
         # Hyperparameter tuning for classifier
@@ -1755,11 +3200,13 @@ def main():
 
         print(f"Tuner: {args.tuner}")
         print(f"Trials: {n_trials}")
+        if args.num_runs > 1:
+            print(f"Runs per trial: {args.num_runs} (min MAE used as objective)")
         print(f"Search space parameters: {list(exp_config.tuning.search_space.parameters.keys())}")
         print("")
 
         # Create training function (pass n_trials for progress logging)
-        train_fn = create_classifier_training_fn(config, n_trials=n_trials)
+        train_fn = create_classifier_training_fn(config, n_trials=n_trials, hpo_runs=args.num_runs)
 
         # Run hyperparameter tuning
         results = run_experiment(train_fn, exp_config, tune=True)
@@ -1782,6 +3229,299 @@ def main():
 
         print("\nUpdate your config file with these parameters and run:")
         print("  python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml --final-training")
+
+    elif args.stage == 'init-baseline':
+        # Create a random baseline classifier for A/B testing workflow testing
+        print("\n" + "=" * 80)
+        print("CREATING RANDOM BASELINE FOR A/B TESTING")
+        print("=" * 80)
+
+        from pathlib import Path
+
+        music_config = config['music']
+        classifier_config = config['classifier']
+
+        # Load embeddings to get dimension
+        embedding_store = EmbeddingStore(music_config['embedding_db_path'])
+        encoder_version = music_config.get('encoder_version', 'v1')
+
+        # Get one embedding to determine dimension
+        db = ClementineDB(music_config['database_path'])
+        all_songs = db.get_all_songs()
+        rated_songs = [s for s in all_songs if s.is_rated]
+
+        if not rated_songs:
+            print("ERROR: No rated songs found")
+            sys.exit(1)
+
+        embeddings_dict = embedding_store.get_embeddings_batch(
+            [rated_songs[0].filename],
+            model_version=encoder_version
+        )
+
+        if not embeddings_dict:
+            print("ERROR: No embeddings found. Run encoder training first.")
+            sys.exit(1)
+
+        embedding_dim = len(next(iter(embeddings_dict.values())))
+        print(f"  Embedding dimension: {embedding_dim}")
+
+        # Create random classifier
+        hidden_dims = classifier_config.get('hidden_dims', [256, 128])
+        classifier = SimpleRatingClassifier(
+            embedding_dim=embedding_dim,
+            hidden_dims=hidden_dims,
+            dropout=0.0
+        )
+
+        # Random initialization is default - just save it
+        prod_dir = Path("prod")
+        prod_dir.mkdir(exist_ok=True)
+
+        checkpoint_path = prod_dir / "classifier_best.pt"
+        torch.save({
+            'model_state_dict': classifier.state_dict(),
+            'encoder_version': encoder_version,
+            'classifier_version': 'random_baseline',
+            'embedding_dim': embedding_dim,
+            'hidden_dims': hidden_dims,
+        }, checkpoint_path)
+
+        print(f"  Random baseline classifier saved to: {checkpoint_path}")
+        print(f"  Architecture: {hidden_dims}")
+
+        # Also copy embeddings.db if not exists
+        embeddings_src = Path(music_config['embedding_db_path'])
+        embeddings_dst = prod_dir / "embeddings.db"
+        if embeddings_src.exists() and not embeddings_dst.exists():
+            import shutil
+            shutil.copy(embeddings_src, embeddings_dst)
+            print(f"  Embeddings copied to: {embeddings_dst}")
+
+        # Copy encoder if exists
+        encoder_src = Path(config['checkpoint_dir']) / "encoder_best.pt"
+        encoder_dst = prod_dir / "encoder_best.pt"
+        if encoder_src.exists() and not encoder_dst.exists():
+            import shutil
+            shutil.copy(encoder_src, encoder_dst)
+            print(f"  Encoder copied to: {encoder_dst}")
+
+        # Create initial training manifest with vault for A/B testing
+        # Vault contains vault_size files reserved exclusively for A/B testing
+        import random
+        random.seed(42)
+
+        all_filenames = [s.filename for s in rated_songs]
+        random.shuffle(all_filenames)
+
+        # Split: vault_size for A/B testing, remainder split 80/20 train/val
+        vault_size = args.vault_size
+        n_total = len(all_filenames)
+        actual_vault_size = min(vault_size, n_total)
+
+        vault_files = all_filenames[:actual_vault_size]
+        remaining = all_filenames[actual_vault_size:]
+
+        n_train = int(len(remaining) * 0.8)
+        train_files = remaining[:n_train]
+        val_files = remaining[n_train:]
+
+        # Create manifest in CHECKPOINTS dir (not prod) - this is where classifier training looks
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest = TrainingManifest(str(checkpoint_dir / "training_manifest.json"))
+        manifest.training_files = set(train_files)
+        manifest.validation_files = set(val_files)
+        manifest.vault_files = set(vault_files)  # Reserved for A/B testing
+        manifest.set_version_info(
+            encoder_version=encoder_version,
+            classifier_version='random_baseline',
+            classification_mode=classifier_config.get('classification_mode', 'binary')
+        )
+        manifest.save()
+
+        # Also copy to prod for reference
+        prod_manifest = TrainingManifest(str(prod_dir / "training_manifest.json"))
+        prod_manifest.training_files = set(train_files)
+        prod_manifest.validation_files = set(val_files)
+        prod_manifest.vault_files = set(vault_files)
+        prod_manifest.set_version_info(
+            encoder_version=encoder_version,
+            classifier_version='random_baseline',
+            classification_mode=classifier_config.get('classification_mode', 'binary')
+        )
+        prod_manifest.save()
+
+        print(f"  Training manifest created:")
+        print(f"    Training files: {len(train_files)}")
+        print(f"    Validation files: {len(val_files)}")
+        print(f"    Vault files: {len(vault_files)} (reserved for A/B testing)")
+
+        print("\n" + "=" * 80)
+        print("RANDOM BASELINE CREATED")
+        print("=" * 80)
+        print("\nNow train a real classifier and A/B test against this baseline:")
+        print("  ./run_music_pipeline.sh classifier --final-training -N 3")
+        print(f"\nThe {len(vault_files)} vault files will be used for A/B testing (never for training).")
+
+    elif args.stage == 'generate-model-card':
+        # Generate production model card with A/B test results
+        from pathlib import Path
+        from datetime import datetime
+        import json
+
+        print("\n" + "=" * 80)
+        print("GENERATING PRODUCTION MODEL CARD")
+        print("=" * 80)
+
+        prod_dir = Path("prod")
+        checkpoint_dir = Path(config['checkpoint_dir'])
+        music_config = config['music']
+        classifier_config = config['classifier']
+
+        # Load training manifest for A/B test results
+        manifest_path = checkpoint_dir / "training_manifest.json"
+        ab_result = None
+        manifest_data = {}
+
+        if manifest_path.exists():
+            with open(manifest_path) as f:
+                manifest_data = json.load(f)
+            ab_result = manifest_data.get('metadata', {}).get('ab_test_result')
+
+        # Load classifier checkpoint for architecture info
+        classifier_path = checkpoint_dir / "classifier_best.pt"
+        classifier_info = {}
+        if classifier_path.exists():
+            checkpoint = torch.load(classifier_path, map_location='cpu', weights_only=False)
+            classifier_info = {
+                'encoder_version': checkpoint.get('encoder_version', 'unknown'),
+                'classifier_version': checkpoint.get('classifier_version', 'unknown'),
+                'embedding_dim': checkpoint.get('embedding_dim', 'unknown'),
+                'hidden_dims': checkpoint.get('hidden_dims', []),
+            }
+
+        # Count training data
+        n_train = len(manifest_data.get('training_files', []))
+        n_val = len(manifest_data.get('validation_files', []))
+
+        # Generate markdown model card
+        model_card_md = f"""# Music Recommendation Model Card
+
+## Model Overview
+
+- **Model Type**: Binary Rating Classifier (like/dislike)
+- **Encoder Version**: {classifier_info.get('encoder_version', music_config.get('encoder_version', 'v1'))}
+- **Classifier Version**: {classifier_info.get('classifier_version', music_config.get('classifier_version', 'v1'))}
+- **Promoted to Production**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+## Architecture
+
+- **Encoder**: MoCo v2 + Genre BCE (ResNet-50 backbone)
+- **Embedding Dimension**: {classifier_info.get('embedding_dim', 2048)}
+- **Classifier Hidden Layers**: {classifier_info.get('hidden_dims', classifier_config.get('hidden_dims', []))}
+- **Classification Mode**: {classifier_config.get('classification_mode', 'binary')}
+
+## Training Data
+
+- **Training Songs**: {n_train:,}
+- **Validation Songs**: {n_val:,}
+- **Total Rated Songs**: {n_train + n_val:,}
+
+## A/B Test Results
+
+"""
+        if ab_result:
+            model_card_md += f"""| Metric | New Model | Production | Improvement |
+|--------|-----------|------------|-------------|
+| Accuracy | {ab_result.get('improvement', 0) + 0.5:.1%} | 50.0% (baseline) | {ab_result.get('improvement', 0):+.1%} |
+
+- **Test Samples**: {ab_result.get('n_samples', 'N/A')} (new ratings since last training)
+- **Statistical Test**: McNemar's test
+- **p-value**: {ab_result.get('p_value', 'N/A'):.4f}
+- **Significant**: {'✓ Yes (p < 0.05)' if ab_result.get('significant') else 'No'}
+
+"""
+        else:
+            model_card_md += "*No A/B test results available*\n\n"
+
+        model_card_md += f"""## Usage
+
+```bash
+# Generate recommendations using this model
+./run_music_pipeline.sh recommend --prod
+
+# Include 10% predicted dislikes for balanced feedback
+./run_music_pipeline.sh recommend --prod --low-rating-ratio 0.1
+```
+
+## Files
+
+- `encoder_best.pt` - Audio encoder (MoCo v2 + Genre BCE)
+- `classifier_best.pt` - Rating classifier
+- `embeddings.db` - Pre-computed embeddings for all songs
+- `training_manifest.json` - Training/validation split tracking
+
+## Iteration Workflow
+
+1. Listen to recommended songs and rate them in Clementine
+2. Re-run classifier training: `./run_music_pipeline.sh classifier --final-training -N 3`
+3. Review A/B test results
+4. If improved, promote: `./run_music_pipeline.sh promote-to-prod`
+
+---
+*Generated by ml_skeleton music recommendation pipeline*
+"""
+
+        # Save model card
+        model_card_path = prod_dir / "MODEL_CARD.md"
+        prod_dir.mkdir(exist_ok=True)
+        with open(model_card_path, 'w') as f:
+            f.write(model_card_md)
+
+        print(f"  Model card saved to: {model_card_path}")
+
+        # Also save as JSON for programmatic access
+        model_card_json = {
+            'model_type': 'binary_rating_classifier',
+            'encoder_version': classifier_info.get('encoder_version', music_config.get('encoder_version', 'v1')),
+            'classifier_version': classifier_info.get('classifier_version', music_config.get('classifier_version', 'v1')),
+            'promoted_at': datetime.now().isoformat(),
+            'architecture': {
+                'encoder': 'moco_v2_genre_bce',
+                'backbone': 'resnet50',
+                'embedding_dim': classifier_info.get('embedding_dim', 2048),
+                'hidden_dims': classifier_info.get('hidden_dims', classifier_config.get('hidden_dims', [])),
+                'classification_mode': classifier_config.get('classification_mode', 'binary'),
+            },
+            'training_data': {
+                'n_training': n_train,
+                'n_validation': n_val,
+                'total': n_train + n_val,
+            },
+            'ab_test': ab_result,
+        }
+
+        model_card_json_path = prod_dir / "model_card.json"
+        with open(model_card_json_path, 'w') as f:
+            json.dump(model_card_json, f, indent=2)
+
+        print(f"  Model card JSON saved to: {model_card_json_path}")
+
+        # Print summary
+        print("\n" + "=" * 60)
+        print("MODEL CARD SUMMARY")
+        print("=" * 60)
+        if ab_result:
+            print(f"  A/B Test Results:")
+            print(f"    Samples: {ab_result.get('n_samples', 'N/A')}")
+            print(f"    Improvement: {ab_result.get('improvement', 0):+.1%}")
+            print(f"    p-value: {ab_result.get('p_value', 'N/A'):.4f}")
+            print(f"    Significant: {'✓ Yes' if ab_result.get('significant') else 'No'}")
+        else:
+            print("  No A/B test results available")
+        print("=" * 60)
 
 
 if __name__ == '__main__':

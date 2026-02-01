@@ -4,6 +4,7 @@ Generates playlists compatible with Clementine music player for human rating.
 """
 
 import html
+import os
 from pathlib import Path
 from urllib.parse import unquote
 from typing import Optional
@@ -33,16 +34,15 @@ def export_to_xspf(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<playlist version="1" xmlns="http://xspf.org/ns/0/">\n')
-        f.write(f'  <title>{html.escape(playlist_title)}</title>\n')
         f.write('  <trackList>\n')
 
         for song, prediction in zip(songs, predictions):
-            # Handle filename (might be bytes or have file:// prefix)
+            # Handle filename that might be bytes
             filename = song.filename
             if isinstance(filename, bytes):
                 filename = filename.decode("utf-8", errors="replace")
 
-            # Extract location path
+            # Extract location path (remove file:// prefix if present)
             location = filename
             if location.startswith("file://"):
                 location = location[7:]
@@ -52,25 +52,33 @@ def export_to_xspf(
             title = html.escape(song.title)
             artist = html.escape(song.artist)
             album = html.escape(song.album)
-            location_escaped = html.escape(location)
+            location = html.escape(location)
 
             # Create annotation with predicted rating (scaled to 0-5 for Clementine)
             rating_5_scale = prediction * 5.0
             annotation = f"{annotation_prefix}: {rating_5_scale:.2f}/5.00"
-            annotation_escaped = html.escape(annotation)
+            annotation = html.escape(annotation)
 
             f.write('    <track>\n')
-            f.write(f'      <location>{location_escaped}</location>\n')
+            f.write(f'      <location>{location}</location>\n')
             f.write(f'      <title>{title}</title>\n')
             if artist:
                 f.write(f'      <creator>{artist}</creator>\n')
             if album:
                 f.write(f'      <album>{album}</album>\n')
-            f.write(f'      <annotation>{annotation_escaped}</annotation>\n')
+            f.write(f'      <annotation>{annotation}</annotation>\n')
             f.write('    </track>\n')
 
         f.write('  </trackList>\n')
         f.write('</playlist>\n')
+
+    # Fix permissions for Docker volume mounts (root -> user ikaro)
+    # Match permissions of other XSPF files: 664 (rw-rw-r--) owned by 1000:1000
+    try:
+        os.chown(output_path, 1000, 1000)
+        os.chmod(output_path, 0o664)
+    except (OSError, PermissionError):
+        pass  # Ignore if not running as root or on non-Unix systems
 
     print(f"Exported {len(songs)} songs to XSPF playlist: {output_path}")
 
@@ -117,43 +125,50 @@ def generate_uncertainty_playlist(
     with open(output_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
         f.write('<playlist version="1" xmlns="http://xspf.org/ns/0/">\n')
-        f.write(f'  <title>{html.escape(playlist_title)}</title>\n')
         f.write('  <trackList>\n')
 
         for song, pred, unc in zip(selected_songs, selected_predictions, selected_uncertainties):
-            # Handle filename
+            # Handle filename that might be bytes
             filename = song.filename
             if isinstance(filename, bytes):
                 filename = filename.decode("utf-8", errors="replace")
 
+            # Extract location path (remove file:// prefix if present)
             location = filename
             if location.startswith("file://"):
                 location = location[7:]
             location = unquote(location)
 
-            # Escape XML
+            # Escape XML special characters
             title = html.escape(song.title)
             artist = html.escape(song.artist)
             album = html.escape(song.album)
-            location_escaped = html.escape(location)
+            location = html.escape(location)
 
             # Annotation with prediction and uncertainty
             rating_5_scale = pred * 5.0
             annotation = f"Predicted: {rating_5_scale:.2f}/5.00 (Uncertainty: {unc:.3f})"
-            annotation_escaped = html.escape(annotation)
+            annotation = html.escape(annotation)
 
             f.write('    <track>\n')
-            f.write(f'      <location>{location_escaped}</location>\n')
+            f.write(f'      <location>{location}</location>\n')
             f.write(f'      <title>{title}</title>\n')
             if artist:
                 f.write(f'      <creator>{artist}</creator>\n')
             if album:
                 f.write(f'      <album>{album}</album>\n')
-            f.write(f'      <annotation>{annotation_escaped}</annotation>\n')
+            f.write(f'      <annotation>{annotation}</annotation>\n')
             f.write('    </track>\n')
 
         f.write('  </trackList>\n')
         f.write('</playlist>\n')
+
+    # Fix permissions for Docker volume mounts (root -> user ikaro)
+    try:
+        os.chown(output_path, 1000, 1000)
+        os.chmod(output_path, 0o664)
+    except (OSError, PermissionError):
+        pass
 
     print(f"Exported {len(selected_songs)} high-uncertainty songs to: {output_path}")
     if selected_uncertainties:

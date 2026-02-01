@@ -46,12 +46,14 @@ class EncoderTrainer:
         optimizer: torch.optim.Optimizer,
         embedding_store: Optional[EmbeddingStore] = None,
         model_version: str = "default",
-        tracker: Optional[Any] = None
+        tracker: Optional[Any] = None,
+        scheduler: Optional[Any] = None
     ):
         self.encoder = encoder.to(device)
         self.device = device
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        self.scheduler = scheduler
         self.embedding_store = embedding_store
         self.model_version = model_version
         self.tracker = tracker  # MLflow tracker for logging learning curves
@@ -72,7 +74,7 @@ class EncoderTrainer:
         train_loader: DataLoader,
         use_multi_task: bool = False,
         use_augmentation: bool = False,
-        use_simsiam: bool = False
+        use_moco: bool = False
     ) -> dict:
         """Train for one epoch.
 
@@ -80,7 +82,7 @@ class EncoderTrainer:
             train_loader: Training data loader
             use_multi_task: If True, expects album labels and uses multi-task loss
             use_augmentation: If True, expects dual audio views for contrastive learning
-            use_simsiam: If True, uses SimSiam training loop with spectrogram views
+            use_moco: If True, uses MoCo v2 training loop with CQT spectrograms
 
         Returns:
             Dictionary with training metrics
@@ -92,18 +94,29 @@ class EncoderTrainer:
         pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}")
 
         for batch in pbar:
-            # SimSiam mode (spectrogram-based dual views)
-            if use_simsiam and "view1" in batch:
-                view1 = batch["view1"].to(self.device)
-                view2 = batch["view2"].to(self.device)
+            # MoCo v2 mode (query/key pairs with genre labels)
+            if use_moco and "query" in batch:
+                query = batch["query"].to(self.device)
+                key = batch["key"].to(self.device)
+                genre = batch["genre"].to(self.device)
 
-                # Forward through SimSiam encoder
-                p1, p2, z1, z2 = self.encoder.forward_simsiam(view1, view2)
+                # Forward through MoCo encoder
+                output = self.encoder(query, key)
 
-                # SimSiam loss
-                loss = self.loss_fn(p1, p2, z1, z2)
+                # MoCo loss (contrastive + genre BCE) - returns dict
+                loss_result = self.loss_fn(
+                    output['logits_contrastive'],
+                    output['labels_contrastive'],
+                    output['logits_genre'],
+                    genre
+                )
+                loss = loss_result['loss']
 
-                loss_dict = {"total": loss.item()}
+                loss_dict = {
+                    "total": loss.item(),
+                    "moco": loss_result['loss_moco'].item(),
+                    "genre": loss_result['loss_genre'].item()
+                }
 
             # Check for augmentation mode (dual audio views - waveform based)
             elif use_augmentation and "audio_view1" in batch:
@@ -216,7 +229,7 @@ class EncoderTrainer:
         val_loader: DataLoader,
         use_multi_task: bool = False,
         use_augmentation: bool = False,
-        use_simsiam: bool = False
+        use_moco: bool = False
     ) -> dict:
         """Validate model.
 
@@ -224,7 +237,7 @@ class EncoderTrainer:
             val_loader: Validation data loader
             use_multi_task: If True, uses multi-task loss
             use_augmentation: If True, expects dual audio views for contrastive learning
-            use_simsiam: If True, uses SimSiam validation loop with spectrogram views
+            use_moco: If True, uses MoCo v2 validation loop
 
         Returns:
             Dictionary with validation metrics
@@ -235,16 +248,20 @@ class EncoderTrainer:
 
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
-                # SimSiam mode (spectrogram-based dual views)
-                if use_simsiam and "view1" in batch:
-                    view1 = batch["view1"].to(self.device)
-                    view2 = batch["view2"].to(self.device)
+                # MoCo v2 mode
+                if use_moco and "query" in batch:
+                    query = batch["query"].to(self.device)
+                    key = batch["key"].to(self.device)
+                    genre = batch["genre"].to(self.device)
 
-                    # Forward through SimSiam encoder
-                    p1, p2, z1, z2 = self.encoder.forward_simsiam(view1, view2)
-
-                    # SimSiam loss
-                    loss = self.loss_fn(p1, p2, z1, z2)
+                    output = self.encoder(query, key)
+                    loss_result = self.loss_fn(
+                        output['logits_contrastive'],
+                        output['labels_contrastive'],
+                        output['logits_genre'],
+                        genre
+                    )
+                    loss = loss_result['loss']
 
                 # Check for augmentation mode (dual audio views)
                 elif use_augmentation and "audio_view1" in batch:
@@ -326,7 +343,7 @@ class EncoderTrainer:
         checkpoint_dir: str = "./checkpoints",
         use_multi_task: bool = False,
         use_augmentation: bool = False,
-        use_simsiam: bool = False,
+        use_moco: bool = False,
         save_best_only: bool = True,
         early_stopping_patience: Optional[int] = None,
         early_stopping_min_delta: float = 0.0,
@@ -342,7 +359,7 @@ class EncoderTrainer:
             checkpoint_dir: Directory to save checkpoints
             use_multi_task: If True, uses multi-task loss
             use_augmentation: If True, expects dual audio views for contrastive learning
-            use_simsiam: If True, uses SimSiam training loop with spectrogram views
+            use_moco: If True, uses MoCo v2 training loop
             save_best_only: If True, only saves best model
             early_stopping_patience: Number of epochs to wait for improvement before stopping
                                      (None = no early stopping)
@@ -387,12 +404,12 @@ class EncoderTrainer:
             start_time = time.time()
 
             # Train
-            train_metrics = self.train_epoch(train_loader, use_multi_task, use_augmentation, use_simsiam)
+            train_metrics = self.train_epoch(train_loader, use_multi_task, use_augmentation, use_moco)
 
             # Validate
             val_metrics = None
             if val_loader is not None:
-                val_metrics = self.validate(val_loader, use_multi_task, use_augmentation, use_simsiam)
+                val_metrics = self.validate(val_loader, use_multi_task, use_augmentation, use_moco)
 
             epoch_time = time.time() - start_time
 
@@ -429,6 +446,14 @@ class EncoderTrainer:
                     print(f"\nEarly stopping triggered after {epoch + 1} epochs")
                     print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
                     break
+
+            # Step the learning rate scheduler
+            if self.scheduler is not None:
+                old_lr = self.optimizer.param_groups[0]['lr']
+                self.scheduler.step()
+                new_lr = self.optimizer.param_groups[0]['lr']
+                if self.tracker is not None:
+                    self.tracker.log_metric('encoder/learning_rate', new_lr, step=epoch)
 
             # Versioned checkpoint naming (e.g., encoder_v2_best.pt)
             version_suffix = f"_{self.model_version}" if self.model_version != "default" else ""
@@ -505,6 +530,9 @@ class EncoderTrainer:
             "sample_rate": self.encoder.sample_rate
         }
 
+        if self.scheduler is not None:
+            checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
+
         if metrics:
             checkpoint["metrics"] = metrics
 
@@ -531,6 +559,10 @@ class EncoderTrainer:
 
         self.encoder.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        if self.scheduler is not None and "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+
         self.current_epoch = checkpoint.get("epoch", 0)
         self.history = checkpoint.get("history", {"train_loss": [], "val_loss": []})
         self.model_version = checkpoint.get("model_version", "default")
@@ -541,14 +573,14 @@ class EncoderTrainer:
         self,
         data_loader: DataLoader,
         save_to_store: bool = True,
-        use_simsiam: bool = False
+        use_moco: bool = False
     ) -> dict[str, torch.Tensor]:
         """Extract embeddings for all songs in dataset.
 
         Args:
             data_loader: Data loader with songs
             save_to_store: If True, save to embedding store
-            use_simsiam: If True, use SimSiam encoder (expects spectrograms)
+            use_moco: If True, use MoCo encoder (expects raw audio)
 
         Returns:
             Dictionary mapping filename -> embedding tensor
@@ -563,25 +595,28 @@ class EncoderTrainer:
                 filenames = batch["filename"]
 
                 # Handle different data formats
-                if use_simsiam or "view1" in batch:
-                    # SimSiam: use view1 for embedding extraction
-                    x = batch["view1"].to(self.device)
-                    # SimSiam encoder returns projection z
-                    embeddings = self.encoder(x)
+                if use_moco and "query" in batch:
+                    # MoCo: use query for embedding extraction from MoCoDataset
+                    x = batch["query"].to(self.device)
+                    # MoCo encoder returns dict with 'embedding' key when x_k=None
+                    output = self.encoder(x)
+                    embeddings = output["embedding"]
+                elif use_moco and "audio" in batch:
+                    # MoCo: use audio for embedding extraction from MusicDataset
+                    x = batch["audio"].to(self.device)
+                    output = self.encoder(x)
+                    embeddings = output["embedding"]
                 elif "audio" in batch:
                     audio = batch["audio"].to(self.device)
                     # Get embeddings based on encoder type
                     if hasattr(self.encoder, 'base_encoder'):
                         # Multi-task encoder
                         embeddings, _ = self.encoder(audio, return_album_logits=False)
-                    elif hasattr(self.encoder, 'forward_simsiam'):
-                        # SimSiam encoder with audio input
-                        embeddings = self.encoder(audio)
                     else:
                         # Simple encoder
                         embeddings = self.encoder(audio)
                 else:
-                    raise ValueError("Batch must contain 'audio' or 'view1' key")
+                    raise ValueError("Batch must contain 'audio', 'view1', or 'query' key")
 
                 # Store embeddings
                 embeddings_cpu = embeddings.cpu()

@@ -59,6 +59,191 @@ class RatingLoss(nn.Module):
         return self.mse(valid_predictions, valid_targets)
 
 
+class WeightedRatingLoss(nn.Module):
+    """Weighted MSE loss for rating prediction to handle class imbalance.
+
+    Applies per-sample weights based on rating class frequency.
+    Samples from minority classes receive higher weights.
+
+    Args:
+        class_weights: Dict mapping rating bucket (0-5) to weight
+                      If None, uses equal weights (same as RatingLoss)
+        num_buckets: Number of rating buckets (default 6 for 0-5 stars)
+    """
+
+    def __init__(self, class_weights: dict = None, num_buckets: int = 6):
+        super().__init__()
+        self.class_weights = class_weights
+        self.num_buckets = num_buckets
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute weighted MSE loss.
+
+        Args:
+            predictions: Predicted ratings, shape (batch_size, 1)
+            targets: Target ratings in [0, 1], shape (batch_size, 1) or (batch_size,)
+                    Unrated songs have rating < 0 and are excluded
+
+        Returns:
+            loss: Scalar weighted loss value
+        """
+        # Ensure shapes match
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(1)
+        if predictions.dim() == 1:
+            predictions = predictions.unsqueeze(1)
+
+        # Mask out unrated songs (rating < 0)
+        valid_mask = (targets >= 0).squeeze()
+
+        if valid_mask.sum() == 0:
+            return torch.zeros(1, device=predictions.device, requires_grad=True).mean()
+
+        valid_predictions = predictions[valid_mask]
+        valid_targets = targets[valid_mask]
+
+        # Compute per-sample MSE
+        mse_per_sample = (valid_predictions - valid_targets) ** 2
+
+        # Apply class weights if provided
+        if self.class_weights is not None:
+            # Convert targets (0-1) to bucket indices (0-5)
+            bucket_indices = (valid_targets * (self.num_buckets - 1)).round().long().squeeze()
+
+            # Look up weight for each sample
+            weights = torch.ones_like(mse_per_sample)
+            for i, bucket_idx in enumerate(bucket_indices):
+                bucket_key = int(bucket_idx.item())
+                if bucket_key in self.class_weights:
+                    weights[i] = self.class_weights[bucket_key]
+
+            # Weighted mean
+            weighted_mse = (mse_per_sample * weights).sum() / weights.sum()
+            return weighted_mse
+        else:
+            # Simple mean
+            return mse_per_sample.mean()
+
+
+class BinaryRatingLoss(nn.Module):
+    """Binary cross-entropy loss for like/dislike classification.
+
+    Used when classification_mode="binary". Expects targets to be 0 or 1.
+
+    Args:
+        pos_weight: Weight for positive class to handle class imbalance.
+                   If None, computed automatically from data.
+    """
+
+    def __init__(self, pos_weight: float = None):
+        super().__init__()
+        self.pos_weight = pos_weight
+        if pos_weight is not None:
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
+        else:
+            self.bce = nn.BCEWithLogitsLoss()
+
+    def forward(
+        self,
+        predictions: torch.Tensor,
+        targets: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute BCE loss.
+
+        Args:
+            predictions: Raw logits (not sigmoid), shape (batch_size, 1)
+            targets: Binary labels (0 or 1), shape (batch_size, 1) or (batch_size,)
+
+        Returns:
+            loss: Scalar loss value
+        """
+        if targets.dim() == 1:
+            targets = targets.unsqueeze(1)
+        if predictions.dim() == 1:
+            predictions = predictions.unsqueeze(1)
+
+        # Move pos_weight to same device as predictions if needed
+        if self.pos_weight is not None and self.bce.pos_weight.device != predictions.device:
+            self.bce.pos_weight = self.bce.pos_weight.to(predictions.device)
+
+        return self.bce(predictions, targets)
+
+    @staticmethod
+    def compute_pos_weight(labels: list) -> float:
+        """Compute pos_weight for class imbalance.
+
+        Args:
+            labels: List of binary labels (0 or 1)
+
+        Returns:
+            pos_weight: ratio of negative to positive samples
+        """
+        pos_count = sum(labels)
+        neg_count = len(labels) - pos_count
+        if pos_count == 0:
+            return 1.0
+        return neg_count / pos_count
+
+
+def compute_class_weights(ratings: list, strategy: str = "inverse", num_buckets: int = 6) -> dict:
+    """Compute class weights from rating distribution.
+
+    Args:
+        ratings: List of ratings in [0, 1] scale
+        strategy: Weighting strategy:
+            - "none": All weights = 1.0
+            - "inverse": Weight = N / (n_classes * count_i)
+            - "sqrt_inverse": Weight = sqrt(N / (n_classes * count_i))
+            - "effective": Effective number weighting (for extreme imbalance)
+        num_buckets: Number of rating buckets (0-5 stars = 6 buckets)
+
+    Returns:
+        Dict mapping bucket index (0-5) to weight
+    """
+    from collections import Counter
+    import math
+
+    if strategy == "none":
+        return {i: 1.0 for i in range(num_buckets)}
+
+    # Count samples per bucket
+    bucket_counts = Counter()
+    for r in ratings:
+        bucket = int(round(r * (num_buckets - 1)))
+        bucket = min(max(bucket, 0), num_buckets - 1)  # Clamp
+        bucket_counts[bucket] += 1
+
+    total = len(ratings)
+    n_classes = len(bucket_counts)
+
+    weights = {}
+    for bucket in range(num_buckets):
+        count = bucket_counts.get(bucket, 1)  # Avoid div by zero
+
+        if strategy == "inverse":
+            weights[bucket] = total / (n_classes * count)
+        elif strategy == "sqrt_inverse":
+            weights[bucket] = math.sqrt(total / (n_classes * count))
+        elif strategy == "effective":
+            # Effective number weighting: (1 - beta^n) / (1 - beta)
+            beta = 0.9999
+            effective_num = (1 - beta ** count) / (1 - beta)
+            weights[bucket] = (1 - beta) / (1 - beta ** count) if count > 0 else 1.0
+        else:
+            weights[bucket] = 1.0
+
+    # Normalize so mean weight = 1
+    mean_weight = sum(weights.values()) / len(weights)
+    if mean_weight > 0:
+        weights = {k: v / mean_weight for k, v in weights.items()}
+
+    return weights
+
+
 class MultiTaskLoss(nn.Module):
     """Multi-task loss combining rating prediction and album classification.
 
@@ -479,96 +664,6 @@ class MetadataContrastiveLoss(nn.Module):
         else:
             # No valid positive pairs - return zero loss with gradient
             loss = torch.zeros(1, device=device, requires_grad=True).mean()
-
-        return loss
-
-
-class SimSiamLoss(nn.Module):
-    """SimSiam loss function for self-supervised contrastive learning.
-
-    SimSiam uses a symmetric loss with stop-gradient on the projection outputs.
-    This prevents representation collapse without requiring negative pairs,
-    large batch sizes, or momentum encoders.
-
-    The loss is:
-        L = D(p1, stopgrad(z2)) / 2 + D(p2, stopgrad(z1)) / 2
-
-    where D(p, z) = -cosine_similarity(p, z) = -(p·z) / (||p|| ||z||)
-
-    Reference:
-        "Exploring Simple Siamese Representation Learning" (Chen & He, 2020)
-        https://arxiv.org/abs/2011.10566
-
-    Args:
-        None - SimSiam loss has no hyperparameters
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(
-        self,
-        p1: torch.Tensor,
-        p2: torch.Tensor,
-        z1: torch.Tensor,
-        z2: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute SimSiam loss.
-
-        Args:
-            p1: Predictions from view 1, shape (batch_size, projection_dim)
-            p2: Predictions from view 2, shape (batch_size, projection_dim)
-            z1: Projections from view 1, shape (batch_size, projection_dim)
-            z2: Projections from view 2, shape (batch_size, projection_dim)
-
-        Returns:
-            loss: Scalar loss value (negative cosine similarity)
-
-        Note:
-            The stop-gradient (z.detach()) is CRITICAL to prevent collapse.
-            Without it, the network can trivially minimize loss by outputting
-            constant representations.
-        """
-        # CRITICAL: Stop gradient on projections (z) to prevent collapse
-        z1 = z1.detach()
-        z2 = z2.detach()
-
-        # L2 normalize all vectors
-        p1 = F.normalize(p1, dim=1)
-        p2 = F.normalize(p2, dim=1)
-        z1 = F.normalize(z1, dim=1)
-        z2 = F.normalize(z2, dim=1)
-
-        # Negative cosine similarity (symmetric)
-        # D(p1, z2) + D(p2, z1) where D = -cosine_sim
-        loss = -(p1 * z2).sum(dim=1).mean() / 2 \
-               -(p2 * z1).sum(dim=1).mean() / 2
-
-        return loss
-
-    def forward_single(
-        self,
-        p: torch.Tensor,
-        z: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute single-direction SimSiam loss (for asymmetric use cases).
-
-        Args:
-            p: Predictions, shape (batch_size, projection_dim)
-            z: Projections (will be detached), shape (batch_size, projection_dim)
-
-        Returns:
-            loss: Scalar loss value
-        """
-        # Stop gradient on z
-        z = z.detach()
-
-        # L2 normalize
-        p = F.normalize(p, dim=1)
-        z = F.normalize(z, dim=1)
-
-        # Negative cosine similarity
-        loss = -(p * z).sum(dim=1).mean()
 
         return loss
 

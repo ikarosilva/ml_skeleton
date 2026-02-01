@@ -385,7 +385,8 @@ class MoCoDataset(Dataset):
             "query": query_aug,
             "key": key_aug,
             "genre": genre_labels,
-            "song_id": song.rowid
+            "song_id": song.rowid,
+            "filename": song.filename
         }
 
 
@@ -431,6 +432,7 @@ class MoCoCollator:
             - key: (B, T) stacked key audio
             - genre: (B, num_genres) stacked genre labels
             - song_ids: List of song IDs
+            - filename: List of filenames (for embedding extraction)
         """
         queries = torch.stack([
             self._pad_or_truncate(sample["query"]) for sample in batch
@@ -440,12 +442,14 @@ class MoCoCollator:
         ])
         genres = torch.stack([sample["genre"] for sample in batch])
         song_ids = [sample["song_id"] for sample in batch]
+        filenames = [sample["filename"] for sample in batch]
 
         return {
             "query": queries,
             "key": keys,
             "genre": genres,
-            "song_ids": song_ids
+            "song_ids": song_ids,
+            "filename": filenames
         }
 
 

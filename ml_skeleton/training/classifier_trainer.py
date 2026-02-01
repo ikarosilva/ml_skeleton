@@ -111,13 +111,15 @@ class ClassifierTrainer:
         optimizer: torch.optim.Optimizer,
         tracker: Optional[Any] = None,
         encoder_version: str = "v1",
-        classifier_version: str = "v1"
+        classifier_version: str = "v1",
+        classification_mode: str = "regression"
     ):
         self.classifier = classifier.to(device)
         self.device = device
         self.loss_fn = loss_fn
         self.optimizer = optimizer
         self.tracker = tracker  # MLflow tracker for logging learning curves
+        self.classification_mode = classification_mode
 
         # Version tracking for compatibility validation
         self.encoder_version = encoder_version  # Encoder version this classifier was trained with
@@ -126,12 +128,14 @@ class ClassifierTrainer:
         # Training state
         self.current_epoch = 0
         self.best_loss = float('inf')
-        self.best_mae = float('inf')
+        self.best_mae = float('inf')  # Also used for accuracy in binary mode
+        self.best_accuracy = 0.0
         self.best_correlation = 0.0
         self.history = {
             "train_loss": [],
             "val_loss": [],
-            "val_mae": []
+            "val_mae": [],  # In binary mode, this stores accuracy
+            "val_accuracy": []
         }
 
     def train_epoch(self, train_loader: DataLoader) -> dict:
@@ -157,8 +161,8 @@ class ClassifierTrainer:
             # Forward pass
             predictions = self.classifier(embeddings)
 
-            # Compute loss
-            loss = self.loss_fn(predictions.squeeze(), ratings)
+            # Compute loss (predictions are already (batch_size,))
+            loss = self.loss_fn(predictions, ratings)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -187,7 +191,7 @@ class ClassifierTrainer:
             val_loader: Validation data loader
 
         Returns:
-            Dictionary with validation metrics (loss, MAE)
+            Dictionary with validation metrics (loss, MAE/accuracy)
         """
         self.classifier.eval()
         total_loss = 0.0
@@ -197,6 +201,13 @@ class ClassifierTrainer:
         all_predictions = []
         all_targets = []
 
+        # Binary classification metrics
+        correct = 0
+        total = 0
+        true_positives = 0
+        false_positives = 0
+        false_negatives = 0
+
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation"):
                 embeddings = batch["embedding"].to(self.device)
@@ -205,35 +216,94 @@ class ClassifierTrainer:
                 # Forward pass
                 predictions = self.classifier(embeddings)
 
-                # Compute loss
-                loss = self.loss_fn(predictions.squeeze(), ratings)
-
-                # Compute MAE
-                mae = torch.abs(predictions.squeeze() - ratings).mean()
-
+                # Compute loss (predictions are already (batch_size,))
+                loss = self.loss_fn(predictions, ratings)
                 total_loss += loss.item()
-                total_mae += mae.item()
                 num_batches += 1
 
-                # Store for correlation analysis
-                all_predictions.extend(predictions.squeeze().cpu().numpy().tolist())
-                all_targets.extend(ratings.cpu().numpy().tolist())
+                if self.classification_mode == "binary":
+                    # Binary: apply sigmoid and threshold at 0.5
+                    probs = torch.sigmoid(predictions).squeeze()
+                    predicted_labels = (probs > 0.5).float()
+                    target_labels = ratings.squeeze()
+
+                    # Accuracy
+                    correct += (predicted_labels == target_labels).sum().item()
+                    total += target_labels.size(0)
+
+                    # Precision/Recall stats
+                    true_positives += ((predicted_labels == 1) & (target_labels == 1)).sum().item()
+                    false_positives += ((predicted_labels == 1) & (target_labels == 0)).sum().item()
+                    false_negatives += ((predicted_labels == 0) & (target_labels == 1)).sum().item()
+
+                    # Store probabilities for analysis
+                    all_predictions.extend(probs.cpu().numpy().tolist())
+                    all_targets.extend(target_labels.cpu().numpy().tolist())
+                else:
+                    # Regression: compute MAE
+                    mae = torch.abs(predictions - ratings).mean()
+                    total_mae += mae.item()
+
+                    # Store for correlation analysis
+                    all_predictions.extend(predictions.cpu().numpy().tolist())
+                    all_targets.extend(ratings.cpu().numpy().tolist())
 
         avg_loss = total_loss / num_batches
-        avg_mae = total_mae / num_batches
 
-        self.history["val_loss"].append(avg_loss)
-        self.history["val_mae"].append(avg_mae)
+        if self.classification_mode == "binary":
+            # Binary metrics
+            accuracy = correct / total if total > 0 else 0.0
+            precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+            recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
-        # Compute correlation
-        correlation = np.corrcoef(all_predictions, all_targets)[0, 1]
+            self.history["val_loss"].append(avg_loss)
+            self.history["val_accuracy"].append(accuracy)
+            self.history["val_mae"].append(1.0 - accuracy)  # For compatibility, store error rate
 
-        return {
-            "loss": avg_loss,
-            "mae": avg_mae,
-            "correlation": correlation,
-            "num_batches": num_batches
-        }
+            # Update best
+            if accuracy > self.best_accuracy:
+                self.best_accuracy = accuracy
+
+            return {
+                "loss": avg_loss,
+                "accuracy": accuracy,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "mae": 1.0 - accuracy,  # Error rate for compatibility
+                "num_batches": num_batches
+            }
+        else:
+            # Regression metrics
+            avg_mae = total_mae / num_batches
+            self.history["val_loss"].append(avg_loss)
+            self.history["val_mae"].append(avg_mae)
+
+            # Compute correlation with proper NaN handling
+            all_predictions_arr = np.array(all_predictions)
+            all_targets_arr = np.array(all_targets)
+
+            pred_std = np.std(all_predictions_arr)
+            target_std = np.std(all_targets_arr)
+
+            if pred_std < 1e-8 or target_std < 1e-8:
+                correlation = np.nan
+                if pred_std < 1e-8:
+                    pred_mean = np.mean(all_predictions_arr)
+                    print(f"  [Warning] Predictions have zero variance (all ~{pred_mean:.4f})")
+            else:
+                corr_matrix = np.corrcoef(all_predictions_arr, all_targets_arr)
+                correlation = corr_matrix[0, 1] if not np.isnan(corr_matrix[0, 1]) else np.nan
+
+            return {
+                "loss": avg_loss,
+                "mae": avg_mae,
+                "correlation": correlation,
+                "num_batches": num_batches,
+                "pred_std": pred_std,
+                "target_std": target_std
+            }
 
     def train(
         self,
@@ -297,24 +367,49 @@ class ClassifierTrainer:
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
             if val_metrics:
                 print(f"  Val Loss: {val_metrics['loss']:.4f}")
-                print(f"  Val MAE: {val_metrics['mae']:.4f}")
-                print(f"  Val Correlation: {val_metrics['correlation']:.4f}")
+                if self.classification_mode == "binary":
+                    print(f"  Val Accuracy: {val_metrics['accuracy']:.4f}")
+                    print(f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}")
+                else:
+                    print(f"  Val MAE: {val_metrics['mae']:.4f}")
+                    corr_str = f"{val_metrics['correlation']:.4f}" if not np.isnan(val_metrics['correlation']) else "nan"
+                    print(f"  Val Correlation: {corr_str}")
+                    if epoch < 3:  # Log variance diagnostics for first few epochs
+                        print(f"  Pred StdDev: {val_metrics.get('pred_std', 0):.4f}, Target StdDev: {val_metrics.get('target_std', 0):.4f}")
 
             # Log metrics to MLflow for learning curves
             if self.tracker is not None:
                 self.tracker.log_metric('classifier/train_loss', train_metrics['loss'], step=epoch)
                 if val_metrics:
                     self.tracker.log_metric('classifier/val_loss', val_metrics['loss'], step=epoch)
-                    self.tracker.log_metric('classifier/val_mae', val_metrics['mae'], step=epoch)
-                    self.tracker.log_metric('classifier/val_correlation', val_metrics['correlation'], step=epoch)
+                    if self.classification_mode == "binary":
+                        self.tracker.log_metric('classifier/val_accuracy', val_metrics['accuracy'], step=epoch)
+                        self.tracker.log_metric('classifier/val_precision', val_metrics['precision'], step=epoch)
+                        self.tracker.log_metric('classifier/val_recall', val_metrics['recall'], step=epoch)
+                        self.tracker.log_metric('classifier/val_f1', val_metrics['f1'], step=epoch)
+                    else:
+                        self.tracker.log_metric('classifier/val_mae', val_metrics['mae'], step=epoch)
+                        # Only log correlation if not NaN
+                        if not np.isnan(val_metrics['correlation']):
+                            self.tracker.log_metric('classifier/val_correlation', val_metrics['correlation'], step=epoch)
+                        # Log variance diagnostics
+                        self.tracker.log_metric('classifier/pred_std', val_metrics.get('pred_std', 0), step=epoch)
+                        self.tracker.log_metric('classifier/target_std', val_metrics.get('target_std', 0), step=epoch)
                 self.tracker.log_metric('classifier/epoch_time', epoch_time, step=epoch)
 
             # Track best metrics
             if val_metrics:
-                if val_metrics['mae'] < self.best_mae:
-                    self.best_mae = val_metrics['mae']
-                if val_metrics['correlation'] > self.best_correlation:
-                    self.best_correlation = val_metrics['correlation']
+                if self.classification_mode == "binary":
+                    # Binary: track accuracy
+                    if val_metrics['accuracy'] > self.best_accuracy:
+                        self.best_accuracy = val_metrics['accuracy']
+                else:
+                    # Regression: track MAE and correlation
+                    if val_metrics['mae'] < self.best_mae:
+                        self.best_mae = val_metrics['mae']
+                    # Only track correlation if not NaN
+                    if not np.isnan(val_metrics['correlation']) and val_metrics['correlation'] > self.best_correlation:
+                        self.best_correlation = val_metrics['correlation']
 
             # Save checkpoint
             current_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
@@ -370,8 +465,11 @@ class ClassifierTrainer:
             epochs_completed = len(self.history['train_loss'])
             self.tracker.log_metric('classifier/epochs_completed', epochs_completed)
             self.tracker.log_metric('classifier/best_val_loss', self.best_loss)
-            self.tracker.log_metric('classifier/best_val_mae', self.best_mae)
-            self.tracker.log_metric('classifier/best_val_correlation', self.best_correlation)
+            if self.classification_mode == "binary":
+                self.tracker.log_metric('classifier/best_val_accuracy', self.best_accuracy)
+            else:
+                self.tracker.log_metric('classifier/best_val_mae', self.best_mae)
+                self.tracker.log_metric('classifier/best_val_correlation', self.best_correlation)
             if self.history['train_loss']:
                 self.tracker.log_metric('classifier/final_train_loss', self.history['train_loss'][-1])
             if self.history['val_loss']:
@@ -454,7 +552,7 @@ class ClassifierTrainer:
             data_loader: Data loader with embeddings
 
         Returns:
-            predictions: List of predicted ratings
+            predictions: List of predicted ratings/probabilities
             filenames: List of corresponding filenames
         """
         self.classifier.eval()
@@ -466,11 +564,15 @@ class ClassifierTrainer:
                 embeddings = batch["embedding"].to(self.device)
                 batch_filenames = batch["filename"]
 
-                # Predict
+                # Predict (predictions are already (batch_size,))
                 preds = self.classifier(embeddings)
 
+                # For binary mode, apply sigmoid to get probabilities
+                if self.classification_mode == "binary":
+                    preds = torch.sigmoid(preds)
+
                 # Store results
-                predictions.extend(preds.squeeze().cpu().numpy().tolist())
+                predictions.extend(preds.cpu().numpy().tolist())
                 filenames.extend(batch_filenames)
 
         return predictions, filenames
@@ -495,16 +597,16 @@ class ClassifierTrainer:
                 embeddings = batch["embedding"].to(self.device)
                 ratings = batch["rating"].to(self.device)
 
-                # Predict
+                # Predict (predictions are already (batch_size,))
                 predictions = self.classifier(embeddings)
 
                 # Compute loss
-                loss = self.loss_fn(predictions.squeeze(), ratings)
+                loss = self.loss_fn(predictions, ratings)
                 total_loss += loss.item()
                 num_batches += 1
 
                 # Store for metrics
-                all_predictions.extend(predictions.squeeze().cpu().numpy().tolist())
+                all_predictions.extend(predictions.cpu().numpy().tolist())
                 all_targets.extend(ratings.cpu().numpy().tolist())
 
         # Compute metrics
@@ -513,7 +615,16 @@ class ClassifierTrainer:
 
         mse = np.mean((all_predictions - all_targets) ** 2)
         mae = np.mean(np.abs(all_predictions - all_targets))
-        correlation = np.corrcoef(all_predictions, all_targets)[0, 1]
+
+        # Compute correlation with proper NaN handling
+        pred_std = np.std(all_predictions)
+        target_std = np.std(all_targets)
+
+        if pred_std < 1e-8 or target_std < 1e-8:
+            correlation = np.nan
+        else:
+            corr_matrix = np.corrcoef(all_predictions, all_targets)
+            correlation = corr_matrix[0, 1] if not np.isnan(corr_matrix[0, 1]) else np.nan
 
         # RMSE
         rmse = np.sqrt(mse)
@@ -524,5 +635,7 @@ class ClassifierTrainer:
             "mae": mae,
             "rmse": rmse,
             "correlation": correlation,
-            "num_samples": len(all_predictions)
+            "num_samples": len(all_predictions),
+            "pred_std": pred_std,
+            "target_std": target_std
         }

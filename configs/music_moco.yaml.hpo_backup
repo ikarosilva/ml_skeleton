@@ -21,7 +21,7 @@ tags:
 # Music-specific configuration (matches existing script expectations)
 music:
   # Clementine database path
-  database_path: "/Music/database/clementine_backup_2026-02.db"
+  database_path: "/Music/database/clementine_backup_2026-01.db"
 
   # Embedding storage (SQLite)
   embedding_db_path: "./embeddings.db"
@@ -58,52 +58,6 @@ music:
   train_split: 0.8
   skip_unknown_metadata: true
 
-# Acoustic fingerprinting and metadata enrichment
-fingerprinting:
-  # Core fingerprinting
-  enabled: true  # Enable acoustic fingerprinting
-  fingerprint_db_path: "./cache/fingerprints.db"  # SQLite database for fingerprints
-  use_cached_chunks: true  # Use existing 30s chunk cache (must run build-cache first)
-  chunk_for_fingerprinting: 0  # Chunk index to use (0=first, 1=middle, 2=middle-late, 3=last)
-  # NOTE: Use chunk 0 (first) for AcoustID matching - their database expects song beginnings
-
-  # Fingerprinting parameters
-  num_workers: 8  # Parallel workers for fingerprint extraction
-  skip_existing: true  # Skip songs that already have fingerprints
-  prioritize_missing_metadata: true  # Process songs with incomplete metadata first
-  max_songs: 500  # Max songs to process per run (for free tier: 500/day limit)
-
-  # Duplicate detection (Phase 2 - not yet implemented)
-  deduplicate: false  # Enable duplicate detection via fingerprint similarity
-  similarity_threshold: 0.95  # Chromaprint similarity threshold for duplicates
-  duplicate_selection: "rated_recent"  # Keep most recent rated version
-  remove_non_canonical: true  # Remove duplicates from training datasets
-
-  # External metadata enrichment (AcoustID + MusicBrainz)
-  enable_external_lookup: true  # Enable external API lookups
-  acoustid_api_key: "${ACOUSTID_API_KEY}"  # Set via environment variable
-  acoustid_tier: "free"  # "free" (500/day) or "paid" ($10/year, unlimited)
-
-  # MusicBrainz database (separate from Clementine DB)
-  musicbrainz_db_path: "./musicbrainz_metadata.db"  # SQLite DB for enriched metadata
-
-  # Rate limits (free tier: 3 req/s AcoustID, 1 req/s MusicBrainz)
-  acoustid_rate_limit: 3.0  # Requests per second for AcoustID API
-  musicbrainz_rate_limit: 1.0  # Requests per second for MusicBrainz API
-
-  # Metadata source configuration
-  metadata_source: "both"  # "clementine", "musicbrainz", or "both"
-  prefer_musicbrainz_if_confidence_above: 0.90  # Override Clementine if MB confidence > 0.90
-  # NOTE: Based on corrected confidence calculation (Hot Rocks test average: 0.988)
-  # Typical AcoustID scores: High matches 0.95-0.99, Medium 0.70-0.95, Low 0.50-0.70
-
-  # Genre taxonomy
-  genre_system: "7categories"  # "7categories" (existing) or "30genres" (new MB-based)
-  genre_mapping_7to30: true  # Provide backward compatibility mapping
-
-  # Loss weighting (Phase 4 - not yet implemented)
-  weight_loss_by_confidence: false  # Downweight low-confidence metadata in training
-
 # CQT transform configuration (nnAudio)
 cqt:
   n_bins: 84          # 7 octaves × 12 semitones
@@ -138,7 +92,7 @@ encoder:
 
   # Training
   epochs: 25  # Balanced for HPO trials (use final_training_epochs for full training)
-  final_training_epochs: 100  # Full training after HPO finds best params
+  final_training_epochs: 70  # Full training after HPO finds best params
   batch_size: 96  # Larger batch for faster HPO (32GB RTX 5090 can handle it)
   learning_rate: 0.0003
 
@@ -197,22 +151,10 @@ classifier:
   early_stopping_patience: 10
   early_stopping_min_delta: 0.0001
 
-  # Classification mode: "regression" (0-1 continuous) or "binary" (like/dislike)
-  classification_mode: "binary"
-
-  # Binary classification settings (only used when classification_mode="binary")
-  binary_positive_threshold: 4  # Rating >= 4 → positive (like)
-  binary_negative_threshold: 2  # Rating <= 2 → negative (dislike)
-  # Songs with ratings between thresholds are excluded from training
-
-  loss_type: "mse"  # Used for regression mode; binary uses BCE
+  loss_type: "mse"
 
   # Rating normalization: 0-5 → 0-1
   rating_scale: 5.0
-
-  # Class weighting for imbalanced rating distribution
-  # Options: "none", "inverse", "sqrt_inverse"
-  class_weight_strategy: "none"
 
 # MLflow configuration
 mlflow:
@@ -297,11 +239,6 @@ tuning:
         type: "categorical"
         choices: [[1024, 512, 256, 128],]
 
-      # Class weighting strategy for imbalanced ratings
-      class_weight_strategy:
-        type: "categorical"
-        choices: ["none", "inverse", "sqrt_inverse"]
-
       # Adam optimizer parameters (all tunable)
       adam_beta1:
         type: "loguniform"
@@ -345,6 +282,6 @@ recommendations:
   output_format: "xspf"
   output_path: "./recommendations.txt"
   output_dir: "/Music/recommendations"
-  min_rating_threshold: 0.0
+  min_rating_threshold: 0.6
   human_feedback_uncertain: 100
   human_feedback_best: 50

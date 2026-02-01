@@ -1,0 +1,30 @@
+# Resource-Optimized Configuration for Classifier HPO
+# Based on music_recommendation.yaml with reduced resource usage
+
+# Key optimizations:
+# - Batch size: 128 (default was 64) - more efficient GPU utilization
+# - HPO trials: 20 (default was 100) - faster completion
+# - Early stopping: 10 epochs patience - stops bad trials early
+# - No DataLoader workers during classifier training (embeddings are pre-loaded)
+# - GPU memory limit: 24GB (leaves 8GB free on 32GB GPU)
+
+tuning:
+  tuner_type: "optuna"
+  n_trials: 20  # Reduced from 100 for faster HPO
+  timeout: null
+  sampler: "TPESampler"
+  pruner: "MedianPruner"
+
+classifier:
+  # Training
+  epochs: 50  # Each trial runs for up to 50 epochs
+  batch_size: 128  # Increased for better GPU efficiency
+  
+  # Early stopping (saves time on bad trials)
+  early_stopping_patience: 10  # Stop if no improvement for 10 epochs
+  early_stopping_min_delta: 0.0001
+
+# Device configuration
+device: "cuda"
+gpu_memory_limit_gb: 24  # Leave 8GB free on 32GB GPU
+precision: "bf16-mixed"  # Memory-efficient mixed precision
