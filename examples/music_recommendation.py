@@ -36,6 +36,7 @@ import argparse
 import sys
 import os
 import shutil
+import numpy as np
 from pathlib import Path
 from typing import Optional
 
@@ -1247,6 +1248,30 @@ def train_encoder(
             use_moco=True
         )
 
+        # Extract all 4 chunks per song into embedding_chunks (for classifier average)
+        from ml_skeleton.music.moco_dataset import ChunkExtractionDataset
+        chunk_cache_config = music_config.get('chunk_cache', {})
+        num_chunks = chunk_cache_config.get('num_chunks', 4)
+        crop_duration = encoder_config.get('augmentation', {}).get('crop_duration_max', 15.0)
+        chunk_extraction_dataset = ChunkExtractionDataset(
+            songs=all_songs,
+            cache_dir=chunk_cache_config.get('directory', './cache/chunks'),
+            num_chunks=num_chunks,
+            sample_rate=music_config['sample_rate'],
+            crop_duration=crop_duration
+        )
+        chunk_extraction_loader = DataLoader(
+            chunk_extraction_dataset,
+            batch_size=encoder_config['batch_size'],
+            shuffle=False,
+            num_workers=num_workers,
+            prefetch_factor=4,
+            pin_memory=True,
+            collate_fn=moco_collator
+        )
+        trainer.extract_embeddings(chunk_extraction_loader, save_to_store=True, use_moco=True)
+        print(f"Extracted all {num_chunks} chunks per song to embedding_chunks")
+
         print(f"\nExtracted {len(embeddings)} embeddings")
         print(f"Saved to: {music_config['embedding_db_path']}")
 
@@ -1516,7 +1541,7 @@ def train_classifier(
     num_runs: int = 1,
     training_seed: int = None,
     init_from_prod: bool = True,
-    vault_size: int = 100
+    vault_size: int = 200
 ):
     """Stage 2: Train rating classifier.
 
@@ -1532,7 +1557,7 @@ def train_classifier(
                       Split always uses config seed for consistency across HPO trials.
         init_from_prod: If True (default), initialize from prod/classifier_best.pt if
                        architecture matches. If False, use random initialization.
-        vault_size: Number of ratings to reserve for A/B testing vault (default: 100).
+        vault_size: Number of ratings to reserve for A/B testing vault (default: 200).
                    Vault files are never used for training, only for comparing models.
 
     Returns:
@@ -1643,19 +1668,26 @@ def train_classifier(
         print("\n[2/6] Loading embeddings...")
     embedding_store = EmbeddingStore(music_config['embedding_db_path'])
 
-    # Get embeddings for all songs
+    # Get embeddings for all songs (prefer 4 chunks per song for classifier average)
     filenames = [s.filename for s in all_songs]
-    embeddings_dict = embedding_store.get_embeddings_batch(
+    embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
-        model_version=music_config['encoder_version']
+        model_version=music_config['encoder_version'],
+        num_chunks=4
     )
+    if not embeddings_dict:
+        embeddings_dict = embedding_store.get_embeddings_batch(
+            filenames,
+            model_version=music_config['encoder_version']
+        )
 
     if verbose:
         print(f"  Loaded {len(embeddings_dict)} embeddings")
 
-    # Check embedding dimension
+    # Check embedding dimension (support (4, D) per song)
     first_embedding = next(iter(embeddings_dict.values()))
-    embedding_dim = len(first_embedding)
+    arr = np.asarray(first_embedding)
+    embedding_dim = int(arr.shape[-1]) if arr.ndim > 1 else len(arr)
     if verbose:
         print(f"  Embedding dimension: {embedding_dim}")
 
@@ -2281,10 +2313,16 @@ def generate_recommendations(
     filenames = [s.filename for s in unrated_songs]
     # Use encoder_version for embedding lookup (with fallback to model_version for backwards compatibility)
     encoder_version = music_config.get('encoder_version', music_config.get('model_version', 'v1'))
-    embeddings_dict = embedding_store.get_embeddings_batch(
+    embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
-        model_version=encoder_version
+        model_version=encoder_version,
+        num_chunks=4
     )
+    if not embeddings_dict:
+        embeddings_dict = embedding_store.get_embeddings_batch(
+            filenames,
+            model_version=encoder_version
+        )
 
     print(f"  Loaded {len(embeddings_dict)} embeddings")
 
@@ -2310,7 +2348,9 @@ def generate_recommendations(
 
     # Load classifier
     print("\n[3/5] Loading classifier...")
-    embedding_dim = len(next(iter(embeddings_dict.values())))
+    _first_emb = next(iter(embeddings_dict.values()))
+    _arr = np.asarray(_first_emb)
+    embedding_dim = int(_arr.shape[-1]) if _arr.ndim > 1 else len(_arr)
 
     checkpoint_path = classifier_checkpoint  # Already set above based on model_dir
     if not checkpoint_path.exists():
@@ -3015,9 +3055,9 @@ def main():
     parser.add_argument(
         '--vault-size',
         type=int,
-        default=100,
+        default=200,
         dest='vault_size',
-        help='Number of ratings to reserve in vault for A/B testing only (default: 100). '
+        help='Number of ratings to reserve in vault for A/B testing only (default: 200). '
              'Vault files are never used for training, only for comparing models.'
     )
 
@@ -3321,8 +3361,6 @@ def main():
         print("CREATING RANDOM BASELINE FOR A/B TESTING")
         print("=" * 80)
 
-        from pathlib import Path
-
         music_config = config['music']
         classifier_config = config['classifier']
 
@@ -3513,7 +3551,6 @@ def main():
 
     elif args.stage == 'generate-model-card':
         # Generate production model card with A/B test results
-        from pathlib import Path
         from datetime import datetime
         import json
 

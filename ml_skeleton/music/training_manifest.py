@@ -7,7 +7,7 @@ Enables proper A/B testing by tracking:
 - When training occurred
 - Model version info
 
-The vault contains a fixed set of ratings (default 100) that are NEVER used for
+The vault contains a fixed set of ratings (default 200) that are NEVER used for
 training, only for A/B testing. This allows multiple A/B test runs without
 needing to rate new songs each time.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Optional
 
 # Default number of ratings to keep in the A/B test vault
-DEFAULT_VAULT_SIZE = 100
+DEFAULT_VAULT_SIZE = 200
 
 
 class TrainingManifest:
@@ -38,7 +38,7 @@ class TrainingManifest:
         # During training
         manifest = TrainingManifest.load_or_create("prod/training_manifest.json")
         train_files, val_files, vault_files = manifest.split_with_vault(
-            all_rated_files, train_ratio=0.8, vault_size=100
+            all_rated_files, train_ratio=0.8, vault_size=200
         )
 
         # After training
@@ -128,7 +128,7 @@ class TrainingManifest:
         Args:
             all_files: List of all rated filenames
             train_ratio: Ratio for training set (of non-vault files)
-            vault_size: Number of files to reserve for A/B testing (default 100)
+            vault_size: Number of files to reserve for A/B testing (default 200)
             seed: Random seed for initial split
             file_ratings: Optional dict of {filename: binary_rating} for class balancing
 

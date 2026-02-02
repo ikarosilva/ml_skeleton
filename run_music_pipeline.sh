@@ -939,7 +939,7 @@ else:
             echo "  --genre CATEGORY           - Filter recommendations by genre category"
             echo "                               Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world"
             echo "  --random-init              - Use random init instead of loading from prod model (default: prod init)"
-            echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 100)"
+            echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 200)"
             echo ""
             echo "Environment Variables:"
             echo "  HPO_ENCODER_TRIALS=30"
