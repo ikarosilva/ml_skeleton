@@ -1758,20 +1758,6 @@ def train_classifier(
         print(f"  Best model saved to: {best_checkpoint}")
         print(f"\n  Total training time: {total_time:.1f}s ({total_time/60:.1f} minutes)")
 
-        # Collect stats for model card (use best run's stats)
-        classifier_stats = {
-            'best_val_loss': best_run['best_val_loss'],
-            'best_val_mae': best_run['best_val_mae'],
-            'val_mae': best_run['best_val_mae'],
-            'best_epoch': best_run['best_epoch'],
-            'epochs_run': best_run['epochs_run'],
-            'training_time_seconds': total_time,
-            'num_runs': num_runs,
-            'mae_mean': np.mean(maes),
-            'mae_std': np.std(maes)
-        }
-        model_card.set_classifier_stats(classifier_stats)
-
         # Save training manifest for multi-run (use consistent split with vault for A/B testing)
         manifest_path = checkpoint_dir / "training_manifest.json"
         manifest = TrainingManifest.load_or_create(str(manifest_path))
@@ -1794,12 +1780,30 @@ def train_classifier(
         )
         manifest.save()
 
+        # Collect stats for model card (use best run's stats)
+        classifier_stats = {
+            'best_val_loss': best_run['best_val_loss'],
+            'best_val_mae': best_run['best_val_mae'],
+            'val_mae': best_run['best_val_mae'],
+            'best_epoch': best_run['best_epoch'],
+            'epochs_run': best_run['epochs_run'],
+            'training_time_seconds': total_time,
+            'num_runs': num_runs,
+            'mae_mean': np.mean(maes),
+            'mae_std': np.std(maes),
+            'train_size': len(train_files),
+            'val_size': len(val_files),
+            'vault_size': len(vault_files)
+        }
+        model_card.set_classifier_stats(classifier_stats)
+
         if verbose:
             print(f"\nTraining manifest saved to: {manifest_path}")
             print(f"  Vault files (A/B test only): {len(vault_files)}")
 
         # A/B test against production model using vault files (always available)
         prod_classifier_path = Path("prod") / "classifier_best.pt"
+        prod_manifest_path = Path("prod") / "training_manifest.json"
         new_classifier_path = checkpoint_dir / "classifier_best.pt"
 
         if prod_classifier_path.exists() and len(vault_files) > 0 and verbose:
@@ -1807,9 +1811,16 @@ def train_classifier(
             print("A/B TEST: New Model vs Production (using vault)")
             print("=" * 60)
 
-            # Create test dataset from vault files (reserved for A/B testing only)
-            vault_files_set = set(vault_files)
-            test_dataset = full_dataset.subset_by_filenames(vault_files_set)
+            # Use CURRENT vault for A/B testing - fair for both models:
+            # - NEW model: hasn't seen vault files (held out by definition)
+            # - PROD model: hasn't seen vault files either:
+            #   * Files in both vaults: PROD held these out
+            #   * Files only in current vault: new ratings that didn't exist when PROD was trained
+            current_vault_set = set(vault_files)
+            print(f"  Using current vault for A/B test: {len(current_vault_set)} files")
+
+            # Create test dataset from current vault
+            test_dataset = full_dataset.subset_by_filenames(current_vault_set)
 
             if len(test_dataset) >= 10:
                 ab_result = run_ab_test(
@@ -1822,13 +1833,16 @@ def train_classifier(
                 )
                 manifest.set_metadata('ab_test_result', {
                     'n_samples': int(ab_result.get('n_samples', 0)),
+                    'new_accuracy': float(ab_result.get('new_accuracy', 0)),
+                    'prod_accuracy': float(ab_result.get('prod_accuracy', 0)),
                     'improvement': float(ab_result.get('improvement', 0)),
                     'p_value': float(ab_result.get('p_value', 1.0)),
                     'significant': bool(ab_result.get('significant', False))
                 })
                 manifest.save()
             else:
-                print(f"  Skipping A/B test: only {len(test_dataset)} vault samples (need >= 10)")
+                print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
+                print(f"  Rate more songs to build up a stable A/B test vault")
         elif verbose and len(vault_files) == 0:
             print(f"\n  No vault files available for A/B testing")
             print(f"  Need at least {vault_size} rated files to create vault")
@@ -2077,6 +2091,10 @@ def train_classifier(
         training_time_seconds=training_time,
         dataset_stats=classifier_dataset_stats
     )
+    # Add train/val/vault sizes for model card
+    classifier_stats['train_size'] = len(train_dataset)
+    classifier_stats['val_size'] = len(val_dataset)
+    classifier_stats['vault_size'] = len(vault_files)
     model_card.set_classifier_stats(classifier_stats)
 
     # Generate model card (only during final training, not HPO)
@@ -2107,6 +2125,7 @@ def train_classifier(
 
     # A/B test against production model using vault files (always available)
     prod_classifier_path = Path("prod") / "classifier_best.pt"
+    prod_manifest_path = Path("prod") / "training_manifest.json"
     new_classifier_path = checkpoint_dir / "classifier_best.pt"
 
     if prod_classifier_path.exists() and len(vault_files) > 0 and verbose:
@@ -2114,9 +2133,16 @@ def train_classifier(
         print("A/B TEST: New Model vs Production (using vault)")
         print("=" * 60)
 
-        # Create test dataset from vault files (reserved for A/B testing only)
-        vault_files_set = set(vault_files)
-        test_dataset = full_dataset.subset_by_filenames(vault_files_set)
+        # Use CURRENT vault for A/B testing - fair for both models:
+        # - NEW model: hasn't seen vault files (held out by definition)
+        # - PROD model: hasn't seen vault files either:
+        #   * Files in both vaults: PROD held these out
+        #   * Files only in current vault: new ratings that didn't exist when PROD was trained
+        current_vault_set = set(vault_files)
+        print(f"  Using current vault for A/B test: {len(current_vault_set)} files")
+
+        # Create test dataset from current vault
+        test_dataset = full_dataset.subset_by_filenames(current_vault_set)
 
         if len(test_dataset) >= 10:  # Need minimum samples for meaningful test
             ab_result = run_ab_test(
@@ -2128,16 +2154,19 @@ def train_classifier(
                 verbose=True
             )
 
-            # Store A/B test result in manifest
+            # Store A/B test result in manifest (include accuracies for debugging)
             manifest.set_metadata('ab_test_result', {
                 'n_samples': int(ab_result.get('n_samples', 0)),
+                'new_accuracy': float(ab_result.get('new_accuracy', 0)),
+                'prod_accuracy': float(ab_result.get('prod_accuracy', 0)),
                 'improvement': float(ab_result.get('improvement', 0)),
                 'p_value': float(ab_result.get('p_value', 1.0)),
                 'significant': bool(ab_result.get('significant', False))
             })
             manifest.save()
         else:
-            print(f"  Skipping A/B test: only {len(test_dataset)} vault samples (need >= 10)")
+            print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
+            print(f"  Rate more songs to build up a stable A/B test vault")
     elif verbose and len(vault_files) == 0:
         print(f"\n  No vault files available for A/B testing")
         print(f"  Need at least {vault_size} rated files to create vault")
@@ -2148,7 +2177,12 @@ def train_classifier(
     return model_card
 
 
-def generate_recommendations(config: dict, prod_dir: str = None, low_rating_ratio: float = 0.0):
+def generate_recommendations(
+    config: dict,
+    prod_dir: str = None,
+    low_rating_ratio: float = 0.0,
+    genre_filter: str = None
+):
     """Generate recommendations for unrated songs.
 
     Args:
@@ -2158,6 +2192,9 @@ def generate_recommendations(config: dict, prod_dir: str = None, low_rating_rati
         low_rating_ratio: Ratio of low-ranked (predicted dislike) songs to include
                          in recommendations (0.0-1.0). Useful for A/B testing to
                          ensure negative labels and force careful listening.
+        genre_filter: Optional genre category to filter recommendations by.
+                     Valid categories: rock, pop, electronic, hiphop, jazz_classical,
+                     country, latin_world
 
     Raises:
         ValueError: If classifier was trained with a different encoder version
@@ -2213,6 +2250,25 @@ def generate_recommendations(config: dict, prod_dir: str = None, low_rating_rati
     # Get unrated songs
     unrated_songs = [s for s in all_songs if not s.is_rated]
     print(f"  Found {len(unrated_songs)} unrated songs")
+
+    # Filter by genre if specified
+    if genre_filter:
+        from ml_skeleton.music.genre_mapper import GENRE_CATEGORIES, parse_genre_string
+        genre_filter_lower = genre_filter.lower()
+
+        # Validate genre category
+        if genre_filter_lower not in GENRE_CATEGORIES:
+            print(f"\n  ERROR: Invalid genre '{genre_filter}'")
+            print(f"  Valid categories: {', '.join(GENRE_CATEGORIES)}")
+            return
+
+        # Filter songs that have this genre
+        unrated_songs_filtered = [
+            s for s in unrated_songs
+            if genre_filter_lower in parse_genre_string(s.genre)
+        ]
+        print(f"  Filtered to {len(unrated_songs_filtered)} '{genre_filter}' songs")
+        unrated_songs = unrated_songs_filtered
 
     if len(unrated_songs) == 0:
         print("  No unrated songs to recommend!")
@@ -2377,10 +2433,24 @@ def generate_recommendations(config: dict, prod_dir: str = None, low_rating_rati
 
     # Save recommendations
     print("\n[5/5] Saving recommendations...")
-    output_path = Path(rec_config.get('output_path', './recommendations.txt'))
+
+    # Determine filename prefix for genre-filtered playlists
+    filename_prefix = f"{genre_filter}_" if genre_filter else ""
+
+    # Apply genre prefix to output path
+    base_output_path = rec_config.get('output_path', './recommendations.txt')
+    if genre_filter:
+        output_dir = Path(base_output_path).parent
+        output_name = f"{filename_prefix}recommendations.txt"
+        output_path = output_dir / output_name
+    else:
+        output_path = Path(base_output_path)
 
     with open(output_path, 'w') as f:
-        f.write(f"Top {len(results)} Recommendations\n")
+        f.write(f"Top {len(results)} Recommendations")
+        if genre_filter:
+            f.write(f" (Genre: {genre_filter})")
+        f.write("\n")
         if low_rating_ratio > 0.0:
             f.write(f"(includes {low_rating_ratio:.0%} predicted dislikes marked with [LOW])\n")
         f.write("=" * 80 + "\n\n")
@@ -2430,16 +2500,19 @@ def generate_recommendations(config: dict, prod_dir: str = None, low_rating_rati
         output_dir=playlist_output_dir,
         top_n_uncertain=top_n_uncertain,
         top_n_best=top_n_best,
-        uncertainty_method="distance_from_middle"
+        uncertainty_method="distance_from_middle",
+        filename_prefix=filename_prefix
     )
 
     print("\n" + "=" * 80)
     print("RECOMMENDATION COMPLETE")
+    if genre_filter:
+        print(f"(Genre filter: {genre_filter})")
     print("=" * 80)
     print(f"\nGenerated files:")
     print(f"  - {output_path} (text recommendations)")
-    print(f"  - {playlist_output_dir / 'recommender_help.xspf'} (high uncertainty - maximize learning)")
-    print(f"  - {playlist_output_dir / 'recommender_best.xspf'} (top predictions - validate quality)")
+    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_help.xspf'} (high uncertainty - maximize learning)")
+    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_best.xspf'} (top predictions - validate quality)")
     print(f"\nNext steps for human-in-the-loop training:")
     print(f"  1. Open XSPF playlists in Clementine")
     print(f"  2. Listen and rate songs")
@@ -2926,6 +2999,13 @@ def main():
              'Useful for A/B testing to ensure negative labels and force careful listening.'
     )
     parser.add_argument(
+        '--genre',
+        type=str,
+        default=None,
+        help='Filter recommendations by genre category. '
+             'Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world'
+    )
+    parser.add_argument(
         '--random-init',
         action='store_true',
         dest='random_init',
@@ -3002,7 +3082,12 @@ def main():
         print("\nNext step: Run with --stage recommend to generate recommendations")
 
     elif args.stage == 'recommend':
-        generate_recommendations(config, prod_dir=args.prod_dir, low_rating_ratio=args.low_rating_ratio)
+        generate_recommendations(
+            config,
+            prod_dir=args.prod_dir,
+            low_rating_ratio=args.low_rating_ratio,
+            genre_filter=args.genre
+        )
         cleanup_memory()
 
     elif args.stage == 'build-cache':
@@ -3311,7 +3396,50 @@ def main():
         import random
         random.seed(42)
 
-        all_filenames = [s.filename for s in rated_songs]
+        # Get all embeddings for rated songs
+        all_rated_filenames = [s.filename for s in rated_songs]
+        all_embeddings = embedding_store.get_embeddings_batch(
+            all_rated_filenames,
+            model_version=encoder_version
+        )
+
+        # Apply the same filtering as classifier training
+        classification_mode = classifier_config.get('classification_mode', 'binary')
+        binary_positive_threshold = classifier_config.get('binary_positive_threshold', 4.0)
+        binary_negative_threshold = classifier_config.get('binary_negative_threshold', 2.0)
+
+        valid_songs = []
+        for song in rated_songs:
+            # Must have embedding
+            if song.filename not in all_embeddings:
+                continue
+            # For binary mode, exclude ambiguous ratings
+            if classification_mode == 'binary':
+                if song.rating >= binary_positive_threshold:
+                    valid_songs.append(song)
+                elif song.rating <= binary_negative_threshold:
+                    valid_songs.append(song)
+                # Skip songs between thresholds (ambiguous)
+            else:
+                valid_songs.append(song)
+
+        print(f"  Classification mode: {classification_mode}")
+        print(f"  Rated songs: {len(rated_songs)}")
+        print(f"  With embeddings: {len(all_embeddings)}")
+        if classification_mode == 'binary':
+            print(f"  After binary filtering (rating >= {binary_positive_threshold} or <= {binary_negative_threshold}): {len(valid_songs)}")
+        else:
+            print(f"  Valid for training: {len(valid_songs)}")
+
+        # Create binary rating lookup for class balancing
+        file_ratings = {}
+        for song in valid_songs:
+            if classification_mode == 'binary':
+                file_ratings[song.filename] = 1 if song.rating >= binary_positive_threshold else 0
+            else:
+                file_ratings[song.filename] = 1 if song.rating >= 3.0 else 0
+
+        all_filenames = [s.filename for s in valid_songs]
         random.shuffle(all_filenames)
 
         # Split: vault_size for A/B testing, remainder split 80/20 train/val
@@ -3319,8 +3447,24 @@ def main():
         n_total = len(all_filenames)
         actual_vault_size = min(vault_size, n_total)
 
-        vault_files = all_filenames[:actual_vault_size]
-        remaining = all_filenames[actual_vault_size:]
+        # Create class-balanced vault (50/50 likes/dislikes)
+        likes = [f for f in all_filenames if file_ratings.get(f, 0) == 1]
+        dislikes = [f for f in all_filenames if file_ratings.get(f, 0) == 0]
+        half_vault = actual_vault_size // 2
+        vault_likes = likes[:min(half_vault, len(likes))]
+        vault_dislikes = dislikes[:min(half_vault, len(dislikes))]
+        # Fill remaining if one class is short
+        remaining_slots = actual_vault_size - len(vault_likes) - len(vault_dislikes)
+        if remaining_slots > 0:
+            if len(vault_likes) < half_vault:
+                vault_dislikes.extend(dislikes[len(vault_dislikes):len(vault_dislikes) + remaining_slots])
+            else:
+                vault_likes.extend(likes[len(vault_likes):len(vault_likes) + remaining_slots])
+        vault_files = vault_likes + vault_dislikes
+
+        # Remaining files (not in vault) for train/val
+        vault_set = set(vault_files)
+        remaining = [f for f in all_filenames if f not in vault_set]
 
         n_train = int(len(remaining) * 0.8)
         train_files = remaining[:n_train]
@@ -3356,7 +3500,9 @@ def main():
         print(f"  Training manifest created:")
         print(f"    Training files: {len(train_files)}")
         print(f"    Validation files: {len(val_files)}")
-        print(f"    Vault files: {len(vault_files)} (reserved for A/B testing)")
+        vault_pos = sum(1 for f in vault_files if file_ratings.get(f, 0) == 1)
+        vault_neg = len(vault_files) - vault_pos
+        print(f"    Vault files: {len(vault_files)} ({vault_pos} likes, {vault_neg} dislikes) - reserved for A/B testing")
 
         print("\n" + "=" * 80)
         print("RANDOM BASELINE CREATED")
@@ -3482,6 +3628,9 @@ def main():
 
         print(f"  Model card saved to: {model_card_path}")
 
+        # Get vault size from manifest
+        n_vault = len(manifest_data.get('vault_files', []))
+
         # Also save as JSON for programmatic access
         model_card_json = {
             'model_type': 'binary_rating_classifier',
@@ -3501,6 +3650,15 @@ def main():
                 'total': n_train + n_val,
             },
             'ab_test': ab_result,
+            # classifier_stats format for A/B history display compatibility
+            'classifier_stats': {
+                'train_size': n_train,
+                'val_size': n_val,
+                'vault_size': n_vault,
+                'metadata': {
+                    'ab_test_result': ab_result
+                }
+            }
         }
 
         model_card_json_path = prod_dir / "model_card.json"

@@ -362,6 +362,9 @@ Songs were excluded based on the following criteria:
             "### Training Data Statistics (Rated Songs Only)",
             "",
             f"- **Total rated songs:** {format(stats.get('total_rated_songs'), ',') if isinstance(stats.get('total_rated_songs'), int) else stats.get('total_rated_songs', 'N/A')}",
+            f"- **Training set:** {format(stats.get('train_size'), ',') if isinstance(stats.get('train_size'), int) else stats.get('train_size', 'N/A')}",
+            f"- **Validation set:** {format(stats.get('val_size'), ',') if isinstance(stats.get('val_size'), int) else stats.get('val_size', 'N/A')}",
+            f"- **A/B Test vault:** {format(stats.get('vault_size'), ',') if isinstance(stats.get('vault_size'), int) else stats.get('vault_size', 'N/A')}",
             f"- **Unique artists:** {format(stats.get('total_artists'), ',') if isinstance(stats.get('total_artists'), int) else stats.get('total_artists', 'N/A')}",
             f"- **Unique albums:** {format(stats.get('total_albums'), ',') if isinstance(stats.get('total_albums'), int) else stats.get('total_albums', 'N/A')}",
         ]

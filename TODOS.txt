@@ -1,22 +1,32 @@
-Found the root cause!
+rock - rock, metal, punk, grunge, alternative, indie, blues, soul, funk
+pop - pop, dance, disco, synth, new wave
+electronic - electronic, techno, house, trance, ambient, edm, dubstep
+hiphop - hip-hop, rap, r&b, urban, trap
+jazz_classical - jazz, classical, orchestra, instrumental, new age
+country - country, bluegrass, americana, folk, western
+latin_world - latin, reggae, world, african, caribbean, soundtrack
 
-Category	Count
-Rated with embeddings	8,630
-Positive (rating ≥ 4)	2,480
-Negative (rating ≤ 2)	2,346
-EXCLUDED ambiguous (2 < rating < 4)	3,804
-Available for binary training	4,826
-44% of your ratings are in the "ambiguous" zone (ratings 2.5, 3.0, 3.5) and get excluded in binary classification mode.
+*train encoder/clf together ?
+*multi chunk rating (2-4 chunks) agg by max
+*Vault size of 200 
+*check worse 100 errors as playlist for mistake in training label
+   -tru good pred bad playlist
+   -tru bad pred good playlist
 
-The vault shrunk from 100 → 59 because 41 of the original vault songs had ambiguous ratings.
 
-4,826 is still alot of songs!! going from 	4,826 to 159 is still not right. what are we missing?
+*increase encoder dim by 50% and depth 50%?
+*clf by genres or genre as input feature?
+*Binary classification mode - pos_weight: 0.914 ???
+
+
 
 
 Dynamic augmentations transforms for the encoder (small noise) ?
 
 *Capture diversity of labels ? Generate a playlist that prioritizes songs that are in
 sparse location in the embeddings. Called recommender_sparse.xspf.
+
+
 
 
 *Not sure if SQLite is best caching mechanism for features.

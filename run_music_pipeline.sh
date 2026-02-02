@@ -563,10 +563,13 @@ if history_dir.exists():
                 date_str = ts.strftime('%Y-%m-%d %H:%M')
             except:
                 date_str = ts_str
-            ab = data.get('classifier_stats', {}).get('metadata', {}).get('ab_test_result', {})
+            classifier_stats = data.get('classifier_stats', {})
+            ab = classifier_stats.get('metadata', {}).get('ab_test_result', {})
             if ab:
                 results.append({
                     'date': date_str,
+                    'train_size': classifier_stats.get('train_size', '-'),
+                    'val_size': classifier_stats.get('val_size', '-'),
                     'n_samples': ab.get('n_samples', 0),
                     'improvement': ab.get('improvement', 0),
                     'p_value': ab.get('p_value', 1.0),
@@ -581,10 +584,13 @@ if Path('prod/model_card.json').exists():
     try:
         with open('prod/model_card.json') as fp:
             data = json.load(fp)
-        ab = data.get('classifier_stats', {}).get('metadata', {}).get('ab_test_result', {})
+        classifier_stats = data.get('classifier_stats', {})
+        ab = classifier_stats.get('metadata', {}).get('ab_test_result', {})
         if ab:
             results.append({
                 'date': 'PROD',
+                'train_size': classifier_stats.get('train_size', '-'),
+                'val_size': classifier_stats.get('val_size', '-'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
@@ -599,10 +605,13 @@ if Path('checkpoints/training_manifest.json').exists():
     try:
         with open('checkpoints/training_manifest.json') as fp:
             data = json.load(fp)
-        ab = data.get('metadata', {}).get('ab_test_result', {})
+        metadata = data.get('metadata', {})
+        ab = metadata.get('ab_test_result', {})
         if ab:
             results.append({
                 'date': 'NEW',
+                'train_size': metadata.get('train_size', '-'),
+                'val_size': metadata.get('val_size', '-'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
@@ -613,12 +622,15 @@ if Path('checkpoints/training_manifest.json').exists():
         pass
 
 if results:
-    print(f\"{'Date':<20} {'Samples':>8} {'Δ Accuracy':>12} {'p-value':>10} {'Sig?':>6}  Notes\")
-    print('-' * 75)
+    print(f\"{'Date':<20} {'Train':>6} {'Val':>6} {'Vault':>6} {'Δ Accuracy':>11} {'p-value':>9} {'Sig?':>5}  Notes\")
+    print('-' * 85)
     for r in results:
         sig = '✓' if r['significant'] else ''
-        imp = f\"{r['improvement']:+.4f}\" if r['improvement'] != 0 else '  0.0000'
-        print(f\"{r['date']:<20} {r['n_samples']:>8} {imp:>12} {r['p_value']:>10.4f} {sig:>6}  {r['label']}\")
+        imp = f\"{r['improvement']:+.4f}\" if r['improvement'] != 0 else ' 0.0000'
+        train_str = str(r['train_size']) if r['train_size'] != '-' else '-'
+        val_str = str(r['val_size']) if r['val_size'] != '-' else '-'
+        vault_str = str(r['n_samples'])
+        print(f\"{r['date']:<20} {train_str:>6} {val_str:>6} {vault_str:>6} {imp:>11} {r['p_value']:>9.4f} {sig:>5}  {r['label']}\")
     print()
     sig_count = sum(1 for r in results if r['significant'])
     print(f'Models in history: {len(results)} | Significant improvements: {sig_count}')
@@ -915,6 +927,7 @@ else:
             echo "  sync-db             - Check database status and rating counts"
             echo "  recommend --prod    - Generate recommendations using prod models"
             echo "  recommend --prod --low-rating-ratio 0.1  - Include 10% predicted dislikes"
+            echo "  recommend --prod --genre rock           - Recommendations for rock songs only"
             echo ""
             echo "Options:"
             echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
@@ -923,6 +936,8 @@ else:
             echo "  --exhaust                  - Process max songs for the day (500 for free tier)"
             echo "  --workers N                - Number of parallel workers for fingerprinting (default: 4)"
             echo "  --low-rating-ratio N       - Include N% predicted dislikes in recommendations (0.0-1.0)"
+            echo "  --genre CATEGORY           - Filter recommendations by genre category"
+            echo "                               Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world"
             echo "  --random-init              - Use random init instead of loading from prod model (default: prod init)"
             echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 100)"
             echo ""

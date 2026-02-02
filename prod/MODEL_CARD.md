@@ -5,7 +5,7 @@
 - **Model Type**: Binary Rating Classifier (like/dislike)
 - **Encoder Version**: v1
 - **Classifier Version**: v1
-- **Promoted to Production**: 2026-02-01 23:34:42
+- **Promoted to Production**: 2026-02-02 01:46:41
 
 ## Architecture
 
@@ -16,19 +16,19 @@
 
 ## Training Data
 
-- **Training Songs**: 3,939
-- **Validation Songs**: 976
-- **Total Rated Songs**: 4,915
+- **Training Songs**: 3,992
+- **Validation Songs**: 999
+- **Total Rated Songs**: 4,991
 
 ## A/B Test Results
 
 | Metric | New Model | Production | Improvement |
 |--------|-----------|------------|-------------|
-| Accuracy | 55.1% | 50.0% (baseline) | +5.1% |
+| Accuracy | 52.0% | 50.0% (baseline) | +2.0% |
 
-- **Test Samples**: 59 (new ratings since last training)
+- **Test Samples**: 100 (new ratings since last training)
 - **Statistical Test**: McNemar's test
-- **p-value**: 0.2482
+- **p-value**: 0.4795
 - **Significant**: No
 
 ## Usage

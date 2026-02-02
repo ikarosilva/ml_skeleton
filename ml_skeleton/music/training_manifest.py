@@ -148,12 +148,14 @@ class TrainingManifest:
 
         if self.vault_files:
             # Existing vault - use rolling strategy
-            vault_files = [f for f in self.vault_files if f in all_files_set]
+            vault_files_before = set(f for f in self.vault_files if f in all_files_set)
+            vault_files = list(vault_files_before)
 
             if new_files:
-                # Add new files to vault
+                # Add new files to vault (combined list, may exceed vault_size)
                 if file_ratings:
-                    # Class-balanced: try to maintain 50/50 in vault
+                    # Class-balanced: combine and trim, tracking what was removed
+                    combined = new_files + vault_files
                     vault_files = self._add_balanced_to_vault(
                         vault_files, new_files, vault_size, file_ratings
                     )
@@ -161,18 +163,28 @@ class TrainingManifest:
                     # Simple FIFO: new files go in, old files get pushed out
                     vault_files = new_files + vault_files
 
-                # If vault exceeds size, push oldest (end of list) to training
-                pushed_to_training = []
+                # Trim vault to size and identify pushed-out files
                 if len(vault_files) > vault_size:
-                    pushed_to_training = vault_files[vault_size:]
                     vault_files = vault_files[:vault_size]
+
+                # Find files that were in vault before but aren't now
+                vault_files_set = set(vault_files)
+                pushed_out = [f for f in vault_files_before if f not in vault_files_set]
 
                 print(f"  Rolling vault update:")
                 print(f"    New ratings added to vault: {len(new_files)}")
-                if pushed_to_training:
-                    print(f"    Old vault files → training: {len(pushed_to_training)}")
-                    # Add pushed files to training set
-                    self.training_files.update(pushed_to_training)
+                if pushed_out:
+                    # Split pushed files 80/20 between training and validation
+                    random.shuffle(pushed_out)
+                    split_idx = int(len(pushed_out) * train_ratio)
+                    pushed_to_train = pushed_out[:split_idx]
+                    pushed_to_val = pushed_out[split_idx:]
+                    print(f"    Old vault files → training: {len(pushed_to_train)}")
+                    print(f"    Old vault files → validation: {len(pushed_to_val)}")
+                    self.training_files.update(pushed_to_train)
+                    self.validation_files.update(pushed_to_val)
+                else:
+                    print(f"    Vault not yet full, no files pushed out")
             else:
                 print(f"  Using existing vault: {len(vault_files)} files for A/B testing")
         else:

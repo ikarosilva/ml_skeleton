@@ -277,7 +277,8 @@ def generate_human_feedback_playlists(
     output_dir: Path,
     top_n_uncertain: int = 100,
     top_n_best: int = 50,
-    uncertainty_method: str = "distance_from_middle"
+    uncertainty_method: str = "distance_from_middle",
+    filename_prefix: str = ""
 ) -> dict:
     """Generate both uncertainty and best-predictions playlists.
 
@@ -290,6 +291,7 @@ def generate_human_feedback_playlists(
         top_n_uncertain: Number of uncertain songs for human rating
         top_n_best: Number of best predictions for validation
         uncertainty_method: Method for computing uncertainty
+        filename_prefix: Optional prefix for playlist filenames (e.g., "rock_")
 
     Returns:
         Dictionary with statistics about generated playlists
@@ -303,7 +305,7 @@ def generate_human_feedback_playlists(
 
     # Generate uncertainty playlist (for maximum learning)
     print(f"\nGenerating high-uncertainty playlist ({top_n_uncertain} songs)...")
-    uncertainty_path = output_dir / "recommender_help.xspf"
+    uncertainty_path = output_dir / f"{filename_prefix}recommender_help.xspf"
     generate_uncertainty_playlist(
         songs=songs,
         predictions=predictions,
@@ -315,7 +317,7 @@ def generate_human_feedback_playlists(
 
     # Generate best predictions playlist (for validation)
     print(f"\nGenerating best-predictions playlist ({top_n_best} songs)...")
-    best_path = output_dir / "recommender_best.xspf"
+    best_path = output_dir / f"{filename_prefix}recommender_best.xspf"
     generate_best_predictions_playlist(
         songs=songs,
         predictions=predictions,
