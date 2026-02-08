@@ -30,11 +30,14 @@ framework: "pytorch"
 
 tags:
   project: "music_recommendation"
-  version: "1.0"
+  version: "v0"
   stage: "encoder"  # Change to "classifier" for Stage 2
 
 # Music-specific configuration
 music:
+  # Root for all cache stores (fingerprints DB, chunk cache). All cache paths live under this.
+  cache_root: "/music-cache"   # or "/data/cache" / "./cache" for local
+
   # Clementine database path
   # IMPORTANT: Update this path to match your Clementine database location
   database_path: "/Music/database/clementine_backup_2026-01.db"
@@ -94,18 +97,17 @@ music:
   use_multi_task: false  # If true, enables album classification loss
   album_weight: 0.5  # Weight for album classification loss
 
-  # 4-Chunk cache configuration (for fingerprinting and MoCo training)
-  # Each song is split into 4 evenly-spaced 30-second chunks
+  # 4-Chunk cache configuration (for fingerprinting and MoCo training). Path under cache_root when relative.
   chunk_cache:
-    directory: "./cache/chunks"  # Directory for cached chunks
-    num_chunks: 4  # Number of chunks per song (evenly spaced)
+    directory: "./chunks"  # Relative to music.cache_root; use /music-cache/chunks for mounted volume
+    num_chunks: 8  # Number of chunks per song (evenly spaced; match encoder/chunk_cache)
     chunk_duration: 30.0  # Duration of each chunk in seconds
 
 # Acoustic fingerprinting and metadata enrichment
 fingerprinting:
   # Core fingerprinting
   enabled: false  # Enable acoustic fingerprinting
-  fingerprint_db_path: "./cache/fingerprints.db"  # SQLite database for fingerprints
+  fingerprint_db_path: "./fingerprints.db"  # Relative to music.cache_root
   use_cached_chunks: true  # Use existing 30s chunk cache (must run build-cache first)
   chunk_for_fingerprinting: 0  # Chunk index to use (0=first, 1=middle, 2=middle-late, 3=last)
   # NOTE: Use chunk 0 (first) for AcoustID matching - their database expects song beginnings
@@ -170,6 +172,9 @@ encoder:
   early_stopping_patience: 10  # Stop if no improvement for N epochs (null = disabled)
   early_stopping_min_delta: 0.0001  # Minimum improvement to count as progress
 
+  # HPO objective and early-stop monitor: val_f1 avoids rewarding collapsed models (predict-all-negative)
+  hpo_metric: "val_roc_auc"
+
   # Optimizer (Always use Adam with cosine scheduler for hyperparameter tuning)
   optimizer: "adam"  # Fixed: adam (with cosine scheduler)
   scheduler: "cosine"  # Fixed: cosine annealing
@@ -232,7 +237,13 @@ classifier:
   # Model architecture
   hidden_dims: [512, 256, 128]
   dropout: 0.3
-  use_batch_norm: False
+  use_batch_norm: true
+  use_residual: true
+
+  # Genre as input (7-dim multi-hot; missing genre imputed from embedding centroids)
+  use_genre: false
+  genre_impute_top_k: 2      # Top-k closest centroids per chunk for imputed multi-hot (allows mix-ins)
+  genre_impute_min_votes: 1   # Min votes across chunks to set a category in imputed multi-hot
 
   # Training
   # epochs: Number of training epochs
@@ -255,11 +266,25 @@ classifier:
   adam_betas: [0.9, 0.999]  # Coefficients for computing running averages (beta1, beta2)
   adam_eps: 1.0e-08  # Term added to denominator for numerical stability
   adam_weight_decay: 0.00001  # Weight decay (L2 penalty)
-  adam_amsgrad: false  # Whether to use AMSGrad variant
-  adam_decoupled_weight_decay: false  # If true, uses AdamW-style decoupled weight decay
+  adam_amsgrad: true  # Fixed true (reduces classifier collapse in binary mode)
+  adam_decoupled_weight_decay: true  # AdamW-style; fixed true (reduces collapse)
 
   # Loss function
   loss_type: "mse"  # mse
+
+  # Training label noise (label smoothing): soften 0/1 during training to reduce bias toward positives. 0 = none; 10 = 10%.
+  training_label_noise: 10
+
+# Joint fine-tune (optional): unfreeze encoder + classifier, train on audio → rating
+# Run after classifier to push accuracy further. Only supported when encoder_type: moco (e.g. use music_moco.yaml).
+joint_finetune:
+  enabled: false
+  epochs: 5
+  encoder_lr: 1.0e-5
+  classifier_lr: 1.0e-4
+  batch_size: 32
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0
 
 # MLflow configuration
 mlflow:
@@ -272,7 +297,8 @@ mlflow:
 # Hyperparameter tuning configuration (optional)
 tuning:
   tuner_type: "optuna"
-  n_trials: 100
+  n_trials: 800
+  reps: 1  # Classifier HPO: repetitions per trial with different init seeds; best (min) value and seed reported
   timeout: null
 
   sampler: "TPESampler"
@@ -329,8 +355,9 @@ tuning:
       batch_size:
         type: "categorical"
         choices: [64,]
+      # Lower bound 0.01 to reduce collapse (very low dropout associated with recall=1 in binary)
       dropout:
-        type: "float"
+        type: "loguniform"
         low: 0.01
         high: 0.5
       hidden_dims:
@@ -354,12 +381,7 @@ tuning:
         type: "loguniform"
         low: 1.0e-07
         high: 1.0e-03
-      adam_amsgrad:
-        type: "categorical"
-        choices: [false, true]
-      adam_decoupled_weight_decay:
-        type: "categorical"
-        choices: [false, true]
+      # adam_amsgrad and adam_decoupled_weight_decay fixed true in classifier section (not in search space)
 
 # Reproducibility
 seed: 42
@@ -386,3 +408,4 @@ recommendations:
   # These playlists help improve the model through active learning
   human_feedback_uncertain: 100  # Top-N uncertain predictions (recommender_help.xspf)
   human_feedback_best: 50  # Top-N best predictions for validation (recommender_best.xspf)
+  error_playlist_size: 100  # Max songs per false_positives / false_negatives playlist (label correction)

@@ -98,6 +98,12 @@ class TuningConfig:
     # Optuna storage for persistence (e.g., "sqlite:///optuna.db")
     optuna_storage: Optional[str] = None
 
+    # If True, delete existing Optuna study from storage before running (fresh HPO run)
+    reset_study: bool = False
+
+    # Optional display name for the HPO parent run: "prefix-{run_id}" (e.g. classifier-tune-hpo-abc123)
+    parent_run_name_prefix: Optional[str] = None
+
 
 @dataclass
 class ExperimentConfig:

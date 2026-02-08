@@ -1,5 +1,9 @@
 #!/bin/bash
 # Music Recommendation Pipeline Runner (MoCo v2 + Genre BCE)
+# Requires bash (arrays, [[, etc.). Re-exec with bash if invoked via sh.
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec bash "$0" "$@"
+fi
 #
 # Usage:
 #   ./run_music_pipeline.sh all              # Run all 3 stages
@@ -34,8 +38,9 @@
 # Environment variables:
 #   CONFIG=/path/to/config.yaml              # Override config file
 #   CLEMENTINE_DB_PATH=/path/to/db           # Override database path
+#   CHUNK_CACHE_DIR=/path/to/chunks          # Chunk cache dir (e.g. /music-cache/chunks in container)
 #   HPO_ENCODER_TRIALS=30                    # Number of encoder HPO trials
-#   HPO_CLASSIFIER_TRIALS=20                 # Number of classifier HPO trials
+#   HPO_CLASSIFIER_TRIALS=800               # Number of classifier HPO trials (default 800)
 #   RESUME_CHECKPOINT=/path/to/checkpoint    # Resume from previous training
 #   ENCODER_VERSION=v2                       # Encoder version for embeddings
 #   CLASSIFIER_VERSION=v2                    # Classifier version
@@ -45,7 +50,7 @@ set -e  # Exit on error
 CONFIG="${CONFIG:-configs/music_moco.yaml}"
 SCRIPT="examples/music_recommendation.py"
 HPO_ENCODER_TRIALS="${HPO_ENCODER_TRIALS:-30}"
-HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-100}"
+HPO_CLASSIFIER_TRIALS="${HPO_CLASSIFIER_TRIALS:-800}"
 RESUME_CHECKPOINT="${RESUME_CHECKPOINT:-}"  # Optional: path to checkpoint to resume from
 ENCODER_VERSION="${ENCODER_VERSION:-}"  # Optional: encoder version for embeddings (e.g., "v2")
 CLASSIFIER_VERSION="${CLASSIFIER_VERSION:-}"  # Optional: classifier version (e.g., "v2")
@@ -54,12 +59,14 @@ CLASSIFIER_VERSION="${CLASSIFIER_VERSION:-}"  # Optional: classifier version (e.
 export MIN_RATED_SONGS="${MIN_RATED_SONGS:-500}"
 
 # Path remapping for audio files
-export MUSIC_PATH_REMAP="${MUSIC_PATH_REMAP:-/home/ikaro/Music:/Music}"
+export MUSIC_PATH_REMAP="${MUSIC_PATH_REMAP:-/home/${USER}/Music:/Music}"
 
 # Allow database path override
 if [ -n "$CLEMENTINE_DB_PATH" ]; then
     export CLEMENTINE_DB_PATH
 fi
+# Chunk cache directory (e.g. /music-cache/chunks when mounted in container)
+[ -n "${CHUNK_CACHE_DIR:-}" ] && export CHUNK_CACHE_DIR
 
 # Colors
 GREEN='\033[0;32m'
@@ -190,6 +197,14 @@ run_classifier() {
     if [ "$is_final_training" = true ]; then
         display_ab_history
     fi
+}
+
+run_joint_finetune() {
+    print_header "Joint Fine-Tune (encoder + classifier on audio)"
+    python "$SCRIPT" --stage joint-finetune --config "$CONFIG" "$@"
+    print_success "Joint fine-tune complete!"
+    echo ""
+    display_ab_history
 }
 
 run_recommend() {
@@ -343,13 +358,11 @@ for r in sorted(rating_dist.keys()):
 }
 
 run_build_cache() {
-    print_header "Building 4-Chunk Waveform Cache"
-    echo "Pre-populating cache for fast training..."
-    echo "  - 4 chunks per song (evenly spaced)"
-    echo "  - 30 seconds per chunk at 16kHz"
-    echo "  - Estimated size: ~30GB for 60K songs"
+    print_header "Building Waveform Chunk Cache"
+    echo "Pre-populating cache for fast training (config: music.chunk_cache)..."
+    echo "  - num_chunks per song, 30s per chunk at 16kHz; use --overwrite when changing num_chunks"
     echo ""
-    python "$SCRIPT" --stage build-cache --config "$CONFIG"
+    python "$SCRIPT" --stage build-cache --config "$CONFIG" "$@"
     print_success "Cache build complete!"
     echo ""
 }
@@ -369,24 +382,63 @@ run_fingerprint() {
 run_fingerprint_stats() {
     print_header "Fingerprint Database Statistics"
     python -c "
-from ml_skeleton.music.fingerprint_db import FingerprintDB
+import os
+import yaml
 from pathlib import Path
+from ml_skeleton.music.fingerprint_db import FingerprintDB
+from ml_skeleton.music.encoder_factory import get_fingerprint_db_path
 
-fp_db_path = './cache/fingerprints.db'
+# Use same canonical path as encoder/classifier/fingerprint stage
+with open('$CONFIG') as f:
+    config = yaml.safe_load(f)
+fp_db_path = get_fingerprint_db_path(config)
+clem_path = os.getenv('CLEMENTINE_DB_PATH') or config.get('music', {}).get('database_path', '')
+
 if Path(fp_db_path).exists():
     db = FingerprintDB(fp_db_path)
     stats = db.get_stats()
+    chunk_cfg = config.get('fingerprinting', {}).get('chunk_for_fingerprinting', 0)
     print(f'  Total fingerprints: {stats[\"total_fingerprints\"]}')
     print(f'  Unique songs: {stats[\"unique_songs\"]}')
-    print(f'  Complete fingerprints: {stats[\"songs_with_complete_fingerprints\"]}')
+    print(f'  Complete (all 8 chunks per song): {stats[\"songs_with_complete_fingerprints\"]} (typical: 1 chromaprint per song at one chunk index)')
+    by_chunk = stats.get('fingerprints_by_chunk', {})
+    if by_chunk:
+        chunks = sorted(by_chunk.keys())
+        print('  By chunk index: ' + ' '.join([f'chunk_{c}: {by_chunk[c]}' for c in chunks]))
+        print(f'  Config chunk_for_fingerprinting: {chunk_cfg} (encoder/MoCo use this chunk)')
+        if chunk_cfg not in by_chunk or by_chunk.get(chunk_cfg, 0) == 0:
+            print('  -> No fingerprints at config chunk; set chunk_for_fingerprinting to a populated chunk or re-run fingerprint with that chunk.')
     print(f'  Canonical songs: {stats[\"canonical_songs\"]}')
     print(f'  Duplicate songs: {stats[\"duplicate_songs\"]}')
     print(f'  Duplicate groups: {stats[\"duplicate_groups\"]}')
     print(f'  DB size: {stats[\"db_size_mb\"]} MB')
+    # Coverage vs Clementine (local only)
+    if clem_path and Path(clem_path).exists():
+        from ml_skeleton.music.clementine_db import ClementineDB
+        clem = ClementineDB(clem_path)
+        total = len(clem.get_all_songs())
+        with_fp = stats['unique_songs']
+        missing = total - with_fp
+        pct = 100.0 * with_fp / total if total else 0
+        print('')
+        print('  Coverage vs Clementine (local):')
+        print(f'    Total songs:     {total:,}')
+        print(f'    With fingerprint: {with_fp:,}')
+        print(f'    Missing:        {missing:,}')
+        print(f'    Coverage:       {pct:.1f}%')
 else:
     print('  No fingerprint database found')
     print('  Run: ./run_music_pipeline.sh fingerprint')
 "
+    echo ""
+}
+
+run_backfill_fingerprint_bits() {
+    print_header "Backfill fingerprint bits column (precomputed 32-byte blobs)"
+    echo "Uses same pipeline as fingerprint_baseline extraction (main process, same DataLoader/encoder)."
+    echo ""
+    python "$SCRIPT" --stage backfill-fingerprint-bits --config "$CONFIG" "$@"
+    print_success "Backfill complete!"
     echo ""
 }
 
@@ -463,20 +515,34 @@ run_fingerprint_and_enrich() {
 
 # HPO functions
 run_encoder_hpo() {
-    local n_trials="${1:-$HPO_ENCODER_TRIALS}"
+    local n_trials="$HPO_ENCODER_TRIALS"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -N)
+                n_trials="${2:-$HPO_ENCODER_TRIALS}"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
 
     print_header "HPO Step 1: Encoder Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials (may take hours)..."
+    echo "  (If malloc crash in first batch: run backfill-fingerprint-bits, or EXPLR_HPO_ENCODER_BATCH_SIZE=24, or EXPLR_HPO_DISABLE_CHROMAPRINT=1)"
     echo ""
 
     # Backup config
     cp "$CONFIG" "${CONFIG}.hpo_backup"
     print_success "Config backup: ${CONFIG}.hpo_backup"
 
-    # Run tuning
+    # Run tuning (pass any remaining args through to Python, e.g. --reset-study)
+    # OMP_NUM_THREADS=1 reduces risk of malloc/OpenMP crashes in Docker; override by setting in env before calling
     HPO_LOG="/tmp/encoder_hpo.log"
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
     python "$SCRIPT" --stage tune-encoder --config "$CONFIG" \
-        --n-trials "$n_trials" 2>&1 | tee "$HPO_LOG"
+        --n-trials "$n_trials" "$@" 2>&1 | tee "$HPO_LOG"
 
     # Extract best params
     echo ""
@@ -488,16 +554,28 @@ run_encoder_hpo() {
 }
 
 run_classifier_hpo() {
-    local n_trials="${1:-$HPO_CLASSIFIER_TRIALS}"
+    local n_trials="$HPO_CLASSIFIER_TRIALS"
+    # Parse -N <num> from args (e.g. ./run_music_pipeline.sh hpo-classifier -N 10)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -N)
+                n_trials="${2:-$HPO_CLASSIFIER_TRIALS}"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
 
     print_header "Classifier Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials..."
     echo ""
 
-    # Run tuning
+    # Run tuning (pass any remaining args through to Python)
     HPO_LOG="/tmp/classifier_hpo.log"
     python "$SCRIPT" --stage tune-classifier --config "$CONFIG" \
-        --n-trials "$n_trials" 2>&1 | tee "$HPO_LOG"
+        --n-trials "$n_trials" "$@" 2>&1 | tee "$HPO_LOG"
 
     # Extract best params
     echo ""
@@ -543,7 +621,7 @@ display_ab_history() {
     fi
 
     print_header "A/B Test History"
-    python -c "
+    python << 'ABHISTEOF'
 import json
 from pathlib import Path
 from datetime import datetime
@@ -561,7 +639,7 @@ if history_dir.exists():
             try:
                 ts = datetime.strptime(ts_str, '%Y%m%d_%H%M%S')
                 date_str = ts.strftime('%Y-%m-%d %H:%M')
-            except:
+            except Exception:
                 date_str = ts_str
             classifier_stats = data.get('classifier_stats', {})
             ab = classifier_stats.get('metadata', {}).get('ab_test_result', {})
@@ -570,13 +648,15 @@ if history_dir.exists():
                     'date': date_str,
                     'train_size': classifier_stats.get('train_size', '-'),
                     'val_size': classifier_stats.get('val_size', '-'),
+                    'train_prevalence': classifier_stats.get('train_prevalence'),
+                    'val_prevalence': classifier_stats.get('val_prevalence'),
                     'n_samples': ab.get('n_samples', 0),
                     'improvement': ab.get('improvement', 0),
                     'p_value': ab.get('p_value', 1.0),
                     'significant': ab.get('significant', False),
                     'label': ''
                 })
-        except:
+        except Exception:
             pass
 
 # Check current prod model card
@@ -591,13 +671,15 @@ if Path('prod/model_card.json').exists():
                 'date': 'PROD',
                 'train_size': classifier_stats.get('train_size', '-'),
                 'val_size': classifier_stats.get('val_size', '-'),
+                'train_prevalence': classifier_stats.get('train_prevalence'),
+                'val_prevalence': classifier_stats.get('val_prevalence'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
                 'significant': ab.get('significant', False),
                 'label': '← current prod'
             })
-    except:
+    except Exception:
         pass
 
 # Check current training manifest (just trained model)
@@ -612,31 +694,44 @@ if Path('checkpoints/training_manifest.json').exists():
                 'date': 'NEW',
                 'train_size': metadata.get('train_size', '-'),
                 'val_size': metadata.get('val_size', '-'),
+                'train_prevalence': metadata.get('train_prevalence'),
+                'val_prevalence': metadata.get('val_prevalence'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
                 'significant': ab.get('significant', False),
                 'label': '← just trained'
             })
-    except:
+    except Exception:
         pass
 
+def fmt_prev(p):
+    if p is None:
+        return '-'
+    try:
+        return f'{float(p)*100:.1f}%'
+    except Exception:
+        return '-'
+
 if results:
-    print(f\"{'Date':<20} {'Train':>6} {'Val':>6} {'Vault':>6} {'Δ Accuracy':>11} {'p-value':>9} {'Sig?':>5}  Notes\")
-    print('-' * 85)
+    print(f"{'Date':<20} {'Train':>6} {'Val':>6} {'Vault@':>6} {'TrPrev':>7} {'ValPrev':>7} {'Δ Accuracy':>11} {'p-value':>9} {'Sig?':>5}  Notes")
+    print('-' * 99)
     for r in results:
         sig = '✓' if r['significant'] else ''
-        imp = f\"{r['improvement']:+.4f}\" if r['improvement'] != 0 else ' 0.0000'
+        imp = f"{r['improvement']:+.4f}" if r['improvement'] != 0 else ' 0.0000'
         train_str = str(r['train_size']) if r['train_size'] != '-' else '-'
         val_str = str(r['val_size']) if r['val_size'] != '-' else '-'
         vault_str = str(r['n_samples'])
-        print(f\"{r['date']:<20} {train_str:>6} {val_str:>6} {vault_str:>6} {imp:>11} {r['p_value']:>9.4f} {sig:>5}  {r['label']}\")
+        tr_prev = fmt_prev(r.get('train_prevalence'))
+        val_prev = fmt_prev(r.get('val_prevalence'))
+        print(f"{r['date']:<20} {train_str:>6} {val_str:>6} {vault_str:>6} {tr_prev:>7} {val_prev:>7} {imp:>11} {r['p_value']:>9.4f} {sig:>5}  {r['label']}")
     print()
     sig_count = sum(1 for r in results if r['significant'])
     print(f'Models in history: {len(results)} | Significant improvements: {sig_count}')
+    print("  Vault@ = vault size when that run's A/B test was done. When comparing two models, both are evaluated on the same current vault.")
 else:
     print('No A/B test results found.')
-"
+ABHISTEOF
     echo ""
 }
 
@@ -720,6 +815,22 @@ run_hpo_pipeline() {
     echo ""
 }
 
+run_full_hpo_pipeline() {
+    # Full pipeline: build-cache → encoder HPO → encoder train → classifier HPO → classifier train → joint-finetune → recommend → promote
+    print_header "FULL HPO PIPELINE (all --hpo)"
+    echo "Steps: build-cache → hpo-encoder → encoder (best) → hpo-classifier → classifier (best) → joint-finetune → recommend → promote-to-prod"
+    echo ""
+
+    run_build_cache
+    run_hpo_pipeline
+    run_joint_finetune "${EXTRA_ARGS[@]}"
+    run_recommend
+    run_promote_to_prod
+
+    print_header "FULL HPO PIPELINE COMPLETE!"
+    echo ""
+}
+
 run_quick_test() {
     print_header "Quick Test Mode"
     TEMP_CONFIG="/tmp/music_moco_quick.yaml"
@@ -744,6 +855,7 @@ main() {
 
     # Collect extra arguments to pass through
     EXTRA_ARGS=()
+    ALL_HPO=0
 
     # Parse additional arguments
     while [[ $# -gt 0 ]]; do
@@ -788,6 +900,10 @@ main() {
                 EXTRA_ARGS+=("--exhaust")
                 shift
                 ;;
+            --hpo)
+                ALL_HPO=1
+                shift
+                ;;
             *)
                 # Collect unknown arguments to pass through to Python script
                 EXTRA_ARGS+=("$1")
@@ -800,18 +916,26 @@ main() {
 
     case "$STAGE" in
         all)
-            [ "${MIN_RATED_SONGS}" = "500" ] && export MIN_RATED_SONGS=60000
-            run_encoder "${EXTRA_ARGS[@]}"
-            run_classifier "${EXTRA_ARGS[@]}"
-            run_recommend
-            display_model_card
-            print_header "Pipeline Complete!"
+            if [ "${ALL_HPO:-0}" = "1" ]; then
+                run_full_hpo_pipeline
+            else
+                [ "${MIN_RATED_SONGS}" = "500" ] && export MIN_RATED_SONGS=60000
+                run_encoder "${EXTRA_ARGS[@]}"
+                run_classifier "${EXTRA_ARGS[@]}"
+                run_joint_finetune "${EXTRA_ARGS[@]}"
+                run_recommend
+                display_model_card
+                print_header "Pipeline Complete!"
+            fi
             ;;
         encoder)
             run_encoder "${EXTRA_ARGS[@]}"
             ;;
         classifier)
             run_classifier "${EXTRA_ARGS[@]}"
+            ;;
+        joint-finetune)
+            run_joint_finetune "${EXTRA_ARGS[@]}"
             ;;
         recommend)
             run_recommend "${EXTRA_ARGS[@]}"
@@ -832,13 +956,16 @@ main() {
             run_quick_test
             ;;
         build-cache)
-            run_build_cache
+            run_build_cache "${EXTRA_ARGS[@]}"
             ;;
         fingerprint)
             run_fingerprint "${EXTRA_ARGS[@]}"
             ;;
         fingerprint-stats)
             run_fingerprint_stats
+            ;;
+        backfill-fingerprint-bits)
+            run_backfill_fingerprint_bits "${EXTRA_ARGS[@]}"
             ;;
         enrich-metadata)
             run_enrich_metadata "${EXTRA_ARGS[@]}"
@@ -853,30 +980,14 @@ main() {
             run_hpo_pipeline
             ;;
         hpo-encoder)
-            run_encoder_hpo
+            run_encoder_hpo "${EXTRA_ARGS[@]}"
             ;;
         hpo-classifier)
-            run_classifier_hpo
+            run_classifier_hpo "${EXTRA_ARGS[@]}"
             ;;
         clear-cache)
-            print_header "Clearing Waveform Cache"
-            CACHE_DIR="./cache"
-            if [ -d "$CACHE_DIR" ]; then
-                CACHE_SIZE=$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)
-                CACHE_FILES=$(find "$CACHE_DIR" -name "*.npy" 2>/dev/null | wc -l)
-                echo "Cache directory: $CACHE_DIR"
-                echo "Size: $CACHE_SIZE ($CACHE_FILES files)"
-                read -p "Delete cache? [y/N] " -n 1 -r
-                echo
-                if [[ $REPLY =~ ^[Yy]$ ]]; then
-                    rm -rf "$CACHE_DIR"
-                    print_success "Cache cleared!"
-                else
-                    print_warning "Cache not deleted"
-                fi
-            else
-                print_warning "No cache found at $CACHE_DIR"
-            fi
+            print_header "Clearing Waveform Chunk Cache (preserves fingerprint DB)"
+            python "$SCRIPT" --stage clear-chunk-cache --config "$CONFIG"
             ;;
         model-card)
             display_model_card
@@ -886,37 +997,40 @@ main() {
             ;;
         cache-stats)
             print_header "Cache Statistics"
-            python -c "
+            python << 'PYEOF'
 from ml_skeleton.music.chunk_cache import get_cache_stats
 stats = get_cache_stats()
 if stats['exists']:
-    print(f'  Directory: {stats[\"cache_dir\"]}')
-    print(f'  Files: {stats[\"num_files\"]}')
-    print(f'  Songs: {stats[\"num_songs\"]}')
-    print(f'  Size: {stats[\"size_gb\"]:.2f} GB')
+    print(f'  Directory: {stats["cache_dir"]}')
+    print(f'  Files: {stats["num_files"]}')
+    print(f'  Songs: {stats["num_songs"]}')
+    print(f'  Size: {stats["size_gb"]:.2f} GB')
 else:
     print('  No cache found')
-"
+PYEOF
             ;;
         *)
-            echo "Usage: $0 {all|encoder|classifier|recommend|quick|hpo|hpo-encoder|hpo-classifier|build-cache|fingerprint|enrich|enrich-metadata|fingerprint-stats|musicbrainz-stats|clear-cache|cache-stats|model-card|ab-history|promote-to-prod|sync-db} [options]"
+            echo "Usage: $0 {all|encoder|classifier|joint-finetune|recommend|quick|hpo|...} [options]"
             echo ""
             echo "Stages:"
-            echo "  all                 - Run complete pipeline (encoder + classifier + recommend)"
+            echo "  all                 - Run complete pipeline (encoder + classifier + [joint-finetune if enabled] + recommend)"
+            echo "  all --hpo            - Full HPO pipeline: build-cache → hpo-encoder → encoder (best) → hpo-classifier → classifier (best) → joint-finetune → recommend → promote"
             echo "  encoder             - Train MoCo v2 + Genre BCE encoder"
             echo "  classifier          - Train rating classifier"
+            echo "  joint-finetune      - Unfreeze encoder+classifier, train on audio→rating (run after classifier; requires joint_finetune.enabled)"
             echo "  recommend           - Generate recommendations"
             echo "  quick               - Quick test (5 epochs, 500 songs)"
             echo "  hpo                 - Full hyperparameter optimization (encoder + classifier)"
-            echo "  hpo-encoder         - Hyperparameter optimization for encoder only"
-            echo "  hpo-classifier      - Hyperparameter optimization for classifier only"
+            echo "  hpo-encoder         - Hyperparameter optimization for encoder only (-N trials, --reset-study; if malloc crash use EXPLR_HPO_DATALOADER_WORKERS=0)"
+            echo "  hpo-classifier      - Hyperparameter optimization for classifier only (supports -N trials, --reps, --reset-study)"
             echo "  build-cache         - Build 4-chunk waveform cache (~30GB)"
             echo "  fingerprint         - Extract acoustic fingerprints from original files (for AcoustID)"
             echo "  enrich              - Complete pipeline: fingerprint + enrich + stats (recommended)"
             echo "  enrich-metadata     - Enrich metadata via AcoustID/MusicBrainz (requires API key)"
             echo "  fingerprint-stats   - Display fingerprint database statistics"
+            echo "  backfill-fingerprint-bits - Precompute bits column (run once so HPO can use chromaprints)"
             echo "  musicbrainz-stats   - Display MusicBrainz database statistics"
-            echo "  clear-cache         - Delete waveform cache"
+            echo "  clear-cache         - Delete waveform chunk cache only (keeps fingerprint DB)"
             echo "  cache-stats         - Show cache statistics"
             echo "  model-card          - Display model card"
             echo "  ab-history          - Show A/B test history from archived model cards"
@@ -928,22 +1042,33 @@ else:
             echo "  recommend --prod    - Generate recommendations using prod models"
             echo "  recommend --prod --low-rating-ratio 0.1  - Include 10% predicted dislikes"
             echo "  recommend --prod --genre rock           - Recommendations for rock songs only"
+            echo "  recommend --error-playlist-size 0        - Skip false_positives/false_negatives playlists"
             echo ""
             echo "Options:"
+            echo "  --encoder-type TYPE        - Encoder: use TYPE (e.g. moco). Required for encoder/hpo-encoder if config has encoder_type: fingerprint_baseline"
+            echo "  --reset-study             - HPO only: delete existing Optuna study and start fresh (tune-classifier / tune-encoder)"
             echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
+            echo "  --best-params PATH         - Path to best params JSON (from HPO)"
+            echo "  --mlflow-run-id ID         - Classifier: load hyperparameters from MLflow run (e.g. HPO parent run ID)"
             echo "  --encoder-version VERSION  - Encoder version for embeddings (e.g., v2)"
             echo "  --classifier-version VER   - Classifier version (e.g., v2)"
             echo "  --exhaust                  - Process max songs for the day (500 for free tier)"
+            echo "  --all                      - Fingerprint: process all missing songs (no max_songs limit)"
             echo "  --workers N                - Number of parallel workers for fingerprinting (default: 4)"
             echo "  --low-rating-ratio N       - Include N% predicted dislikes in recommendations (0.0-1.0)"
             echo "  --genre CATEGORY           - Filter recommendations by genre category"
+            echo "  --error-playlist-size N    - Max songs per false_positives/false_negatives playlist (0 = disable)"
             echo "                               Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world"
             echo "  --random-init              - Use random init instead of loading from prod model (default: prod init)"
-            echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 200)"
+            echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 1000)"
+            echo "  --hpo                      - With 'all': run full HPO pipeline (build-cache, encoder/clf HPO + train with best, joint-finetune, recommend, promote)"
             echo ""
             echo "Environment Variables:"
-            echo "  HPO_ENCODER_TRIALS=30"
-            echo "  HPO_CLASSIFIER_TRIALS=20"
+            echo "  HPO_ENCODER_TRIALS=30      - Number of encoder HPO trials"
+            echo "  HPO_CLASSIFIER_TRIALS=800  - Number of classifier HPO trials (default 800)"
+            echo "  EXPLR_HPO_DATALOADER_WORKERS=0 - Encoder HPO: use 0 dataloader workers"
+            echo "  EXPLR_HPO_DISABLE_CHROMAPRINT=1 - Encoder HPO: disable chromaprint loss (if malloc crash in first batch)"
+            echo "  --reps N                  - Repetitions per trial (different init seeds); best value and seed reported"
             echo "  RESUME_CHECKPOINT=/path/to   - Resume from checkpoint"
             echo "  ENCODER_VERSION=v2           - Encoder version for embeddings"
             echo "  CLASSIFIER_VERSION=v2        - Classifier version"
@@ -966,7 +1091,9 @@ else:
             echo "  $0 all                                  # Run complete pipeline"
             echo "  $0 encoder                              # Train encoder only"
             echo "  HPO_ENCODER_TRIALS=50 $0 hpo            # Run HPO with 50 encoder trials"
+            echo "  EXPLR_HPO_DISABLE_CHROMAPRINT=1 EXPLR_HPO_DATALOADER_WORKERS=0 $0 hpo-encoder -N 30 --encoder-type moco --reset-study  # If malloc in first batch"
             echo "  $0 fingerprint --workers 8              # Fingerprint with 8 parallel workers"
+            echo "  $0 fingerprint --workers 2 --all       # Fingerprint all missing songs (2 workers)"
             echo "  ACOUSTID_API_KEY=key $0 enrich          # Fingerprint + enrich + stats (10 songs)"
             echo "  ACOUSTID_API_KEY=key $0 enrich --exhaust --workers 8 # Process 500 songs with 8 workers"
             echo ""

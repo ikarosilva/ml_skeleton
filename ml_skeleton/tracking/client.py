@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 import mlflow
+from mlflow.tracking import MlflowClient
+from mlflow.utils.mlflow_tags import MLFLOW_PARENT_RUN_ID, MLFLOW_RUN_NAME
 
 
 class ExplrTracker:
@@ -44,6 +46,7 @@ class ExplrTracker:
         run_id: Optional[str] = None,
         run_name: Optional[str] = None,
         nested: bool = False,
+        parent_run_id: Optional[str] = None,
     ):
         """
         Initialize the tracker.
@@ -54,18 +57,41 @@ class ExplrTracker:
             run_id: Optional existing run ID to resume
             run_name: Optional name for the run
             nested: Whether this is a nested run (for tuning trials)
+            parent_run_id: Optional parent run ID for nested runs (ensures nesting
+                even when no active run in current thread, e.g. HPO trials).
         """
         self._tracking_uri = tracking_uri
         self._experiment_name = experiment_name
         self._run_id = run_id
         self._run_name = run_name
         self._nested = nested
+        self._parent_run_id = parent_run_id
         self._active_run = None
 
     def __enter__(self) -> "ExplrTracker":
         """Start the MLflow run."""
         mlflow.set_tracking_uri(self._tracking_uri)
-        mlflow.set_experiment(self._experiment_name)
+        # HPO nesting: when nested and parent_run_id are set, create child via client with
+        # MLFLOW_PARENT_RUN_ID tag (so UI shows hierarchy), then resume as active run with
+        # nested=True (required because parent is still active in this thread).
+        if self._nested and self._parent_run_id:
+            mlflow.set_experiment(self._experiment_name)
+            client = MlflowClient()
+            parent_run = client.get_run(self._parent_run_id)
+            experiment_id = parent_run.info.experiment_id
+            tags = {MLFLOW_PARENT_RUN_ID: self._parent_run_id}
+            if self._run_name:
+                tags[MLFLOW_RUN_NAME] = self._run_name
+            child_run = client.create_run(
+                experiment_id=experiment_id,
+                run_name=self._run_name,
+                tags=tags,
+            )
+            # Parent run is still active in this thread; resume child as nested run
+            self._active_run = mlflow.start_run(run_id=child_run.info.run_id, nested=True)
+            return self
+        if not self._nested or mlflow.active_run() is None:
+            mlflow.set_experiment(self._experiment_name)
 
         if self._run_id:
             self._active_run = mlflow.start_run(
@@ -83,6 +109,29 @@ class ExplrTracker:
         if self._active_run:
             mlflow.end_run()
         return False
+
+    def create_child_tracker(self, run_name: str) -> "ExplrTracker":
+        """
+        Create a tracker for a nested child run (e.g. one seed run inside an HPO trial).
+
+        Must be called while this tracker's run is active (e.g. inside ``with ctx.tracker:``).
+        The returned tracker should be used in a ``with child_tracker:`` block so the child
+        run is started and ended correctly.
+
+        Args:
+            run_name: Name for the child run (e.g. ``seed_42`` or ``rep_1``).
+
+        Returns:
+            New ExplrTracker configured as a nested child of the current run.
+        """
+        parent_id = self.run_id
+        return ExplrTracker(
+            tracking_uri=self._tracking_uri,
+            experiment_name=self._experiment_name,
+            run_name=run_name,
+            nested=True,
+            parent_run_id=parent_id,
+        )
 
     @property
     def run_id(self) -> str:

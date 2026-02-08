@@ -84,7 +84,7 @@ class TrainingResult:
 
     Example:
         return TrainingResult(
-            primary_metric=best_val_loss,
+            primary_metric=val_loss,
             primary_metric_name="val_loss",
             minimize=True,
             metrics={

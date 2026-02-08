@@ -51,7 +51,7 @@ class ModelCardGenerator:
                 - training_time_seconds: Total training time
                 - final_train_loss: Final training loss
                 - final_val_loss: Final validation loss
-                - best_val_loss: Best validation loss achieved
+                - val_loss: Validation loss at saved checkpoint
                 - best_epoch: Epoch with best validation loss
                 - total_songs: Total songs in training set
                 - total_artists: Number of unique artists
@@ -70,7 +70,7 @@ class ModelCardGenerator:
                 - training_time_seconds: Total training time
                 - final_train_loss: Final training loss
                 - final_val_loss: Final validation loss
-                - best_val_loss: Best validation loss achieved
+                - val_loss: Validation loss at saved checkpoint
                 - best_epoch: Epoch with best validation loss
                 - total_rated_songs: Total rated songs
                 - total_artists: Number of unique artists (rated songs only)
@@ -297,7 +297,7 @@ Songs were excluded based on the following criteria:
             f"- **Training time:** {training_time_hours:.2f} hours",
             f"- **Final training loss:** {stats.get('final_train_loss', 'N/A'):.6f}",
             f"- **Final validation loss:** {stats.get('final_val_loss', 'N/A'):.6f}",
-            f"- **Best validation loss:** {stats.get('best_val_loss', 'N/A'):.6f} (epoch {stats.get('best_epoch', 'N/A')})",
+            f"- **Validation loss (saved checkpoint):** {stats.get('val_loss', stats.get('best_val_loss', 'N/A')):.6f} (epoch {stats.get('best_epoch', 'N/A')})",
             "",
             "### Training Data Statistics",
             "",
@@ -357,7 +357,7 @@ Songs were excluded based on the following criteria:
             f"- **Training time:** {training_time_hours:.2f} hours",
             f"- **Final training loss (MSE):** {stats.get('final_train_loss', 'N/A'):.6f}",
             f"- **Final validation loss (MSE):** {stats.get('final_val_loss', 'N/A'):.6f}",
-            f"- **Best validation loss:** {stats.get('best_val_loss', 'N/A'):.6f} (epoch {stats.get('best_epoch', 'N/A')})",
+            f"- **Validation loss (saved checkpoint):** {stats.get('val_loss', stats.get('best_val_loss', 'N/A')):.6f} (epoch {stats.get('best_epoch', 'N/A')})",
             "",
             "### Training Data Statistics (Rated Songs Only)",
             "",

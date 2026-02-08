@@ -30,19 +30,25 @@ Usage:
     # Or manually apply best params from tuning:
     python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml \
         --final-training --best-params checkpoints/best_encoder_params.json
+
+    # Classifier: load hyperparameters from an MLflow run (e.g. classifier HPO parent run ID):
+    python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml \
+        --final-training --mlflow-run-id a985c318e2b1434abd04864cdcdaa4c4
 """
 
 import argparse
-import sys
+import json
 import os
 import shutil
+import sys
+
 import numpy as np
 from pathlib import Path
 from typing import Optional
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 import yaml
 
 # Add parent directory to path for imports
@@ -58,16 +64,19 @@ from ml_skeleton.music.encoder_factory import (
     create_dataset,
     create_optimizer,
     get_encoder_type,
+    get_fingerprint_db_path,
+    get_chunk_cache_dir,
     get_mlflow_tags
 )
 from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
-from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists
+from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists, export_to_xspf
 from ml_skeleton.training.encoder_trainer import EncoderTrainer
 from ml_skeleton.training.classifier_trainer import (
     ClassifierTrainer,
     get_encoder_version_from_checkpoint,
     validate_model_compatibility
 )
+from ml_skeleton.training.joint_finetune_trainer import JointFinetuneTrainer
 from ml_skeleton.music.model_card import ModelCardGenerator
 from ml_skeleton.music.dataset_stats import (
     collect_preprocessing_stats,
@@ -75,13 +84,13 @@ from ml_skeleton.music.dataset_stats import (
     collect_training_stats
 )
 from ml_skeleton.music.training_manifest import TrainingManifest
-from ml_skeleton.music.ab_testing import run_ab_test, format_ab_test_summary
+from ml_skeleton.music.ab_testing import run_ab_test, format_ab_test_summary, ab_result_to_mlflow_metrics
 
 # Framework imports for hyperparameter tuning and MLflow tracking
 from ml_skeleton import TrainingContext, TrainingResult, ExperimentConfig, run_experiment
 from ml_skeleton.core.config import TunerType
 from ml_skeleton.tracking import ExplrTracker, MLflowServer
-from ml_skeleton.utils.memory import cleanup_memory
+from ml_skeleton.utils.memory import cleanup_memory, limit_gpu_memory
 
 
 def load_config(config_path: str) -> dict:
@@ -100,6 +109,164 @@ def load_config(config_path: str) -> dict:
         config['music']['database_path'] = env_db_path
 
     return config
+
+
+def _parse_mlflow_param_value(value: str):
+    """Parse MLflow param string to int/float/bool/list/dict or leave as str."""
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if s.lower() == "true":
+        return True
+    if s.lower() == "false":
+        return False
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return value
+
+
+def get_mlflow_run_name(tracking_uri: str, run_id: str) -> str:
+    """Return display name for an MLflow run (run_name, tag, or run_id prefix)."""
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    mlflow.set_tracking_uri(tracking_uri)
+    client = MlflowClient()
+    run = client.get_run(run_id)
+    if getattr(run.info, "run_name", None):
+        return run.info.run_name or ""
+    return run.data.tags.get("mlflow.runName", run_id[:8] if run_id else "")
+
+
+def load_classifier_params_from_mlflow_run(tracking_uri: str, run_id: str) -> tuple[dict, str]:
+    """Load classifier hyperparameters from an MLflow run (e.g. classifier HPO parent run).
+
+    Supports both HPO parent runs (params like best_learning_rate, best_dropout, ...)
+    and trial runs (learning_rate, dropout, ...). Skips non-hyperparameter keys.
+
+    Returns:
+        Tuple of (params_dict, run_name). params_dict is suitable for config['classifier'].
+    """
+    import mlflow
+    from mlflow.tracking import MlflowClient
+
+    mlflow.set_tracking_uri(tracking_uri)
+    client = MlflowClient()
+    run = client.get_run(run_id)
+    params = run.data.params or {}
+    skip_keys = {"n_trials", "sampler", "pruner", "n_completed_trials", "best_trial_number", "hpo_mlflow_run_id", "hpo_mlflow_run_name"}
+    result = {}
+    for key, value in params.items():
+        if key in skip_keys:
+            continue
+        if key.startswith("best_"):
+            config_key = key[5:]
+        else:
+            config_key = key
+        result[config_key] = _parse_mlflow_param_value(value)
+    run_name = getattr(run.info, "run_name", None) or run.data.tags.get("mlflow.runName", run_id[:8] if run_id else "")
+    return result, run_name
+
+
+def get_hpo_val_roc_auc(config: dict, tracking_uri: Optional[str] = None) -> Optional[float]:
+    """Get HPO best val ROC AUC from config (from best params JSON) or from MLflow.
+
+    Tries in order: (1) config key hpo_val_roc_auc, (2) run metric best_val_roc_auc,
+    (3) max roc_auc among child runs, (4) run's own roc_auc (when run_id is a trial run).
+    Returns None if not available.
+    """
+    clf = config.get("classifier", {})
+    v = clf.get("hpo_val_roc_auc")
+    if v is not None:
+        return float(v)
+    run_id = clf.get("hpo_mlflow_run_id")
+    if not run_id:
+        return None
+    uri = tracking_uri or config.get("mlflow", {}).get("tracking_uri", "http://localhost:5000")
+    err_msg = None
+    try:
+        import mlflow
+        from mlflow.tracking import MlflowClient
+        mlflow.set_tracking_uri(uri)
+        client = MlflowClient(tracking_uri=uri)
+        run = client.get_run(run_id)
+        m = run.data.metrics or {}
+        v = m.get("best_val_roc_auc")
+        if v is not None:
+            return float(v)
+        # Fallback: get max roc_auc from child runs (HPO parent run; children are trials)
+        from mlflow.entities import ViewType
+        child_runs = client.search_runs(
+            experiment_ids=[run.info.experiment_id],
+            filter_string=f'tags."mlflow.parentRunId" = "{run_id}"',
+            run_view_type=ViewType.ALL,
+            max_results=500,
+        )
+        roc_aucs = []
+        for r in child_runs:
+            roc = (r.data.metrics or {}).get("roc_auc")
+            if roc is not None:
+                roc_aucs.append(float(roc))
+        if roc_aucs:
+            return max(roc_aucs)
+        # Fallback: run_id may be a trial run (no children); use this run's roc_auc
+        v = m.get("roc_auc")
+        if v is not None:
+            return float(v)
+        return None
+    except Exception as e:
+        err_msg = str(e)
+        return None
+    finally:
+        if err_msg is not None and run_id:
+            print(f"  (Could not fetch HPO ROC AUC from MLflow run {run_id[:8]}...: {err_msg})")
+
+
+def _report_and_log_hpo_vs_final_roc_auc(
+    config: dict,
+    hpo_val_roc_auc: Optional[float],
+    final_val_roc_auc: Optional[float],
+    classifier_mlflow_run_id: Optional[str],
+) -> None:
+    """Report HPO vs final val ROC AUC at end of classifier --final-training; log to MLflow."""
+    if hpo_val_roc_auc is None and final_val_roc_auc is None:
+        return
+    tracking_uri = config.get("mlflow", {}).get("tracking_uri", "http://localhost:5000")
+    print("\n" + "=" * 60)
+    print("HPO vs FINAL TRAINING (val ROC AUC)")
+    print("=" * 60)
+    if hpo_val_roc_auc is not None:
+        print(f"  HPO best val ROC AUC:  {hpo_val_roc_auc:.6f}")
+    else:
+        print("  HPO best val ROC AUC:  (not available — use --best-params or --mlflow-run-id from tune-classifier)")
+    if final_val_roc_auc is not None:
+        print(f"  Final val ROC AUC:     {final_val_roc_auc:.6f}")
+    if hpo_val_roc_auc is not None and final_val_roc_auc is not None:
+        diff = final_val_roc_auc - hpo_val_roc_auc
+        print(f"  Difference (final−HPO): {diff:+.6f}")
+        if final_val_roc_auc < hpo_val_roc_auc:
+            print("\n  ⚠ WARNING: Final model has LOWER val ROC AUC than the HPO best run.")
+            print("  Consider re-running HPO or checking data/split consistency.")
+        if classifier_mlflow_run_id:
+            try:
+                from mlflow.tracking import MlflowClient
+                client = MlflowClient(tracking_uri=tracking_uri)
+                client.log_metric(classifier_mlflow_run_id, "hpo_val_roc_auc", hpo_val_roc_auc)
+                client.log_metric(classifier_mlflow_run_id, "final_val_roc_auc", final_val_roc_auc)
+                client.log_metric(classifier_mlflow_run_id, "roc_auc_diff_final_minus_hpo", diff)
+            except Exception:
+                pass
+    print("=" * 60)
 
 
 def apply_hyperparameters_to_config(config: dict, hyperparameters: dict, stage: str) -> dict:
@@ -152,6 +319,8 @@ _hpo_best_trial: int = -1
 # Global tracking for HPO best trial (classifier)
 _hpo_classifier_best_value: float = float('inf')
 _hpo_classifier_best_trial: int = -1
+# Per-trial best init seed when reps > 1 (trial_number -> seed)
+_trial_best_reps_seed: dict = {}
 
 
 def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs: int = 1):
@@ -190,11 +359,40 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs
             stage='encoder'
         )
 
+        # Optional: disable chromaprint loss during HPO to avoid malloc/C library crash in first batch
+        if os.environ.get("EXPLR_HPO_DISABLE_CHROMAPRINT") == "1":
+            config["encoder"]["chromaprint_loss_weight"] = 0
+            print("  HPO: chromaprint loss disabled (EXPLR_HPO_DISABLE_CHROMAPRINT=1)")
+
+        # Optional: smaller encoder batch size during HPO to reduce chromaprint/malloc pressure in first batch
+        _hpo_batch = os.environ.get("EXPLR_HPO_ENCODER_BATCH_SIZE")
+        if _hpo_batch is not None:
+            try:
+                config["encoder"]["batch_size"] = int(_hpo_batch)
+                print(f"  HPO: encoder batch_size overridden to {config['encoder']['batch_size']} (EXPLR_HPO_ENCODER_BATCH_SIZE)")
+            except ValueError:
+                pass
+
+        # If chromaprint loss is on but fingerprint DB has no precomputed bits, disable chromaprint to avoid malloc/free crash
+        if config["encoder"].get("chromaprint_loss_weight", 0) > 0:
+            from ml_skeleton.music.fingerprint_db import FingerprintDB
+            from ml_skeleton.music.encoder_factory import get_fingerprint_db_path
+            fp_path = get_fingerprint_db_path(config)
+            if Path(fp_path).exists():
+                try:
+                    _fp_db = FingerprintDB(fp_path)
+                    _missing = _fp_db.count_missing_bits()
+                    if _missing > 0:
+                        config["encoder"]["chromaprint_loss_weight"] = 0
+                        print(f"  HPO: chromaprint loss disabled: {_missing} fingerprints have no precomputed 'bits' (run: ./run_music_pipeline.sh backfill-fingerprint-bits)")
+                except Exception:
+                    pass
+
         # Override device if provided by context
         if ctx.device:
             config['device'] = ctx.device
 
-        # Multi-run HPO: run multiple times with different seeds, use best (min) loss
+        # Multi-run HPO: run multiple times with different seeds, nested as child runs under this trial
         # NOTE: config['seed'] stays constant for train/val split consistency across trials
         if hpo_runs > 1:
             base_seed = config.get('seed', 42)
@@ -206,19 +404,23 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs
                 training_seed = base_seed + run_idx * 1000  # Different seed for model init/training
 
                 if run_idx == 0:
-                    print(f"  HPO multi-run: {hpo_runs} runs per trial (objective = min loss, split fixed)")
+                    print(f"  HPO multi-run: {hpo_runs} runs per trial (nested under trial, objective = min loss)")
 
-                model_card = train_encoder(
-                    config,
-                    model_card=_global_model_card,
-                    skip_embeddings=True,
-                    trial_info=trial_info,
-                    verbose=False,
-                    training_seed=training_seed  # Only model init varies, split stays constant
-                )
+                # Nest each seed run as a child MLflow run under this trial
+                child_tracker = ctx.tracker.create_child_tracker(run_name=f"seed_{training_seed}")
+                with child_tracker:
+                    model_card = train_encoder(
+                        config,
+                        model_card=_global_model_card,
+                        skip_embeddings=True,
+                        trial_info=trial_info,
+                        verbose=False,
+                        training_seed=training_seed,
+                        mlflow_tracker=child_tracker,
+                    )
 
                 encoder_stats = model_card.encoder_stats
-                run_loss = encoder_stats.get('best_val_loss', encoder_stats.get('final_val_loss', float('inf')))
+                run_loss = encoder_stats.get('val_loss', encoder_stats.get('final_val_loss', float('inf')))
                 run_losses.append(run_loss)
                 print(f"    Run {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_loss={run_loss:.6f}")
 
@@ -244,7 +446,7 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs
 
             # Get best validation loss from encoder stats
             encoder_stats = model_card.encoder_stats
-            best_val_loss = encoder_stats.get('best_val_loss', encoder_stats.get('final_val_loss', float('inf')))
+            best_val_loss = encoder_stats.get('val_loss', encoder_stats.get('final_val_loss', float('inf')))
 
         # Track and report new best trials
         global _hpo_best_value, _hpo_best_trial
@@ -266,8 +468,11 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs
                 print(f"    Saved best HPO model to: {hpo_best_checkpoint}")
 
         # Log to MLflow (skip params during HPO - optuna_tuner already logged them)
-        # Only log metrics here
-        ctx.tracker.log_metric('best_val_loss', best_val_loss)
+        # Log seed used for this run; then metrics
+        seed_used = encoder_stats.get('training_seed')
+        if seed_used is not None:
+            ctx.tracker.log_param('training_seed', str(seed_used))
+        ctx.tracker.log_metric('val_loss', best_val_loss)
         ctx.tracker.log_metric('epochs_run', encoder_stats.get('epochs_run', 0))
         ctx.tracker.log_metric('training_time', encoder_stats.get('training_time_seconds', 0))
 
@@ -278,7 +483,7 @@ def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs
             metrics={
                 'final_train_loss': encoder_stats.get('final_train_loss', 0),
                 'final_val_loss': encoder_stats.get('final_val_loss', 0),
-                'best_val_loss': best_val_loss,
+                'val_loss': best_val_loss,
                 'best_epoch': encoder_stats.get('best_epoch', 0)
             },
             best_model_path=str(Path(config['checkpoint_dir']) / 'encoder_best.pt'),
@@ -324,90 +529,284 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
             stage='classifier'
         )
 
+        encoder_version = config.get('music', {}).get('encoder_version', 'default')
+        effective_batch = _effective_classifier_batch_size(config['classifier'], encoder_version)
+        suffix = " (fingerprint_baseline)" if encoder_version == 'fingerprint_baseline' else ""
+        print(f"  Effective batch size: {effective_batch}{suffix}")
+
         # Override device if provided by context
         if ctx.device:
             config['device'] = ctx.device
 
-        # Multi-run HPO: run multiple times with different seeds, use best (min) MAE
+        # When init_seed is in the search space, run a single trial with that seed (Optuna explores seed)
+        classifier_config = config.get('classifier', {})
+        search_space_params = config.get('tuning', {}).get('classifier_search_space', {}).get('parameters', {})
+        init_seed_in_space = 'init_seed' in search_space_params
+        hpo_init_seed = classifier_config.get('init_seed') if isinstance(classifier_config.get('init_seed'), (int, float)) else None
+        if init_seed_in_space and hpo_init_seed is not None:
+            training_seed = int(hpo_init_seed)
+            print(f"  HPO init_seed: {training_seed} (single run)")
+            model_card = train_classifier(
+                config,
+                model_card=_global_model_card,
+                trial_info=trial_info,
+                verbose=False,
+                training_seed=training_seed,
+                mlflow_tracker=ctx.tracker,
+            )
+            _global_model_card = model_card
+            classifier_stats = model_card.classifier_stats
+            best_val_loss = classifier_stats.get('val_loss', classifier_stats.get('final_val_loss', float('inf')))
+            best_val_mae = classifier_stats.get('val_mae', best_val_loss)
+            best_val_f1 = classifier_stats.get('val_f1')
+            best_val_rating_mse = classifier_stats.get('val_rating_mse')
+            best_val_rating_corr = classifier_stats.get('val_rating_corr')
+        # Multi-rep HPO: run multiple times with different init seeds, nested as child runs under this trial
         # NOTE: config['seed'] stays constant for train/val split consistency across trials
-        if hpo_runs > 1:
+        elif hpo_runs > 1:
+            global _trial_best_reps_seed
             base_seed = config.get('seed', 42)
+            hpo_metric = config.get('classifier', {}).get('hpo_metric', 'val_roc_auc')
+            use_f1_for_best = (hpo_metric == 'val_f1')
+            use_roc_auc_for_best = (hpo_metric == 'val_roc_auc')
             run_maes = []
+            run_f1s = []
+            run_roc_aucs = []
             best_run_idx = 0
             best_run_mae = float('inf')
+            best_run_f1 = -1.0
+            best_run_roc_auc = -1.0
+            best_run_model_card = None
 
             for run_idx in range(hpo_runs):
                 training_seed = base_seed + run_idx * 1000  # Different seed for model init/training
 
                 if run_idx == 0:
-                    print(f"  HPO multi-run: {hpo_runs} runs per trial (objective = min MAE, split fixed)")
+                    print(f"  HPO reps: {hpo_runs} reps per trial (nested under trial, best by {hpo_metric})")
 
-                model_card = train_classifier(
-                    config,
-                    model_card=_global_model_card,
-                    trial_info=trial_info,
-                    verbose=False,
-                    training_seed=training_seed  # Only model init varies, split stays constant
-                )
+                # Nest each seed run as a child MLflow run under this trial
+                child_tracker = ctx.tracker.create_child_tracker(run_name=f"seed_{training_seed}")
+                with child_tracker:
+                    model_card = train_classifier(
+                        config,
+                        model_card=_global_model_card,
+                        trial_info=trial_info,
+                        verbose=False,
+                        training_seed=training_seed,
+                        mlflow_tracker=child_tracker,
+                    )
 
                 classifier_stats = model_card.classifier_stats
-                run_mae = classifier_stats.get('val_mae', classifier_stats.get('best_val_loss', float('inf')))
+                run_mae = classifier_stats.get('val_mae', classifier_stats.get('val_loss', float('inf')))
+                run_f1 = classifier_stats.get('val_f1') or 0.0
+                run_roc_auc = classifier_stats.get('val_roc_auc') or 0.0
                 run_maes.append(run_mae)
-                print(f"    Run {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_mae={run_mae:.6f}")
+                run_f1s.append(run_f1)
+                run_roc_aucs.append(run_roc_auc)
+                if use_f1_for_best:
+                    print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_f1={run_f1:.6f}")
+                elif use_roc_auc_for_best:
+                    print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_roc_auc={run_roc_auc:.6f}")
+                else:
+                    print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_mae={run_mae:.6f}")
 
-                # Track best run
-                if run_mae < best_run_mae:
-                    best_run_mae = run_mae
-                    best_run_idx = run_idx
+                # Track best run by hpo_metric (max F1, max ROC AUC, or min MAE)
+                if use_f1_for_best:
+                    if run_f1 > best_run_f1:
+                        best_run_f1 = run_f1
+                        best_run_idx = run_idx
+                        best_run_model_card = model_card
+                elif use_roc_auc_for_best:
+                    if run_roc_auc > best_run_roc_auc:
+                        best_run_roc_auc = run_roc_auc
+                        best_run_idx = run_idx
+                        best_run_model_card = model_card
+                else:
+                    if run_mae < best_run_mae:
+                        best_run_mae = run_mae
+                        best_run_idx = run_idx
+                        best_run_model_card = model_card
 
-            # Use minimum MAE as objective (find best single model)
-            best_val_mae = np.min(run_maes)
-            print(f"    Best: {best_val_mae:.6f} (run {best_run_idx + 1}), Mean: {np.mean(run_maes):.6f} +/- {np.std(run_maes):.6f}")
-            _global_model_card = model_card
-            best_val_loss = best_val_mae  # Use MAE as loss for consistency
+            best_val_mae = run_maes[best_run_idx]
+            best_seed = base_seed + best_run_idx * 1000
+            if ctx.trial_number is not None:
+                _trial_best_reps_seed[ctx.trial_number] = best_seed
+            if use_f1_for_best:
+                print(f"    Best: val_f1={best_run_f1:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean F1: {np.mean(run_f1s):.6f} +/- {np.std(run_f1s):.6f}")
+            elif use_roc_auc_for_best:
+                print(f"    Best: val_roc_auc={best_run_roc_auc:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_roc_aucs):.6f} +/- {np.std(run_roc_aucs):.6f}")
+            else:
+                print(f"    Best: {best_val_mae:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_maes):.6f} +/- {np.std(run_maes):.6f}")
+            _global_model_card = best_run_model_card if best_run_model_card is not None else model_card
+            best_val_loss = best_run_model_card.classifier_stats.get('val_loss', best_val_mae) if best_run_model_card else best_val_mae
+            classifier_stats = _global_model_card.classifier_stats
+            best_val_f1 = classifier_stats.get('val_f1')
+            best_val_roc_auc = classifier_stats.get('val_roc_auc')
+            best_val_rating_mse = classifier_stats.get('val_rating_mse')
+            best_val_rating_corr = classifier_stats.get('val_rating_corr')
         else:
             # Single run (original behavior)
-            model_card = train_classifier(config, model_card=_global_model_card, trial_info=trial_info, verbose=False)
+            model_card = train_classifier(
+                config,
+                model_card=_global_model_card,
+                trial_info=trial_info,
+                verbose=False,
+                mlflow_tracker=ctx.tracker,
+            )
             _global_model_card = model_card
 
             # Get metrics from classifier stats
             classifier_stats = model_card.classifier_stats
-            best_val_loss = classifier_stats.get('best_val_loss', classifier_stats.get('final_val_loss', float('inf')))
+            best_val_loss = classifier_stats.get('val_loss', classifier_stats.get('final_val_loss', float('inf')))
+            best_val_mae = classifier_stats.get('val_mae', best_val_loss)
+            best_val_f1 = classifier_stats.get('val_f1')
+            best_val_roc_auc = classifier_stats.get('val_roc_auc')
+            best_val_rating_mse = classifier_stats.get('val_rating_mse')
+            best_val_rating_corr = classifier_stats.get('val_rating_corr')
 
-            # For classifier, we optimize MAE instead of loss
-            # Calculate best MAE from history if available
-            best_val_mae = best_val_loss  # Fallback
-            if 'val_mae' in classifier_stats:
-                best_val_mae = classifier_stats['val_mae']
+        # HPO objective: configurable via classifier.hpo_metric (default val_roc_auc)
+        hpo_metric = config.get('classifier', {}).get('hpo_metric', 'val_roc_auc')
+        if hpo_metric == 'val_loss':
+            # Minimize validation BCE loss (binary classifier)
+            primary_metric = best_val_loss
+            primary_metric_name = 'val_loss'
+            minimize = True
+            best_display = best_val_loss
+        elif hpo_metric == 'val_rating_mse' and best_val_rating_mse is not None:
+            primary_metric = best_val_rating_mse
+            primary_metric_name = 'val_rating_mse'
+            minimize = True
+            best_display = best_val_rating_mse
+        elif hpo_metric == 'val_rating_corr' and best_val_rating_corr is not None:
+            # Maximize correlation: Optuna minimizes, so primary_metric = 1 - corr
+            primary_metric = 1.0 - best_val_rating_corr
+            primary_metric_name = 'optuna_objective'  # Log minimized value; actual metric is val_rating_corr
+            minimize = True
+            best_display = best_val_rating_corr
+        elif hpo_metric == 'val_rating_corr_and_f1':
+            # Linear combination: maximize (w_corr * norm_corr + w_f1 * f1), minimize 1 - that
+            clf_cfg = config.get('classifier', {})
+            w_corr = clf_cfg.get('hpo_metric_corr_weight', 0.5)
+            w_f1 = clf_cfg.get('hpo_metric_f1_weight', 0.5)
+            total_w = w_corr + w_f1
+            if total_w > 0:
+                w_corr, w_f1 = w_corr / total_w, w_f1 / total_w
+            norm_corr = (best_val_rating_corr + 1.0) / 2.0 if best_val_rating_corr is not None else None  # [-1,1] -> [0,1]
+            combined = 0.0
+            if norm_corr is not None and best_val_f1 is not None:
+                combined = w_corr * norm_corr + w_f1 * best_val_f1
+                primary_metric = 1.0 - combined
+                primary_metric_name = 'optuna_objective'
+                minimize = True
+                best_display = combined
+            elif norm_corr is not None:
+                primary_metric = 1.0 - norm_corr
+                primary_metric_name = 'optuna_objective'
+                minimize = True
+                best_display = norm_corr
+            elif best_val_f1 is not None:
+                primary_metric = 1.0 - best_val_f1
+                primary_metric_name = 'optuna_objective'
+                minimize = True
+                best_display = best_val_f1
+            else:
+                primary_metric = best_val_mae
+                primary_metric_name = 'val_mae'
+                minimize = True
+                best_display = best_val_mae
+        elif hpo_metric == 'val_roc_auc' and best_val_roc_auc is not None:
+            # Maximize ROC AUC: Optuna minimizes, so primary_metric = 1 - ROC AUC. Log as optuna_objective.
+            primary_metric = 1.0 - best_val_roc_auc
+            primary_metric_name = 'optuna_objective'
+            minimize = True
+            best_display = best_val_roc_auc
+        elif hpo_metric == 'val_f1' and best_val_f1 is not None:
+            # Maximize F1: Optuna minimizes, so primary_metric = 1 - F1. Log as optuna_objective
+            # so MLflow doesn't show "val_f1" = (1 - F1); actual F1 is in val_f1.
+            primary_metric = 1.0 - best_val_f1
+            primary_metric_name = 'optuna_objective'
+            minimize = True
+            best_display = best_val_f1
+        else:
+            primary_metric = best_val_mae
+            primary_metric_name = 'val_mae'
+            minimize = True
+            best_display = best_val_mae
 
-        # Track and report new best trials
+        # Track and report new best trials (compare using same metric we optimize)
         global _hpo_classifier_best_value, _hpo_classifier_best_trial
-        if best_val_mae < _hpo_classifier_best_value:
-            _hpo_classifier_best_value = best_val_mae
+        if primary_metric < _hpo_classifier_best_value:
+            _hpo_classifier_best_value = primary_metric
             _hpo_classifier_best_trial = ctx.trial_number + 1 if ctx.trial_number is not None else 0
-            print(f"  ★ NEW BEST (Trial {_hpo_classifier_best_trial}): val_mae={best_val_mae:.6f}")
+            best_seed_for_trial = _trial_best_reps_seed.get(ctx.trial_number) if hpo_runs > 1 and ctx.trial_number is not None else None
+            seed_info = f", init_seed={best_seed_for_trial}" if best_seed_for_trial is not None else ""
+            display_name = hpo_metric if primary_metric_name == 'optuna_objective' else primary_metric_name
+            print(f"  ★ NEW BEST (Trial {_hpo_classifier_best_trial}): {display_name}={best_display:.6f}{seed_info}")
             print(f"    Parameters: lr={ctx.hyperparameters.get('learning_rate', 'N/A'):.2e}, "
                   f"dropout={ctx.hyperparameters.get('dropout', 'N/A')}, "
                   f"wd={ctx.hyperparameters.get('adam_weight_decay', 'N/A'):.2e}")
 
-        # Log to MLflow (skip params during HPO - optuna_tuner already logged them)
-        # Only log metrics here
-        ctx.tracker.log_metric('best_val_loss', best_val_loss)
-        ctx.tracker.log_metric('best_val_mae', best_val_mae)
+        # Log key fixed config and seed so runs are comparable in MLflow
+        cc = config.get('classifier', {})
+        seed_val = classifier_stats.get('training_seed')
+        ctx.tracker.log_params({
+            'training_label_noise': cc.get('training_label_noise', 0),
+            'fingerprint_noise_variance': cc.get('fingerprint_noise_variance', 0),
+            'hpo_metric': cc.get('hpo_metric', 'val_roc_auc'),
+            'training_seed': str(seed_val) if seed_val is not None else '',
+        })
+        # Log to MLflow (tuner already logged sampled hyperparameters) — final metrics at saved checkpoint only
+        ctx.tracker.log_metric('val_loss', best_val_loss)
+        ctx.tracker.log_metric('val_mae', best_val_mae)
+        if best_val_f1 is not None:
+            ctx.tracker.log_metric('val_f1', best_val_f1)
+        if best_val_rating_mse is not None:
+            ctx.tracker.log_metric('val_rating_mse', best_val_rating_mse)
+        if best_val_rating_corr is not None:
+            ctx.tracker.log_metric('val_rating_corr', best_val_rating_corr)
+        if primary_metric_name == 'val_rating_corr_and_f1':
+            ctx.tracker.log_metric('val_rating_corr_and_f1', best_display)
         ctx.tracker.log_metric('epochs_run', classifier_stats.get('epochs_run', 0))
         ctx.tracker.log_metric('training_time', classifier_stats.get('training_time_seconds', 0))
 
+        # Only include numeric metrics (MLflow rejects None)
+        metrics_dict = {
+            'final_train_loss': classifier_stats.get('final_train_loss', 0),
+            'final_val_loss': classifier_stats.get('final_val_loss', 0),
+            'val_loss': best_val_loss,
+            'val_mae': best_val_mae,
+            'best_epoch': classifier_stats.get('best_epoch', 0),
+        }
+        best_val_accuracy = classifier_stats.get('val_accuracy')
+        if best_val_accuracy is not None:
+            ctx.tracker.log_metric('val_accuracy', best_val_accuracy)
+            metrics_dict['val_accuracy'] = best_val_accuracy
+        best_val_precision = classifier_stats.get('val_precision')
+        if best_val_precision is not None:
+            ctx.tracker.log_metric('val_precision', best_val_precision)
+            ctx.tracker.log_metric('val_ppv', best_val_precision)
+            metrics_dict['val_precision'] = best_val_precision
+            metrics_dict['val_ppv'] = best_val_precision
+        best_val_recall = classifier_stats.get('val_recall')
+        if best_val_recall is not None:
+            ctx.tracker.log_metric('val_recall', best_val_recall)
+            metrics_dict['val_recall'] = best_val_recall
+        roc_auc = classifier_stats.get('val_roc_auc')  # ROC AUC at saved checkpoint
+        if roc_auc is not None:
+            ctx.tracker.log_metric('roc_auc', roc_auc)
+            metrics_dict['roc_auc'] = roc_auc
+        if best_val_f1 is not None:
+            metrics_dict['val_f1'] = best_val_f1
+        if best_val_rating_mse is not None:
+            metrics_dict['val_rating_mse'] = best_val_rating_mse
+        if best_val_rating_corr is not None:
+            metrics_dict['val_rating_corr'] = best_val_rating_corr
+
         return TrainingResult(
-            primary_metric=best_val_mae,
-            primary_metric_name='val_mae',
-            minimize=True,
-            metrics={
-                'final_train_loss': classifier_stats.get('final_train_loss', 0),
-                'final_val_loss': classifier_stats.get('final_val_loss', 0),
-                'best_val_loss': best_val_loss,
-                'best_val_mae': best_val_mae,
-                'best_epoch': classifier_stats.get('best_epoch', 0)
-            },
+            primary_metric=primary_metric,
+            primary_metric_name=primary_metric_name,
+            minimize=minimize,
+            metrics=metrics_dict,
             best_model_path=str(Path(config['checkpoint_dir']) / 'classifier_best.pt'),
             epochs_completed=classifier_stats.get('epochs_run', 0)
         )
@@ -437,7 +836,7 @@ def _perform_encoder_training_run(
     """Perform a single encoder training run with a specific seed.
 
     Returns:
-        dict with keys: best_val_loss, best_epoch, history, checkpoint_path, training_time
+        dict with keys: val_loss, best_epoch, history, checkpoint_path, training_time
     """
     import time
     import random
@@ -587,7 +986,7 @@ def _perform_encoder_training_run(
     cleanup_memory()
 
     return {
-        'best_val_loss': best_val_loss,
+        'val_loss': best_val_loss,
         'best_epoch': best_epoch,
         'epochs_run': epochs_run,
         'history': history,
@@ -606,7 +1005,8 @@ def train_encoder(
     resume_checkpoint: str = None,
     model_version_override: str = None,
     num_runs: int = 1,
-    training_seed: int = None
+    training_seed: int = None,
+    mlflow_tracker=None,
 ):
     """Stage 1: Train audio encoder.
 
@@ -622,6 +1022,8 @@ def train_encoder(
         num_runs: Number of training runs with different seeds (default: 1)
         training_seed: Seed for model init/training (if None, uses config seed).
                       Split always uses config seed for consistency across HPO trials.
+        mlflow_tracker: Optional MLflow tracker from HPO context (e.g. nested seed run).
+                       When set, logging uses this run; no new run is started.
 
     Returns:
         ModelCardGenerator with encoder statistics
@@ -679,11 +1081,13 @@ def train_encoder(
     # Store config in model card
     model_card.set_config(config)
 
-    # Initialize MLflow tracking
+    # Initialize MLflow tracking (use provided tracker when in HPO nested seed run)
     mlflow_config = config.get('mlflow', {})
     mlflow_enabled = mlflow_config.get('auto_start', True)
 
-    if False and mlflow_enabled:  # TODO DEBUG - disabled for now
+    if mlflow_tracker is not None:
+        tracker = mlflow_tracker
+    elif False and mlflow_enabled:  # TODO DEBUG - disabled for now
         # Start MLflow server if configured
         tracking_uri = mlflow_config.get('tracking_uri', 'http://localhost:5000')
         # Extract port from tracking_uri
@@ -750,9 +1154,54 @@ def train_encoder(
     encoder_type = get_encoder_type(config)
     use_moco = (encoder_type == "moco")
 
+    # Fingerprint-baseline: extraction only (no training). Saves chromaprint-derived "embeddings" for classifier ablation.
+    if encoder_type == "fingerprint_baseline":
+        if verbose:
+            print("\n[3/7] Fingerprint-baseline: extraction only (no training)...")
+        encoder = create_encoder(config)
+        loss_fn = create_loss_fn(config)
+        bl_config = encoder_config.get('fingerprint_baseline', {})
+        model_version = model_version_override or bl_config.get('encoder_version', 'fingerprint_baseline')
+        embedding_store = EmbeddingStore(music_config['embedding_db_path'])
+        extraction_dataset = create_dataset(
+            config=config,
+            songs=all_songs,
+            album_to_idx=album_to_idx,
+            filename_to_albums=filename_to_albums,
+            is_training=False,
+        )
+        from ml_skeleton.music.fingerprint_encoder import collate_fingerprint_baseline
+        num_workers = music_config.get('dataloader_workers', 4)
+        all_loader = DataLoader(
+            extraction_dataset,
+            batch_size=encoder_config.get('batch_size', 64),
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_fingerprint_baseline,
+        )
+        optimizer = torch.optim.Adam(encoder.parameters(), lr=1e-4)
+        trainer = EncoderTrainer(
+            encoder=encoder,
+            device=device,
+            loss_fn=loss_fn,
+            optimizer=optimizer,
+            embedding_store=embedding_store,
+            model_version=model_version,
+            tracker=None,
+            scheduler=None,
+        )
+        if verbose:
+            print("  Extracting chromaprint-derived embeddings...")
+        trainer.extract_embeddings(all_loader, save_to_store=True, use_moco=False)
+        if verbose:
+            print(f"  Saved to {music_config['embedding_db_path']} (model_version={model_version})")
+        return model_card
+
     # MoCo uses MoCoDataset (created by factory)
     if use_moco:
         from ml_skeleton.music.moco_dataset import MoCoDataset
+        if trial_info is not None:
+            print("[HPO] Creating MoCo dataset...", flush=True)
         full_dataset = create_dataset(
             config=config,
             songs=all_songs,
@@ -760,6 +1209,8 @@ def train_encoder(
             filename_to_albums=filename_to_albums,
             is_training=True
         )
+        if trial_info is not None:
+            print("[HPO] MoCo dataset created.", flush=True)
         if verbose:
             print(f"  Using MoCoDataset with chunk cache")
     else:
@@ -837,31 +1288,31 @@ def train_encoder(
             run_results.append({
                 'run': run_idx + 1,
                 'seed': run_seed,
-                'best_val_loss': result['best_val_loss'],
+                'val_loss': result['val_loss'],
                 'best_epoch': result['best_epoch'],
                 'epochs_run': result['epochs_run'],
                 'checkpoint_path': result['checkpoint_path'],
                 'training_time': result['training_time']
             })
 
-            print(f"\n  Run {run_idx + 1} complete: best_val_loss={result['best_val_loss']:.6f} (epoch {result['best_epoch']})")
+            print(f"\n  Run {run_idx + 1} complete: val_loss={result['val_loss']:.6f} (epoch {result['best_epoch']})")
 
         # Report multi-run statistics
-        losses = [r['best_val_loss'] for r in run_results]
+        losses = [r['val_loss'] for r in run_results]
         total_time = sum(r['training_time'] for r in run_results)
 
         print(f"\n{'='*60}")
         print("MULTI-RUN STATISTICS")
         print(f"{'='*60}")
         for r in run_results:
-            print(f"  Run {r['run']}: val_loss={r['best_val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
+            print(f"  Run {r['run']}: val_loss={r['val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
         print(f"\n  Mean: {np.mean(losses):.6f} +/- {np.std(losses):.6f}")
         print(f"  Min:  {np.min(losses):.6f}")
         print(f"  Max:  {np.max(losses):.6f}")
 
         # Identify and copy best model
-        best_run = min(run_results, key=lambda x: x['best_val_loss'])
-        print(f"\n  Best: Run {best_run['run']} (val_loss={best_run['best_val_loss']:.6f}, seed={best_run['seed']})")
+        best_run = min(run_results, key=lambda x: x['val_loss'])
+        print(f"\n  Best: Run {best_run['run']} (val_loss={best_run['val_loss']:.6f}, seed={best_run['seed']})")
 
         # Copy best run's checkpoint to encoder_best.pt
         best_checkpoint = checkpoint_dir / f"encoder_best.pt"
@@ -958,6 +1409,13 @@ def train_encoder(
 
     # Create data loaders with optimized parallel loading
     num_workers = music_config.get('dataloader_workers', 4)
+    # Avoid fork-related malloc crashes in Docker/HPO: set EXPLR_HPO_DATALOADER_WORKERS=0
+    if trial_info is not None:
+        _hpo_workers = os.environ.get("EXPLR_HPO_DATALOADER_WORKERS")
+        if _hpo_workers is not None:
+            num_workers = int(_hpo_workers)
+            if verbose:
+                print(f"  HPO: dataloader_workers overridden to {num_workers} (EXPLR_HPO_DATALOADER_WORKERS)")
 
     # Worker initialization function for reproducible DataLoader workers (use model_seed)
     def worker_init_fn(worker_id):
@@ -986,8 +1444,12 @@ def train_encoder(
         loader_kwargs['prefetch_factor'] = 8  # Increased for better GPU utilization
         loader_kwargs['persistent_workers'] = True
 
+    if trial_info is not None:
+        print("[HPO] Creating data loaders...", flush=True)
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_kwargs)
+    if trial_info is not None:
+        print("[HPO] Data loaders created.", flush=True)
 
     # Multi-task is only for simple encoder (not used with MoCo)
     use_multi_task = False
@@ -995,9 +1457,13 @@ def train_encoder(
     # Create model using factory
     if verbose:
         print("\n[4/7] Creating encoder model...")
+    if trial_info is not None:
+        print("[HPO] Creating encoder model...", flush=True)
 
     # Create MoCo encoder using factory
     encoder = create_encoder(config)
+    if trial_info is not None:
+        print("[HPO] Encoder model created.", flush=True)
     if verbose:
         print(f"  Using MoCoEncoder")
         moco_config = encoder_config.get('moco', {})
@@ -1111,11 +1577,15 @@ def train_encoder(
     # Train with time tracking and MLflow logging
     if verbose:
         print("\n[7/7] Training...")
+    if trial_info is not None:
+        print("[HPO] Starting training loop...", flush=True)
     training_start_time = time.time()
 
-    if tracker:
-        with tracker:
-            # Log configuration and hyperparameters
+    tracker_already_active = mlflow_tracker is not None
+
+    def _encoder_train_and_log():
+        nonlocal history, training_time
+        if tracker:
             tracker.log_params({
                 'stage': 'encoder',
                 'final_training': final_training,
@@ -1131,38 +1601,40 @@ def train_encoder(
                 'sample_rate': music_config['sample_rate'],
                 'crop_position': music_config.get('crop_position', 'end'),
                 'normalize': music_config.get('normalize', True),
+                'training_seed': str(model_seed),
             })
-
-            # Train
-            history = trainer.train(
-                train_loader=train_loader,
-                val_loader=val_loader,
-                num_epochs=num_epochs,
-                checkpoint_dir=config['checkpoint_dir'],
-                use_multi_task=use_multi_task,
-                use_augmentation=use_augmentation,
-                use_moco=True,
-                save_best_only=True,
-                early_stopping_patience=encoder_config.get('early_stopping_patience'),
-                early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
-                verbose=verbose,
-                start_epoch=start_epoch
-            )
-            training_time = time.time() - training_start_time
-
-            # Log final metrics to MLflow
+        history = trainer.train(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=num_epochs,
+            checkpoint_dir=config['checkpoint_dir'],
+            use_multi_task=use_multi_task,
+            use_augmentation=use_augmentation,
+            use_moco=True,
+            save_best_only=True,
+            early_stopping_patience=encoder_config.get('early_stopping_patience'),
+            early_stopping_min_delta=encoder_config.get('early_stopping_min_delta', 0.0),
+            verbose=verbose,
+            start_epoch=start_epoch
+        )
+        training_time = time.time() - training_start_time
+        if tracker:
             best_val_loss_mlflow = min(history['val_loss']) if history['val_loss'] else float('inf')
             final_train_loss_mlflow = history['train_loss'][-1] if history['train_loss'] else float('inf')
-
-            tracker.log_metric('best_val_loss', best_val_loss_mlflow)
+            tracker.log_metric('val_loss', best_val_loss_mlflow)
             tracker.log_metric('final_train_loss', final_train_loss_mlflow)
             tracker.log_metric('training_time_seconds', training_time)
             tracker.log_metric('epochs_completed', len(history['train_loss']))
-
-            # Log checkpoint as artifact
             checkpoint_path = Path(config['checkpoint_dir']) / 'encoder_best.pt'
             if checkpoint_path.exists():
                 tracker.log_artifact(str(checkpoint_path))
+
+    if tracker:
+        if tracker_already_active:
+            _encoder_train_and_log()
+        else:
+            with tracker:
+                _encoder_train_and_log()
     else:
         # Train without MLflow
         history = trainer.train(
@@ -1203,6 +1675,7 @@ def train_encoder(
         training_time_seconds=training_time,
         dataset_stats=dataset_stats
     )
+    encoder_stats['training_seed'] = model_seed
     model_card.set_encoder_stats(encoder_stats)
 
     # Extract embeddings (skip during HPO to save time)
@@ -1248,14 +1721,14 @@ def train_encoder(
             use_moco=True
         )
 
-        # Extract all 4 chunks per song into embedding_chunks (for classifier average)
+        # Extract all chunks per song into embedding_chunks (for classifier average)
         from ml_skeleton.music.moco_dataset import ChunkExtractionDataset
         chunk_cache_config = music_config.get('chunk_cache', {})
-        num_chunks = chunk_cache_config.get('num_chunks', 4)
+        num_chunks = chunk_cache_config.get('num_chunks', 8)
         crop_duration = encoder_config.get('augmentation', {}).get('crop_duration_max', 15.0)
         chunk_extraction_dataset = ChunkExtractionDataset(
             songs=all_songs,
-            cache_dir=chunk_cache_config.get('directory', './cache/chunks'),
+            cache_dir=get_chunk_cache_dir(config),
             num_chunks=num_chunks,
             sample_rate=music_config['sample_rate'],
             crop_duration=crop_duration
@@ -1297,6 +1770,8 @@ def _get_ratings_from_dataset(dataset) -> list:
     """
     from torch.utils.data import Subset
 
+    if isinstance(dataset, NoisyEmbeddingWrapper):
+        dataset = dataset.dataset
     if isinstance(dataset, Subset):
         # For Subset, access underlying dataset via indices
         underlying = dataset.dataset
@@ -1304,6 +1779,66 @@ def _get_ratings_from_dataset(dataset) -> list:
     else:
         # For EmbeddingDataset, use the method directly
         return dataset.get_all_ratings()
+
+
+def _effective_classifier_batch_size(classifier_config: dict, encoder_version: str) -> int:
+    """Use fingerprint_baseline_batch_size when training on chromaprint embeddings only."""
+    if encoder_version == "fingerprint_baseline" and classifier_config.get("fingerprint_baseline_batch_size") is not None:
+        return classifier_config["fingerprint_baseline_batch_size"]
+    return classifier_config["batch_size"]
+
+
+class NoisyEmbeddingWrapper(Dataset):
+    """Wraps a dataset and adds Gaussian noise N(0, variance) to the 'embedding' field in __getitem__.
+
+    Used so that noise is applied only to training data, not validation.
+    """
+
+    def __init__(self, dataset: Dataset, variance: float = 0.1, seed: Optional[int] = None):
+        self.dataset = dataset
+        self.variance = variance
+        self.seed = seed
+        self._std = np.sqrt(variance)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = self.dataset[idx]
+        out = {k: (v.clone() if isinstance(v, torch.Tensor) and v.is_floating_point() else v) for k, v in item.items()}
+        emb = out["embedding"]
+        if self.seed is not None:
+            np.random.seed(self.seed + idx)
+        noise = np.random.normal(0, self._std, size=emb.shape).astype(np.float32)
+        out["embedding"] = emb + torch.from_numpy(noise)
+        return out
+
+
+def _zscore_normalize_embeddings(embeddings_dict: dict) -> dict:
+    """Z-score normalize embeddings per dimension (mean=0, std=1) to improve classifier training.
+
+    Fingerprint (chromaprint) inputs are 0/1 binary with possibly low variance per dimension;
+    normalization gives the classifier inputs with consistent scale and can help avoid collapse.
+    Handles both (D,) and (num_chunks, D) shapes per key.
+    """
+    if not embeddings_dict:
+        return embeddings_dict
+    arrs = []
+    for v in embeddings_dict.values():
+        a = np.asarray(v, dtype=np.float32)
+        if a.ndim == 1:
+            arrs.append(a)
+        else:
+            arrs.append(a.reshape(-1, a.shape[-1]))
+    stack = np.vstack(arrs)
+    mean = np.mean(stack, axis=0)
+    std = np.std(stack, axis=0)
+    std[std == 0] = 1.0
+    out = {}
+    for k, v in embeddings_dict.items():
+        a = np.asarray(v, dtype=np.float32)
+        out[k] = ((a - mean) / std).astype(np.float32)
+    return out
 
 
 def _perform_classifier_training_run(
@@ -1323,7 +1858,9 @@ def _perform_classifier_training_run(
     verbose: bool = True,
     class_weight_strategy: str = "none",
     classification_mode: str = "regression",
-    init_from_prod: bool = True
+    init_from_prod: bool = True,
+    use_genre: bool = False,
+    genre_centroids: Optional[np.ndarray] = None,
 ) -> dict:
     """Perform a single classifier training run with a specific seed.
 
@@ -1334,9 +1871,11 @@ def _perform_classifier_training_run(
             - "inverse": Weight = N / (n_classes * count_i)
             - "sqrt_inverse": Weight = sqrt(N / (n_classes * count_i))
         init_from_prod: If True, initialize from prod/classifier_best.pt if architecture matches.
+        use_genre: If True, classifier receives 7-dim genre multi-hot (real or centroid-imputed).
+        genre_centroids: (7, D) centroids for imputing missing genre; saved in checkpoint.
 
     Returns:
-        dict with keys: best_val_loss, best_val_mae, best_epoch, history, checkpoint_path, training_time
+        dict with keys: val_loss, val_mae, best_epoch, history, checkpoint_path, training_time
     """
     import time
     import random
@@ -1362,6 +1901,18 @@ def _perform_classifier_training_run(
         generator=torch.Generator().manual_seed(run_seed)
     )
 
+    # Fingerprint baseline: add Gaussian noise to both train and val (val sees same regime as train)
+    noise_variance = classifier_config.get("fingerprint_noise_variance", 0.0)
+    if encoder_version == "fingerprint_baseline" and noise_variance > 0:
+        train_dataset = NoisyEmbeddingWrapper(
+            train_dataset, variance=noise_variance, seed=run_seed
+        )
+        val_dataset = NoisyEmbeddingWrapper(
+            val_dataset, variance=noise_variance, seed=run_seed + 1000000
+        )
+        if verbose:
+            print(f"  Fingerprint: Gaussian noise (variance={noise_variance}) applied to train and val")
+
     if verbose:
         print(f"  Train: {len(train_dataset)} songs")
         print(f"  Val: {len(val_dataset)} songs")
@@ -1369,9 +1920,10 @@ def _perform_classifier_training_run(
     # Compute class weights from training data if requested
     class_weights = None
     if class_weight_strategy != "none":
-        # Extract ratings from training dataset
+        # Extract ratings from training dataset (unwrap if NoisyEmbeddingWrapper)
+        train_subset = train_dataset.dataset if isinstance(train_dataset, NoisyEmbeddingWrapper) else train_dataset
         train_ratings = []
-        for idx in train_dataset.indices:
+        for idx in train_subset.indices:
             item = full_dataset[idx]
             train_ratings.append(item['rating'].item())
 
@@ -1387,10 +1939,12 @@ def _perform_classifier_training_run(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
+    batch_size = _effective_classifier_batch_size(classifier_config, encoder_version)
+
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=classifier_config['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
         num_workers=4,
         pin_memory=True,
@@ -1400,7 +1954,7 @@ def _perform_classifier_training_run(
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=classifier_config['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -1413,7 +1967,10 @@ def _perform_classifier_training_run(
     classifier = SimpleRatingClassifier(
         embedding_dim=embedding_dim,
         hidden_dims=classifier_config['hidden_dims'],
-        dropout=classifier_config['dropout']
+        dropout=classifier_config['dropout'],
+        use_genre=use_genre,
+        use_batch_norm=classifier_config.get('use_batch_norm', False),
+        use_residual=classifier_config.get('use_residual', False),
     )
 
     # Try to initialize from production model if requested
@@ -1449,12 +2006,19 @@ def _perform_classifier_training_run(
 
     # Create loss function based on classification mode
     if classification_mode == "binary":
-        # Compute pos_weight from training data for class imbalance
         train_labels = _get_ratings_from_dataset(train_dataset)
-        pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels)
-        loss_fn = BinaryRatingLoss(pos_weight=pos_weight)
+        binary_pos_weight = classifier_config.get('binary_pos_weight')
+        if binary_pos_weight is not None and isinstance(binary_pos_weight, (int, float)):
+            pos_weight = float(binary_pos_weight)
+            pos_weight_note = " (explicit binary_pos_weight)"
+        else:
+            use_pos_weight = classifier_config.get('binary_use_pos_weight', True)
+            pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels) if use_pos_weight else 1.0
+            pos_weight_note = (" (no upweight)" if not use_pos_weight else "")
+        middle_weight = classifier_config.get('binary_middle_loss_weight', 0.1)
+        loss_fn = BinaryRatingLoss(pos_weight=pos_weight, middle_weight=middle_weight)
         if verbose:
-            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}")
+            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}, middle_weight: {middle_weight}{pos_weight_note}")
     elif class_weights is not None:
         loss_fn = WeightedRatingLoss(class_weights=class_weights)
     else:
@@ -1485,20 +2049,37 @@ def _perform_classifier_training_run(
         tracker=tracker,
         encoder_version=encoder_version,
         classifier_version=classifier_version,
-        classification_mode=classification_mode
+        classification_mode=classification_mode,
+        genre_centroids=genre_centroids,
+        chunk_aggregation=classifier_config.get('chunk_aggregation', 'mean'),
+        clip_grad=classifier_config.get('clip_grad', False),
+        clip_grad_norm=classifier_config.get('clip_grad_norm', 1.0),
+        training_label_noise=classifier_config.get('training_label_noise', 0),
+        hpo_mlflow_run_id=classifier_config.get('hpo_mlflow_run_id'),
+        hpo_mlflow_run_name=classifier_config.get('hpo_mlflow_run_name'),
     )
 
-    # Train
+    # Train (use HPO metric for early stop/checkpoint when set)
+    hpo_metric = classifier_config.get('hpo_metric', 'val_roc_auc')
+    train_kwargs = {
+        'train_loader': train_loader,
+        'val_loader': val_loader,
+        'num_epochs': num_epochs,
+        'checkpoint_dir': str(checkpoint_dir),
+        'save_best_only': True,
+        'early_stopping_patience': classifier_config.get('early_stopping_patience'),
+        'early_stopping_min_delta': classifier_config.get('early_stopping_min_delta', 0.0),
+    }
+    if hpo_metric == 'val_rating_corr_and_f1':
+        train_kwargs['monitor_metric'] = 'val_rating_corr_and_f1'
+        train_kwargs['hpo_metric_corr_weight'] = classifier_config.get('hpo_metric_corr_weight', 0.5)
+        train_kwargs['hpo_metric_f1_weight'] = classifier_config.get('hpo_metric_f1_weight', 0.5)
+    elif hpo_metric == 'val_f1':
+        train_kwargs['monitor_metric'] = 'val_f1'
+    elif hpo_metric == 'val_roc_auc':
+        train_kwargs['monitor_metric'] = 'val_roc_auc'
     training_start_time = time.time()
-    history = trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        num_epochs=num_epochs,
-        checkpoint_dir=str(checkpoint_dir),
-        save_best_only=True,
-        early_stopping_patience=classifier_config.get('early_stopping_patience'),
-        early_stopping_min_delta=classifier_config.get('early_stopping_min_delta', 0.0)
-    )
+    history = trainer.train(**train_kwargs)
     training_time = time.time() - training_start_time
 
     # Calculate metrics
@@ -1521,8 +2102,8 @@ def _perform_classifier_training_run(
     cleanup_memory()
 
     return {
-        'best_val_loss': best_val_loss,
-        'best_val_mae': best_val_mae,
+        'val_loss': best_val_loss,
+        'val_mae': best_val_mae,
         'best_epoch': best_epoch,
         'epochs_run': epochs_run,
         'history': history,
@@ -1541,7 +2122,8 @@ def train_classifier(
     num_runs: int = 1,
     training_seed: int = None,
     init_from_prod: bool = True,
-    vault_size: int = 200
+    vault_size: int = 1000,
+    mlflow_tracker=None,
 ):
     """Stage 2: Train rating classifier.
 
@@ -1557,8 +2139,10 @@ def train_classifier(
                       Split always uses config seed for consistency across HPO trials.
         init_from_prod: If True (default), initialize from prod/classifier_best.pt if
                        architecture matches. If False, use random initialization.
-        vault_size: Number of ratings to reserve for A/B testing vault (default: 200).
+        vault_size: Number of ratings to reserve for A/B testing vault (default: 1000).
                    Vault files are never used for training, only for comparing models.
+        mlflow_tracker: Optional MLflow tracker from HPO context. When set, logging uses
+                       this run (caller already started it); no new run is started.
 
     Returns:
         ModelCardGenerator with complete statistics
@@ -1594,6 +2178,8 @@ def train_classifier(
         print("STAGE 2: CLASSIFIER TRAINING")
     print("=" * 80)
 
+    classifier_mlflow_run_id = None  # Set when single-run uses tracker; used to log A/B test metrics
+
     # Create or verify model card generator
     if model_card is None:
         print("  WARNING: No model card from encoder stage. Creating new one.")
@@ -1605,8 +2191,21 @@ def train_classifier(
     classifier_config = config['classifier']
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Select appropriate epoch count based on training mode
-    if final_training and 'final_training_epochs' in classifier_config:
+    # Select appropriate epoch count (fingerprint_baseline can use longer training)
+    encoder_version_for_epochs = music_config.get('encoder_version', 'v1')
+    if encoder_version_for_epochs == 'fingerprint_baseline' and (
+        classifier_config.get('fingerprint_baseline_epochs') is not None
+        or classifier_config.get('fingerprint_baseline_final_training_epochs') is not None
+    ):
+        if final_training and classifier_config.get('fingerprint_baseline_final_training_epochs') is not None:
+            num_epochs = classifier_config['fingerprint_baseline_final_training_epochs']
+            if verbose:
+                print(f"  Using fingerprint_baseline_final_training_epochs={num_epochs}")
+        else:
+            num_epochs = classifier_config.get('fingerprint_baseline_epochs', classifier_config['epochs'])
+            if verbose:
+                print(f"  Using fingerprint_baseline_epochs={num_epochs} (fingerprint_baseline)")
+    elif final_training and 'final_training_epochs' in classifier_config:
         num_epochs = classifier_config['final_training_epochs']
         if verbose:
             print(f"  Using final_training_epochs={num_epochs} for training with best hyperparameters")
@@ -1615,25 +2214,22 @@ def train_classifier(
         if verbose:
             print(f"  Using epochs={num_epochs} (HPO/regular training mode)")
 
-    # Initialize MLflow tracking
+    # Initialize MLflow tracking (use provided tracker when in HPO to avoid starting a second run)
     mlflow_config = config.get('mlflow', {})
     mlflow_enabled = mlflow_config.get('auto_start', True)
 
-    if False and mlflow_enabled:  # TODO DEBUG - disabled for now like encoder
+    if mlflow_tracker is not None:
+        tracker = mlflow_tracker
+    elif mlflow_enabled:
         # Start MLflow server if configured
         tracking_uri = mlflow_config.get('tracking_uri', 'http://localhost:5000')
-        # Extract port from tracking_uri
         port = int(tracking_uri.split(':')[-1].rstrip('/'))
-
-        mlflow_server = MLflowServer.ensure_running(
+        MLflowServer.ensure_running(
             port=port,
             backend_store_uri=mlflow_config.get('backend_store_uri', 'sqlite:///mlflow.db'),
             artifact_root=mlflow_config.get('artifact_location', './mlruns')
         )
-
-        # Create run name
         run_name = f"classifier_{'final' if final_training else 'regular'}_{int(time.time())}"
-
         tracker = ExplrTracker(
             tracking_uri=tracking_uri,
             experiment_name=mlflow_config.get('experiment_name', 'music_recommendation'),
@@ -1668,12 +2264,13 @@ def train_classifier(
         print("\n[2/6] Loading embeddings...")
     embedding_store = EmbeddingStore(music_config['embedding_db_path'])
 
-    # Get embeddings for all songs (prefer 4 chunks per song for classifier average)
+    # Get embeddings for all songs (num_chunks per song, default 8, for classifier average)
+    num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
     filenames = [s.filename for s in all_songs]
     embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
         model_version=music_config['encoder_version'],
-        num_chunks=4
+        num_chunks=num_chunks
     )
     if not embeddings_dict:
         embeddings_dict = embedding_store.get_embeddings_batch(
@@ -1684,34 +2281,68 @@ def train_classifier(
     if verbose:
         print(f"  Loaded {len(embeddings_dict)} embeddings")
 
+    # For fingerprint baseline: z-score normalize (noise is added only to training data in the train step)
+    encoder_version_for_norm = music_config.get("encoder_version", "v1")
+    if encoder_version_for_norm == "fingerprint_baseline" and classifier_config.get("normalize_fingerprint_embeddings", True):
+        embeddings_dict = _zscore_normalize_embeddings(embeddings_dict)
+        if verbose:
+            print("  Fingerprint embeddings: z-score normalized (per dimension)")
+
     # Check embedding dimension (support (4, D) per song)
     first_embedding = next(iter(embeddings_dict.values()))
     arr = np.asarray(first_embedding)
     embedding_dim = int(arr.shape[-1]) if arr.ndim > 1 else len(arr)
     if verbose:
-        print(f"  Embedding dimension: {embedding_dim}")
+        print(f"  Embedding dimension: {embedding_dim} (chunks per song: {num_chunks})")
 
     # Create dataset
     if verbose:
         print("\n[3/6] Creating dataset...")
 
-    # Get classification mode from config
+    # Get classification mode and genre options from config
     classification_mode = classifier_config.get('classification_mode', 'regression')
     binary_positive_threshold = classifier_config.get('binary_positive_threshold', 4.0)
     binary_negative_threshold = classifier_config.get('binary_negative_threshold', 2.0)
+    use_genre = classifier_config.get('use_genre', False)
+    genre_impute_top_k = classifier_config.get('genre_impute_top_k', 2)
+    genre_impute_min_votes = classifier_config.get('genre_impute_min_votes', 1)
 
+    # When use_genre: compute 7 category centroids from songs with genre (for imputing missing)
+    genre_centroids = None
+    if use_genre:
+        from ml_skeleton.music.genre_centroids import compute_genre_centroids
+        genre_centroids = compute_genre_centroids(
+            embeddings_dict,
+            all_songs,
+            encoder_version=music_config.get('encoder_version', 'v1'),
+        )
+        if verbose:
+            print(f"  Genre centroids: computed from songs with metadata (shape {genre_centroids.shape})")
+
+    binary_include_middle = classifier_config.get('binary_include_middle', False)
+    replace_embeddings_with_noise = classifier_config.get('replace_embeddings_with_noise', False)
     full_dataset = EmbeddingDataset(
         embeddings=embeddings_dict,
         songs=all_songs,
         only_rated=True,
         classification_mode=classification_mode,
         binary_positive_threshold=binary_positive_threshold,
-        binary_negative_threshold=binary_negative_threshold
+        binary_negative_threshold=binary_negative_threshold,
+        use_genre=use_genre,
+        genre_centroids=genre_centroids,
+        genre_impute_top_k=genre_impute_top_k,
+        genre_impute_min_votes=genre_impute_min_votes,
+        binary_include_middle=binary_include_middle,
+        replace_embeddings_with_noise=replace_embeddings_with_noise,
+        noise_seed=config.get('seed', 42),
     )
 
-    # Get version information (needed for multi-run)
+    # Get version information (needed for multi-run and checkpoint)
+    # When using fingerprint_baseline there is no encoder checkpoint; always use config so HPO works.
     encoder_checkpoint_path = Path(config['checkpoint_dir']) / "encoder_best.pt"
-    if encoder_checkpoint_path.exists():
+    if music_config.get('encoder_version') == 'fingerprint_baseline':
+        encoder_version = 'fingerprint_baseline'
+    elif encoder_checkpoint_path.exists():
         encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
     else:
         encoder_version = music_config.get('encoder_version', 'v1')
@@ -1751,38 +2382,40 @@ def train_classifier(
                 verbose=verbose,
                 class_weight_strategy=classifier_config.get('class_weight_strategy', 'none'),
                 classification_mode=classification_mode,
-                init_from_prod=init_from_prod
+                init_from_prod=init_from_prod,
+                use_genre=use_genre,
+                genre_centroids=genre_centroids,
             )
 
             run_results.append({
                 'run': run_idx + 1,
                 'seed': run_seed,
-                'best_val_loss': result['best_val_loss'],
-                'best_val_mae': result['best_val_mae'],
+                'val_loss': result['val_loss'],
+                'val_mae': result['val_mae'],
                 'best_epoch': result['best_epoch'],
                 'epochs_run': result['epochs_run'],
                 'checkpoint_path': result['checkpoint_path'],
                 'training_time': result['training_time']
             })
 
-            print(f"\n  Run {run_idx + 1} complete: best_val_mae={result['best_val_mae']:.6f} (epoch {result['best_epoch']})")
+            print(f"\n  Run {run_idx + 1} complete: val_mae={result['val_mae']:.6f} (epoch {result['best_epoch']})")
 
         # Report multi-run statistics
-        maes = [r['best_val_mae'] for r in run_results]
-        losses = [r['best_val_loss'] for r in run_results]
+        maes = [r['val_mae'] for r in run_results]
+        losses = [r['val_loss'] for r in run_results]
         total_time = sum(r['training_time'] for r in run_results)
 
         print(f"\n{'='*60}")
         print("MULTI-RUN STATISTICS")
         print(f"{'='*60}")
         for r in run_results:
-            print(f"  Run {r['run']}: val_mae={r['best_val_mae']:.6f}, val_loss={r['best_val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
+            print(f"  Run {r['run']}: val_mae={r['val_mae']:.6f}, val_loss={r['val_loss']:.6f} (epoch {r['best_epoch']}, seed={r['seed']})")
         print(f"\n  MAE  - Mean: {np.mean(maes):.6f} +/- {np.std(maes):.6f}, Min: {np.min(maes):.6f}, Max: {np.max(maes):.6f}")
         print(f"  Loss - Mean: {np.mean(losses):.6f} +/- {np.std(losses):.6f}")
 
         # Identify and copy best model (by MAE)
-        best_run = min(run_results, key=lambda x: x['best_val_mae'])
-        print(f"\n  Best: Run {best_run['run']} (val_mae={best_run['best_val_mae']:.6f}, seed={best_run['seed']})")
+        best_run = min(run_results, key=lambda x: x['val_mae'])
+        print(f"\n  Best: Run {best_run['run']} (val_mae={best_run['val_mae']:.6f}, seed={best_run['seed']})")
 
         # Copy best run's checkpoint to classifier_best.pt
         best_checkpoint = checkpoint_dir / "classifier_best.pt"
@@ -1813,10 +2446,13 @@ def train_classifier(
         manifest.save()
 
         # Collect stats for model card (use best run's stats)
+        train_pos = sum(1 for f in train_files if file_ratings.get(f, 0) == 1)
+        val_pos = sum(1 for f in val_files if file_ratings.get(f, 0) == 1)
+        train_prev = train_pos / len(train_files) if train_files else 0.0
+        val_prev = val_pos / len(val_files) if val_files else 0.0
         classifier_stats = {
-            'best_val_loss': best_run['best_val_loss'],
-            'best_val_mae': best_run['best_val_mae'],
-            'val_mae': best_run['best_val_mae'],
+            'val_loss': best_run['val_loss'],
+            'val_mae': best_run['val_mae'],
             'best_epoch': best_run['best_epoch'],
             'epochs_run': best_run['epochs_run'],
             'training_time_seconds': total_time,
@@ -1825,7 +2461,9 @@ def train_classifier(
             'mae_std': np.std(maes),
             'train_size': len(train_files),
             'val_size': len(val_files),
-            'vault_size': len(vault_files)
+            'vault_size': len(vault_files),
+            'train_prevalence': train_prev,
+            'val_prevalence': val_prev,
         }
         model_card.set_classifier_stats(classifier_stats)
 
@@ -1851,8 +2489,12 @@ def train_classifier(
             current_vault_set = set(vault_files)
             print(f"  Using current vault for A/B test: {len(current_vault_set)} files")
 
-            # Create test dataset from current vault
+            # Create test dataset from current vault (fingerprint_baseline: add noise to avoid collapse)
             test_dataset = full_dataset.subset_by_filenames(current_vault_set)
+            if encoder_version == "fingerprint_baseline":
+                noise_variance = classifier_config.get("fingerprint_noise_variance", 0.0)
+                if noise_variance > 0:
+                    test_dataset = NoisyEmbeddingWrapper(test_dataset, variance=noise_variance, seed=99999)
 
             if len(test_dataset) >= 10:
                 ab_result = run_ab_test(
@@ -1872,6 +2514,12 @@ def train_classifier(
                     'significant': bool(ab_result.get('significant', False))
                 })
                 manifest.save()
+                if classifier_mlflow_run_id:
+                    from mlflow.tracking import MlflowClient
+                    tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
+                    client = MlflowClient(tracking_uri=tracking_uri)
+                    for k, v in ab_result_to_mlflow_metrics(ab_result).items():
+                        client.log_metric(classifier_mlflow_run_id, k, v)
             else:
                 print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
                 print(f"  Rate more songs to build up a stable A/B test vault")
@@ -1881,6 +2529,17 @@ def train_classifier(
         elif verbose:
             print(f"\n  No production model found at {prod_classifier_path}")
             print(f"  Run 'promote-to-prod' after initial training to enable A/B testing")
+
+        # Final training: report HPO vs final val ROC AUC and log to MLflow
+        if verbose and final_training:
+            hpo_auc = get_hpo_val_roc_auc(config)
+            final_auc = model_card.classifier_stats.get("val_roc_auc") if model_card and model_card.classifier_stats else None
+            _report_and_log_hpo_vs_final_roc_auc(
+                config=config,
+                hpo_val_roc_auc=hpo_auc,
+                final_val_roc_auc=final_auc,
+                classifier_mlflow_run_id=classifier_mlflow_run_id,
+            )
 
         print("\nNext step: Run with --stage recommend to generate recommendations")
 
@@ -1923,6 +2582,18 @@ def train_classifier(
     # Create train/val datasets from filename lists
     train_dataset, val_dataset = full_dataset.split_by_filenames(train_files, val_files)
 
+    # Fingerprint baseline: add Gaussian noise to both train and val (val sees same regime as train)
+    noise_variance = classifier_config.get("fingerprint_noise_variance", 0.0)
+    if encoder_version == "fingerprint_baseline" and noise_variance > 0:
+        train_dataset = NoisyEmbeddingWrapper(
+            train_dataset, variance=noise_variance, seed=model_seed
+        )
+        val_dataset = NoisyEmbeddingWrapper(
+            val_dataset, variance=noise_variance, seed=model_seed + 1000000
+        )
+        if verbose:
+            print(f"  Fingerprint: Gaussian noise (variance={noise_variance}) applied to train and val")
+
     if verbose:
         print(f"  Train: {len(train_dataset)} songs")
         print(f"  Val: {len(val_dataset)} songs")
@@ -1946,11 +2617,16 @@ def train_classifier(
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
+    batch_size = _effective_classifier_batch_size(classifier_config, encoder_version)
+    # Generator for reproducible shuffle (same model_seed => same batch order as HPO best run)
+    train_shuffle_generator = torch.Generator().manual_seed(model_seed)
+
     # Create data loaders (embeddings are cheap to load, so smaller prefetch)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=classifier_config['batch_size'],
+        batch_size=batch_size,
         shuffle=True,
+        generator=train_shuffle_generator,
         num_workers=4,
         pin_memory=True,
         prefetch_factor=2,  # Embeddings load fast, so 2 batches is enough
@@ -1959,7 +2635,7 @@ def train_classifier(
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=classifier_config['batch_size'],
+        batch_size=batch_size,
         shuffle=False,
         num_workers=4,
         pin_memory=True,
@@ -1974,22 +2650,33 @@ def train_classifier(
     classifier = SimpleRatingClassifier(
         embedding_dim=embedding_dim,
         hidden_dims=classifier_config['hidden_dims'],
-        dropout=classifier_config['dropout']
+        dropout=classifier_config['dropout'],
+        use_genre=use_genre,
+        use_batch_norm=classifier_config.get('use_batch_norm', False),
+        use_residual=classifier_config.get('use_residual', False),
     )
 
     if verbose:
         print(f"  Embedding dim: {embedding_dim}")
+        print(f"  Use genre: {use_genre}")
         print(f"  Hidden dims: {classifier_config['hidden_dims']}")
         print(f"  Dropout: {classifier_config['dropout']}")
 
     # Create loss function based on classification mode
     if classification_mode == "binary":
-        # Compute pos_weight from training data for class imbalance
         train_labels = _get_ratings_from_dataset(train_dataset)
-        pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels)
-        loss_fn = BinaryRatingLoss(pos_weight=pos_weight)
+        binary_pos_weight = classifier_config.get('binary_pos_weight')
+        if binary_pos_weight is not None and isinstance(binary_pos_weight, (int, float)):
+            pos_weight = float(binary_pos_weight)
+            pos_weight_note = " (explicit binary_pos_weight)"
+        else:
+            use_pos_weight = classifier_config.get('binary_use_pos_weight', True)
+            pos_weight = BinaryRatingLoss.compute_pos_weight(train_labels) if use_pos_weight else 1.0
+            pos_weight_note = (" (no upweight)" if not use_pos_weight else "")
+        middle_weight = classifier_config.get('binary_middle_loss_weight', 0.1)
+        loss_fn = BinaryRatingLoss(pos_weight=pos_weight, middle_weight=middle_weight)
         if verbose:
-            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}")
+            print(f"  Binary classification mode - pos_weight: {pos_weight:.3f}, middle_weight: {middle_weight}{pos_weight_note}")
     elif class_weights is not None:
         loss_fn = WeightedRatingLoss(class_weights=class_weights)
     else:
@@ -2035,7 +2722,14 @@ def train_classifier(
         tracker=tracker,  # Pass tracker for MLflow learning curves
         encoder_version=encoder_version,
         classifier_version=classifier_version,
-        classification_mode=classification_mode
+        classification_mode=classification_mode,
+        genre_centroids=genre_centroids,
+        chunk_aggregation=classifier_config.get('chunk_aggregation', 'mean'),
+        clip_grad=classifier_config.get('clip_grad', False),
+        clip_grad_norm=classifier_config.get('clip_grad_norm', 1.0),
+        training_label_noise=classifier_config.get('training_label_noise', 0),
+        hpo_mlflow_run_id=classifier_config.get('hpo_mlflow_run_id'),
+        hpo_mlflow_run_name=classifier_config.get('hpo_mlflow_run_name'),
     )
 
     # Train with time tracking and MLflow logging
@@ -2043,60 +2737,99 @@ def train_classifier(
         print("\n[6/6] Training...")
     training_start_time = time.time()
 
+    # When HPO optimizes a metric (e.g. val_roc_auc, val_f1), use it for early stopping and best checkpoint.
+    hpo_metric = classifier_config.get('hpo_metric', 'val_roc_auc')
+    train_kwargs = {
+        'train_loader': train_loader,
+        'val_loader': val_loader,
+        'num_epochs': num_epochs,
+        'checkpoint_dir': config['checkpoint_dir'],
+        'save_best_only': True,
+        'early_stopping_patience': classifier_config.get('early_stopping_patience'),
+        'early_stopping_min_delta': classifier_config.get('early_stopping_min_delta', 0.0),
+    }
+    if hpo_metric == 'val_rating_corr_and_f1':
+        train_kwargs['monitor_metric'] = 'val_rating_corr_and_f1'
+        train_kwargs['hpo_metric_corr_weight'] = classifier_config.get('hpo_metric_corr_weight', 0.5)
+        train_kwargs['hpo_metric_f1_weight'] = classifier_config.get('hpo_metric_f1_weight', 0.5)
+    elif hpo_metric == 'val_f1':
+        train_kwargs['monitor_metric'] = 'val_f1'
+    elif hpo_metric == 'val_roc_auc':
+        train_kwargs['monitor_metric'] = 'val_roc_auc'
+
+    # When tracker was passed from HPO (mlflow_tracker), we're already inside that run; don't start another
+    tracker_already_active = mlflow_tracker is not None
     if tracker:
-        with tracker:
-            # Log configuration and hyperparameters
-            tracker.log_params({
-                'stage': 'classifier',
-                'final_training': final_training,
-                'hidden_dims': str(classifier_config.get('hidden_dims', [256, 128])),
-                'dropout': classifier_config.get('dropout', 0.3),
-                'batch_size': classifier_config['batch_size'],
-                'learning_rate': classifier_config['learning_rate'],
-                'num_epochs': num_epochs,
-                'optimizer': classifier_config.get('optimizer', 'adam'),
-                'scheduler': classifier_config.get('scheduler', 'cosine'),
-                'loss_type': classifier_config.get('loss_type', 'mse'),
-            })
+        def _run_with_tracker():
+            nonlocal classifier_mlflow_run_id
+            # Log params only when we own the run (not HPO). In HPO the tuner already logged trial params,
+            # and with multi-rep we'd re-log training_seed (42 then 1042) which MLflow forbids.
+            if not tracker_already_active:
+                params_to_log = {
+                    'stage': 'classifier',
+                    'final_training': final_training,
+                    'hidden_dims': str(classifier_config.get('hidden_dims', [256, 128])),
+                    'dropout': classifier_config.get('dropout', 0.3),
+                    'batch_size': batch_size,
+                    'learning_rate': classifier_config['learning_rate'],
+                    'num_epochs': num_epochs,
+                    'optimizer': classifier_config.get('optimizer', 'adam'),
+                    'scheduler': classifier_config.get('scheduler', 'cosine'),
+                    'loss_type': classifier_config.get('loss_type', 'mse'),
+                    'chunk_aggregation': classifier_config.get('chunk_aggregation', 'mean'),
+                    'training_label_noise': classifier_config.get('training_label_noise', 0),
+                    'fingerprint_noise_variance': classifier_config.get('fingerprint_noise_variance', 0),
+                    'training_seed': str(model_seed),
+                }
+                if classifier_config.get('hpo_mlflow_run_id'):
+                    params_to_log['hpo_mlflow_run_id'] = classifier_config['hpo_mlflow_run_id']
+                if classifier_config.get('hpo_mlflow_run_name'):
+                    params_to_log['hpo_mlflow_run_name'] = classifier_config['hpo_mlflow_run_name']
+                tracker.log_params(params_to_log)
 
             # Train
-            history = trainer.train(
-                train_loader=train_loader,
-                val_loader=val_loader,
-                num_epochs=num_epochs,
-                checkpoint_dir=config['checkpoint_dir'],
-                save_best_only=True,
-                early_stopping_patience=classifier_config.get('early_stopping_patience'),
-                early_stopping_min_delta=classifier_config.get('early_stopping_min_delta', 0.0)
-            )
+            history = trainer.train(**train_kwargs)
             training_time = time.time() - training_start_time
 
             # Log final metrics
             best_val_loss = min(history['val_loss']) if history['val_loss'] else float('inf')
             best_val_mae = min(history['val_mae']) if history['val_mae'] else float('inf')
             final_train_loss = history['train_loss'][-1] if history['train_loss'] else float('inf')
+            best_val_accuracy = max(history['val_accuracy']) if history.get('val_accuracy') else None
+            best_val_precision = max(history['val_precision']) if history.get('val_precision') else None
+            best_val_recall = max(history['val_recall']) if history.get('val_recall') else None
+            roc_auc_saved = history.get('roc_auc') or (max(history['val_roc_auc']) if history.get('val_roc_auc') else None)
 
-            tracker.log_metric('best_val_loss', best_val_loss)
-            tracker.log_metric('best_val_mae', best_val_mae)
+            tracker.log_metric('val_loss', best_val_loss)
+            tracker.log_metric('val_mae', best_val_mae)
             tracker.log_metric('final_train_loss', final_train_loss)
             tracker.log_metric('training_time_seconds', training_time)
             tracker.log_metric('epochs_completed', len(history['train_loss']))
+            if best_val_accuracy is not None:
+                tracker.log_metric('val_accuracy', best_val_accuracy)
+            if best_val_precision is not None:
+                tracker.log_metric('val_precision', best_val_precision)
+                tracker.log_metric('val_ppv', best_val_precision)
+            if best_val_recall is not None:
+                tracker.log_metric('val_recall', best_val_recall)
+            if roc_auc_saved is not None:
+                tracker.log_metric('roc_auc', roc_auc_saved)
 
             # Log checkpoint as artifact
             checkpoint_path = Path(config['checkpoint_dir']) / 'classifier_best.pt'
             if checkpoint_path.exists():
                 tracker.log_artifact(str(checkpoint_path))
+            classifier_mlflow_run_id = tracker.run_id
+            return history, training_time
+
+        if tracker_already_active:
+            history, training_time = _run_with_tracker()
+        else:
+            with tracker:
+                history, training_time = _run_with_tracker()
     else:
         # Train without MLflow
-        history = trainer.train(
-            train_loader=train_loader,
-            val_loader=val_loader,
-            num_epochs=num_epochs,
-            checkpoint_dir=config['checkpoint_dir'],
-            save_best_only=True,
-            early_stopping_patience=classifier_config.get('early_stopping_patience'),
-            early_stopping_min_delta=classifier_config.get('early_stopping_min_delta', 0.0)
-        )
+        history = trainer.train(**train_kwargs)
         training_time = time.time() - training_start_time
 
     # Calculate metrics
@@ -2113,6 +2846,9 @@ def train_classifier(
         print(f"Best val MAE: {best_val_mae:.4f}")
         print(f"Training time: {training_time:.2f} seconds ({training_time/60:.2f} minutes)")
         print(f"Checkpoint saved to: {config['checkpoint_dir']}/classifier_best.pt")
+        if classifier_mlflow_run_id:
+            print(f"MLflow run ID: {classifier_mlflow_run_id}")
+            print(f"MLflow run hash: {classifier_mlflow_run_id[:8]}")
     else:
         # Concise HPO trial summary
         print(f"  Epochs: {epochs_run} | Train: {final_train_loss:.4f} | Val: {best_val_loss:.4f} | MAE: {best_val_mae:.4f} | Time: {training_time:.1f}s")
@@ -2123,10 +2859,55 @@ def train_classifier(
         training_time_seconds=training_time,
         dataset_stats=classifier_dataset_stats
     )
-    # Add train/val/vault sizes for model card
+    classifier_stats['val_mae'] = best_val_mae
+    if history.get('val_accuracy'):
+        classifier_stats['val_accuracy'] = max(history['val_accuracy'])
+    else:
+        classifier_stats['val_accuracy'] = None
+    if history.get('val_precision'):
+        classifier_stats['val_precision'] = max(history['val_precision'])
+        classifier_stats['val_ppv'] = classifier_stats['val_precision']  # PPV = precision
+    else:
+        classifier_stats['val_precision'] = None
+        classifier_stats['val_ppv'] = None
+    if history.get('val_recall'):
+        classifier_stats['val_recall'] = max(history['val_recall'])
+    else:
+        classifier_stats['val_recall'] = None
+    if history.get('val_f1'):
+        classifier_stats['val_f1'] = max(history['val_f1'])
+        if config.get('classifier', {}).get('hpo_metric') == 'val_f1':
+            classifier_stats['best_epoch'] = history['val_f1'].index(max(history['val_f1'])) + 1
+    else:
+        classifier_stats['val_f1'] = None
+    if history.get('roc_auc') is not None:
+        classifier_stats['val_roc_auc'] = history['roc_auc']  # ROC AUC of saved best model (early stopping)
+    elif history.get('val_roc_auc'):
+        classifier_stats['val_roc_auc'] = max(history['val_roc_auc'])
+    else:
+        classifier_stats['val_roc_auc'] = None
+    if history.get('best_epoch') is not None:
+        classifier_stats['best_epoch'] = history['best_epoch']  # Epoch when best checkpoint was saved
+    elif history.get('val_roc_auc') and config.get('classifier', {}).get('hpo_metric') == 'val_roc_auc':
+        classifier_stats['best_epoch'] = history['val_roc_auc'].index(max(history['val_roc_auc'])) + 1
+    if history.get('val_rating_mse'):
+        classifier_stats['val_rating_mse'] = min(history['val_rating_mse'])
+    else:
+        classifier_stats['val_rating_mse'] = None
+    if history.get('val_rating_corr'):
+        valid_corr = [x for x in history['val_rating_corr'] if not (isinstance(x, float) and np.isnan(x))]
+        classifier_stats['val_rating_corr'] = max(valid_corr) if valid_corr else None
+    else:
+        classifier_stats['val_rating_corr'] = None
+    # Add train/val/vault sizes and prevalence for model card
     classifier_stats['train_size'] = len(train_dataset)
     classifier_stats['val_size'] = len(val_dataset)
     classifier_stats['vault_size'] = len(vault_files)
+    train_pos = sum(1 for f in train_files if file_ratings.get(f, 0) == 1)
+    val_pos = sum(1 for f in val_files if file_ratings.get(f, 0) == 1)
+    classifier_stats['train_prevalence'] = train_pos / len(train_files) if train_files else 0.0
+    classifier_stats['val_prevalence'] = val_pos / len(val_files) if val_files else 0.0
+    classifier_stats['training_seed'] = model_seed
     model_card.set_classifier_stats(classifier_stats)
 
     # Generate model card (only during final training, not HPO)
@@ -2140,13 +2921,15 @@ def train_classifier(
     # Skip model card generation during HPO (verbose=False)
 
     # Save training manifest (tracks which files were used for training)
-    manifest.set_metadata('best_val_loss', best_val_loss)
-    manifest.set_metadata('best_val_mae', best_val_mae)
+    manifest.set_metadata('val_loss', best_val_loss)
+    manifest.set_metadata('val_mae', best_val_mae)
     manifest.set_metadata('training_time_seconds', training_time)
     manifest.set_metadata('epochs_run', epochs_run)
     manifest.set_metadata('train_size', len(train_dataset))
     manifest.set_metadata('val_size', len(val_dataset))
     manifest.set_metadata('vault_size', len(vault_files))
+    manifest.set_metadata('train_prevalence', classifier_stats['train_prevalence'])
+    manifest.set_metadata('val_prevalence', classifier_stats['val_prevalence'])
     manifest.save()
 
     if verbose:
@@ -2173,8 +2956,12 @@ def train_classifier(
         current_vault_set = set(vault_files)
         print(f"  Using current vault for A/B test: {len(current_vault_set)} files")
 
-        # Create test dataset from current vault
+        # Create test dataset from current vault (fingerprint_baseline: add noise to avoid collapse)
         test_dataset = full_dataset.subset_by_filenames(current_vault_set)
+        if encoder_version == "fingerprint_baseline":
+            noise_variance = classifier_config.get("fingerprint_noise_variance", 0.0)
+            if noise_variance > 0:
+                test_dataset = NoisyEmbeddingWrapper(test_dataset, variance=noise_variance, seed=99999)
 
         if len(test_dataset) >= 10:  # Need minimum samples for meaningful test
             ab_result = run_ab_test(
@@ -2196,6 +2983,13 @@ def train_classifier(
                 'significant': bool(ab_result.get('significant', False))
             })
             manifest.save()
+            # Log A/B test metrics to MLflow (classifier run) if we have a run id
+            if classifier_mlflow_run_id:
+                from mlflow.tracking import MlflowClient
+                tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
+                client = MlflowClient(tracking_uri=tracking_uri)
+                for k, v in ab_result_to_mlflow_metrics(ab_result).items():
+                    client.log_metric(classifier_mlflow_run_id, k, v)
         else:
             print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
             print(f"  Rate more songs to build up a stable A/B test vault")
@@ -2206,14 +3000,396 @@ def train_classifier(
         print(f"\n  No production model found at {prod_classifier_path}")
         print(f"  Run 'promote-to-prod' after initial training to enable A/B testing")
 
+    # Final training: report HPO vs final val ROC AUC and log to MLflow
+    if verbose and final_training:
+        hpo_auc = get_hpo_val_roc_auc(config)
+        final_auc = classifier_stats.get("val_roc_auc")
+        _report_and_log_hpo_vs_final_roc_auc(
+            config=config,
+            hpo_val_roc_auc=hpo_auc,
+            final_val_roc_auc=final_auc,
+            classifier_mlflow_run_id=classifier_mlflow_run_id,
+        )
+
     return model_card
+
+
+def train_joint_finetune(
+    config: dict,
+    verbose: bool = True,
+):
+    """Joint fine-tune: unfreeze encoder + classifier, train on audio → rating.
+
+    Run after encoder and classifier training. Loads both checkpoints, builds
+    audio dataset for train+val files from manifest, and trains with two learning
+    rates (encoder lower, classifier higher). Saves updated encoder and classifier,
+    then re-extracts embeddings for the fine-tuned encoder.
+
+    Requires config with encoder_type 'moco' (create_encoder supports only MoCo).
+    """
+    import time
+
+    cleanup_memory()
+
+    music_config = config["music"]
+    classifier_config = config.get("classifier", {})
+    jf_config = config.get("joint_finetune", {})
+    if not jf_config.get("enabled", False):
+        if verbose:
+            print("Joint fine-tune is disabled (joint_finetune.enabled: false). Skipping.")
+        return None
+
+    device = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_dir = Path(config["checkpoint_dir"])
+    encoder_path = checkpoint_dir / "encoder_best.pt"
+    classifier_path = checkpoint_dir / "classifier_best.pt"
+
+    if not encoder_path.exists() or not classifier_path.exists():
+        if verbose:
+            print("Joint fine-tune requires encoder_best.pt and classifier_best.pt. Run encoder then classifier first.")
+        return None
+
+    encoder_type = config.get("encoder", {}).get("encoder_type", "")
+    if encoder_type != "moco":
+        if verbose:
+            print(f"Joint fine-tune currently only supports encoder_type 'moco' (got '{encoder_type}'). Skipping.")
+        return None
+
+    if verbose:
+        print("=" * 80)
+        print("JOINT FINE-TUNE (encoder + classifier on audio → rating)")
+        print("=" * 80)
+
+    # Load manifest for train/val split
+    manifest_path = checkpoint_dir / "training_manifest.json"
+    if not manifest_path.exists():
+        if verbose:
+            print("No training_manifest.json found. Run classifier stage first.")
+        return None
+    manifest = TrainingManifest.load_or_create(str(manifest_path))
+    train_files = list(manifest.training_files)
+    val_files = list(manifest.validation_files)
+    vault_files = list(manifest.vault_files)
+    if not train_files and not val_files:
+        if verbose:
+            print("Manifest has no training or validation files.")
+        return None
+
+    # DB and songs
+    db = ClementineDB(music_config["database_path"])
+    all_songs = db.get_all_songs()
+    album_to_idx, filename_to_albums = build_album_mapping(all_songs)
+    train_val_vault = set(train_files) | set(val_files) | set(vault_files)
+    songs_for_audio = [s for s in all_songs if s.filename in train_val_vault and s.is_rated]
+    if not songs_for_audio:
+        if verbose:
+            print("No rated songs in train/val/vault.")
+        return None
+
+    # MusicDataset for audio (single crop, no augmentation)
+    sample_rate = music_config.get("sample_rate", 16000)
+    duration = music_config.get("audio_duration", 60.0)
+    crop_position = music_config.get("crop_position", "end")
+    normalize = music_config.get("normalize", True)
+    music_dataset = MusicDataset(
+        songs=songs_for_audio,
+        album_to_idx=album_to_idx,
+        filename_to_albums=filename_to_albums,
+        sample_rate=sample_rate,
+        duration=duration,
+        crop_position=crop_position,
+        normalize=normalize,
+        only_rated=True,
+        use_augmentation=False,
+    )
+    train_indices = [i for i in range(len(music_dataset)) if music_dataset.songs[i].filename in set(train_files)]
+    val_indices = [i for i in range(len(music_dataset)) if music_dataset.songs[i].filename in set(val_files)]
+    if not train_indices:
+        if verbose:
+            print("No training samples in audio dataset.")
+        return None
+    train_ds = torch.utils.data.Subset(music_dataset, train_indices)
+    val_ds = torch.utils.data.Subset(music_dataset, val_indices) if val_indices else None
+
+    num_workers = music_config.get("dataloader_workers", 4)
+    batch_size = jf_config.get("batch_size", classifier_config.get("batch_size", 32))
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=music_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=music_collate_fn,
+    ) if val_ds and len(val_ds) > 0 else None
+
+    # Load encoder
+    encoder = create_encoder(config)
+    enc_ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
+    encoder.load_state_dict(enc_ckpt["model_state_dict"])
+    encoder_version = enc_ckpt.get("encoder_version", music_config.get("encoder_version", "v1"))
+
+    # Load classifier
+    clf_ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
+    state_dict = clf_ckpt["model_state_dict"]
+    embedding_dim = int(clf_ckpt.get("embedding_dim", 2048))
+    hidden_dims = clf_ckpt.get("hidden_dims", classifier_config.get("hidden_dims", [512, 256, 128]))
+    dropout = classifier_config.get("dropout", 0.3)
+    use_genre = clf_ckpt.get("use_genre", False)
+    use_batch_norm = clf_ckpt.get("use_batch_norm", False)
+    use_residual = clf_ckpt.get("use_residual", False)
+    genre_centroids = clf_ckpt.get("genre_centroids")
+    classifier_version = clf_ckpt.get("classifier_version", "v1")
+    classification_mode = classifier_config.get("classification_mode", "regression")
+
+    classifier = SimpleRatingClassifier(
+        embedding_dim=embedding_dim,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        use_genre=use_genre,
+        use_batch_norm=use_batch_norm,
+        use_residual=use_residual,
+    )
+    classifier.load_state_dict(state_dict)
+
+    # Genre dict for train+val (from current embeddings + centroids)
+    genre_dict = {}
+    if use_genre and genre_centroids is not None:
+        from ml_skeleton.music.genre_centroids import get_genre_features
+        embedding_store = EmbeddingStore(music_config["embedding_db_path"])
+        all_filenames = train_files + val_files
+        embeddings_dict = embedding_store.get_embeddings_batch(
+            all_filenames,
+            model_version=encoder_version,
+        )
+        for song in songs_for_audio:
+            if song.filename not in embeddings_dict:
+                continue
+            emb = embeddings_dict[song.filename]
+            if isinstance(emb, np.ndarray):
+                pass
+            else:
+                emb = np.asarray(emb)
+            genre_dict[song.filename] = get_genre_features(
+                song,
+                emb,
+                genre_centroids,
+                top_k=classifier_config.get("genre_impute_top_k", 2),
+                min_votes=classifier_config.get("genre_impute_min_votes", 1),
+            )
+
+    # Loss and optimizer (two param groups)
+    if classification_mode == "binary":
+        loss_fn = BinaryRatingLoss()
+    else:
+        loss_fn = RatingLoss()
+    encoder_lr = jf_config.get("encoder_lr", 1e-5)
+    classifier_lr = jf_config.get("classifier_lr", 1e-4)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": encoder.parameters(), "lr": encoder_lr},
+            {"params": classifier.parameters(), "lr": classifier_lr},
+        ],
+        weight_decay=classifier_config.get("adam_weight_decay", 0.0),
+    )
+
+    num_epochs = jf_config.get("epochs", 5)
+    early_stopping_patience = jf_config.get("early_stopping_patience", 3)
+    early_stopping_min_delta = jf_config.get("early_stopping_min_delta", 0.0)
+
+    trainer = JointFinetuneTrainer(
+        encoder=encoder,
+        classifier=classifier,
+        device=device,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        encoder_version=encoder_version,
+        classifier_version=classifier_version,
+        classification_mode=classification_mode,
+        use_genre=use_genre,
+        genre_dict=genre_dict,
+        genre_centroids=genre_centroids,
+        tracker=None,
+    )
+    start = time.time()
+    trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        num_epochs=num_epochs,
+        checkpoint_dir=str(checkpoint_dir),
+        save_best_only=True,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
+        verbose=verbose,
+    )
+    elapsed = time.time() - start
+    if verbose:
+        print(f"\nJoint fine-tune completed in {elapsed:.1f}s ({elapsed/60:.1f} min)")
+
+    prod_classifier_path = Path("prod") / "classifier_best.pt"
+    prod_encoder_path = Path("prod") / "encoder_best.pt"
+    current_vault_set = set(vault_files)
+
+    # Re-extract embeddings for fine-tuned encoder (train+val+vault)
+    if verbose:
+        print("Re-extracting embeddings for fine-tuned encoder...")
+    encoder.eval()
+    embedding_store = EmbeddingStore(music_config["embedding_db_path"])
+    reembed_loader = DataLoader(
+        music_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=music_collate_fn,
+    )
+    enc_trainer = EncoderTrainer(
+        encoder=encoder,
+        device=device,
+        loss_fn=loss_fn,
+        optimizer=torch.optim.Adam(encoder.parameters(), lr=1e-5),
+        embedding_store=embedding_store,
+        model_version=encoder_version,
+    )
+    enc_trainer.extract_embeddings(reembed_loader, save_to_store=True, use_moco=True)
+    if verbose:
+        print("Embeddings updated.")
+
+    # A/B test: new model on NEW embeddings, prod on embeddings from PROD encoder (prod pipeline never changes)
+    new_classifier_path = checkpoint_dir / "classifier_best.pt"
+    if prod_classifier_path.exists() and prod_encoder_path.exists() and len(vault_files) > 0 and verbose:
+        print("\n" + "=" * 60)
+        print("A/B TEST: New Model (joint-finetuned) vs Production (using vault)")
+        print("=" * 60)
+        print(f"  Using current vault for A/B test: {len(current_vault_set)} files")
+        print("  Prod: embeddings from prod encoder (prod pipeline unchanged). New: fine-tuned embeddings.")
+        # New embeddings (from store after re-extract)
+        new_embeddings_dict = enc_trainer.embedding_store.get_embeddings_batch(
+            list(current_vault_set),
+            model_version=encoder_version,
+        )
+        vault_songs = [s for s in all_songs if s.filename in current_vault_set and s.is_rated]
+        vault_songs = sorted(vault_songs, key=lambda s: s.filename)
+        vault_songs_new = [s for s in vault_songs if s.filename in new_embeddings_dict]
+        if new_embeddings_dict and vault_songs_new:
+            test_dataset_new = EmbeddingDataset(
+                embeddings=new_embeddings_dict,
+                songs=vault_songs_new,
+                only_rated=True,
+                classification_mode=classification_mode,
+                binary_positive_threshold=classifier_config.get("binary_positive_threshold", 4.0),
+                binary_negative_threshold=classifier_config.get("binary_negative_threshold", 2.0),
+                use_genre=use_genre,
+                genre_centroids=genre_centroids,
+                genre_impute_top_k=classifier_config.get("genre_impute_top_k", 2),
+                genre_impute_min_votes=classifier_config.get("genre_impute_min_votes", 1),
+            )
+            # Prod embeddings: generate from prod encoder on vault audio (keeps prod pipeline intact)
+            prod_embeddings_dict = {}
+            try:
+                prod_encoder = create_encoder(config)
+                prod_ckpt = torch.load(prod_encoder_path, map_location="cpu", weights_only=False)
+                prod_encoder.load_state_dict(prod_ckpt["model_state_dict"])
+                prod_encoder = prod_encoder.to(device)
+                prod_encoder.eval()
+                vault_indices = [i for i in range(len(music_dataset)) if music_dataset.songs[i].filename in current_vault_set]
+                vault_indices = sorted(vault_indices, key=lambda i: music_dataset.songs[i].filename)
+                vault_audio_subset = torch.utils.data.Subset(music_dataset, vault_indices)
+                vault_loader = DataLoader(
+                    vault_audio_subset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=0,
+                    collate_fn=music_collate_fn,
+                )
+                with torch.no_grad():
+                    for batch in vault_loader:
+                        audio_batch = batch["audio"].to(device)
+                        out = prod_encoder(audio_batch)
+                        emb = out["embedding"] if isinstance(out, dict) else out
+                        emb_cpu = emb.cpu().numpy()
+                        for i, fn in enumerate(batch["filename"]):
+                            prod_embeddings_dict[fn] = emb_cpu[i]
+            except Exception as e:
+                if verbose:
+                    print(f"  Could not generate prod vault embeddings: {e}")
+            prod_test_dataset = None
+            if prod_embeddings_dict:
+                vault_songs_both = [s for s in vault_songs_new if s.filename in prod_embeddings_dict]
+                if len(vault_songs_both) >= 10:
+                    prod_test_dataset = EmbeddingDataset(
+                        embeddings=prod_embeddings_dict,
+                        songs=vault_songs_both,
+                        only_rated=True,
+                        classification_mode=classification_mode,
+                        binary_positive_threshold=classifier_config.get("binary_positive_threshold", 4.0),
+                        binary_negative_threshold=classifier_config.get("binary_negative_threshold", 2.0),
+                        use_genre=use_genre,
+                        genre_centroids=genre_centroids,
+                        genre_impute_top_k=classifier_config.get("genre_impute_top_k", 2),
+                        genre_impute_min_votes=classifier_config.get("genre_impute_min_votes", 1),
+                    )
+                    # New model dataset must match same songs (same order and length for A/B test)
+                    test_dataset_new = EmbeddingDataset(
+                        embeddings=new_embeddings_dict,
+                        songs=vault_songs_both,
+                        only_rated=True,
+                        classification_mode=classification_mode,
+                        binary_positive_threshold=classifier_config.get("binary_positive_threshold", 4.0),
+                        binary_negative_threshold=classifier_config.get("binary_negative_threshold", 2.0),
+                        use_genre=use_genre,
+                        genre_centroids=genre_centroids,
+                        genre_impute_top_k=classifier_config.get("genre_impute_top_k", 2),
+                        genre_impute_min_votes=classifier_config.get("genre_impute_min_votes", 1),
+                    )
+            if prod_test_dataset is None:
+                prod_test_dataset = test_dataset_new
+            if len(test_dataset_new) >= 10:
+                ab_result = run_ab_test(
+                    new_classifier_path=str(new_classifier_path),
+                    prod_classifier_path=str(prod_classifier_path),
+                    test_dataset=test_dataset_new,
+                    classification_mode=classification_mode,
+                    device=device,
+                    verbose=True,
+                    prod_test_dataset=prod_test_dataset,
+                )
+                manifest.set_metadata("ab_test_result", {
+                    "n_samples": int(ab_result.get("n_samples", 0)),
+                    "new_accuracy": float(ab_result.get("new_accuracy", 0)),
+                    "prod_accuracy": float(ab_result.get("prod_accuracy", 0)),
+                    "improvement": float(ab_result.get("improvement", 0)),
+                    "p_value": float(ab_result.get("p_value", 1.0)),
+                    "significant": bool(ab_result.get("significant", False)),
+                })
+                manifest.save()
+            else:
+                print(f"  Skipping A/B test: only {len(test_dataset_new)} samples in vault (need >= 10)")
+        else:
+            print("  Skipping A/B test: could not load vault embeddings")
+    elif verbose and len(vault_files) == 0:
+        print("  No vault files available for A/B testing")
+    elif verbose and (not prod_classifier_path.exists() or not prod_encoder_path.exists()):
+        print("  No production model in prod/ (need encoder_best.pt and classifier_best.pt); run promote-to-prod to enable A/B testing")
+
+    if verbose:
+        print("\nNext: --stage recommend or promote-to-prod")
+    return None
 
 
 def generate_recommendations(
     config: dict,
     prod_dir: str = None,
     low_rating_ratio: float = 0.0,
-    genre_filter: str = None
+    genre_filter: str = None,
+    error_playlist_size: int = None
 ):
     """Generate recommendations for unrated songs.
 
@@ -2227,6 +3403,8 @@ def generate_recommendations(
         genre_filter: Optional genre category to filter recommendations by.
                      Valid categories: rock, pop, electronic, hiphop, jazz_classical,
                      country, latin_world
+        error_playlist_size: Max songs per false_positives/false_negatives playlist.
+                            None = use config; 0 = do not generate error playlists.
 
     Raises:
         ValueError: If classifier was trained with a different encoder version
@@ -2247,6 +3425,7 @@ def generate_recommendations(
     # Load configuration
     music_config = config['music']
     rec_config = config.get('recommendations', {})
+    classifier_config = config.get('classifier', {})
     device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
 
     # Determine model directory (prod or dev)
@@ -2313,10 +3492,11 @@ def generate_recommendations(
     filenames = [s.filename for s in unrated_songs]
     # Use encoder_version for embedding lookup (with fallback to model_version for backwards compatibility)
     encoder_version = music_config.get('encoder_version', music_config.get('model_version', 'v1'))
+    num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
     embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
         model_version=encoder_version,
-        num_chunks=4
+        num_chunks=num_chunks
     )
     if not embeddings_dict:
         embeddings_dict = embedding_store.get_embeddings_batch(
@@ -2330,11 +3510,29 @@ def generate_recommendations(
         print("  No embeddings found! Run encoder training first.")
         return
 
-    # Create dataset
+    checkpoint_path = classifier_checkpoint
+    if not checkpoint_path.exists():
+        print(f"  Classifier checkpoint not found: {checkpoint_path}")
+        if prod_dir:
+            print("  Run 'promote-to-prod' first to deploy models!")
+        else:
+            print("  Run classifier training first!")
+        return
+
+    # Load checkpoint once (used for dataset genre setup and for classifier weights)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    use_genre_recommend = checkpoint.get("use_genre", False)
+    genre_centroids_recommend = checkpoint.get("genre_centroids")
+
+    # Create dataset (with genre when classifier was trained with genre)
     dataset = EmbeddingDataset(
         embeddings=embeddings_dict,
         songs=unrated_songs,
-        only_rated=False
+        only_rated=False,
+        use_genre=use_genre_recommend,
+        genre_centroids=genre_centroids_recommend,
+        genre_impute_top_k=classifier_config.get('genre_impute_top_k', 2),
+        genre_impute_min_votes=classifier_config.get('genre_impute_min_votes', 1),
     )
 
     data_loader = DataLoader(
@@ -2350,41 +3548,44 @@ def generate_recommendations(
     print("\n[3/5] Loading classifier...")
     _first_emb = next(iter(embeddings_dict.values()))
     _arr = np.asarray(_first_emb)
-    embedding_dim = int(_arr.shape[-1]) if _arr.ndim > 1 else len(_arr)
+    embedding_dim_from_emb = int(_arr.shape[-1]) if _arr.ndim > 1 else len(_arr)
 
-    checkpoint_path = classifier_checkpoint  # Already set above based on model_dir
-    if not checkpoint_path.exists():
-        print(f"  Classifier checkpoint not found: {checkpoint_path}")
-        if prod_dir:
-            print("  Run 'promote-to-prod' first to deploy models!")
-        else:
-            print("  Run classifier training first!")
-        return
-
-    # Load checkpoint first to infer architecture from state dict
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    # Checkpoint already loaded above; use it for classifier state and architecture
     state_dict = checkpoint['model_state_dict']
+    use_genre_ck = checkpoint.get('use_genre', False)
+    embedding_dim_ck = checkpoint.get('embedding_dim')
+    embedding_dim = int(embedding_dim_ck) if embedding_dim_ck is not None and int(embedding_dim_ck) > 0 else embedding_dim_from_emb
 
-    # Infer hidden_dims from checkpoint state dict
-    # Layer weights are named mlp.0.weight, mlp.3.weight, mlp.6.weight, etc.
-    # Each weight shape is [out_features, in_features]
-    hidden_dims = []
-    layer_idx = 0
-    while f"mlp.{layer_idx}.weight" in state_dict:
-        weight = state_dict[f"mlp.{layer_idx}.weight"]
-        out_features = weight.shape[0]
-        # Skip the final output layer (size 1)
-        if out_features > 1:
-            hidden_dims.append(out_features)
-        layer_idx += 3  # Each block is Linear + ReLU + Dropout (3 layers)
+    # Get hidden_dims from checkpoint or infer from state dict (old: mlp.*, new: blocks.*)
+    hidden_dims = checkpoint.get('hidden_dims')
+    if hidden_dims is None:
+        hidden_dims = []
+        if "blocks.0.0.weight" in state_dict:
+            i = 0
+            while f"blocks.{i}.0.weight" in state_dict:
+                hidden_dims.append(state_dict[f"blocks.{i}.0.weight"].shape[0])
+                i += 1
+        else:
+            layer_idx = 0
+            while f"mlp.{layer_idx}.weight" in state_dict:
+                weight = state_dict[f"mlp.{layer_idx}.weight"]
+                out_features = weight.shape[0]
+                if out_features > 1:
+                    hidden_dims.append(out_features)
+                layer_idx += 3
 
     dropout = config['classifier'].get('dropout', 0.3)  # Dropout doesn't affect loading
-    print(f"  Inferred architecture from checkpoint: hidden_dims={hidden_dims}")
+    use_batch_norm_ck = checkpoint.get('use_batch_norm', False)
+    use_residual_ck = checkpoint.get('use_residual', False)
+    print(f"  Inferred architecture from checkpoint: hidden_dims={hidden_dims}, use_genre={use_genre_ck}")
 
     classifier = SimpleRatingClassifier(
         embedding_dim=embedding_dim,
         hidden_dims=hidden_dims,
-        dropout=dropout
+        dropout=dropout,
+        use_genre=use_genre_ck,
+        use_batch_norm=use_batch_norm_ck,
+        use_residual=use_residual_ck,
     )
 
     classifier.load_state_dict(state_dict)
@@ -2403,12 +3604,16 @@ def generate_recommendations(
         loss_fn = RatingLoss()
         print(f"  Mode: Regression (continuous ratings)")
 
+    chunk_aggregation = checkpoint.get(
+        'chunk_aggregation', classifier_config.get('chunk_aggregation', 'mean')
+    )
     trainer = ClassifierTrainer(
         classifier=classifier,
         device=device,
         loss_fn=loss_fn,
         optimizer=torch.optim.Adam(classifier.parameters()),  # Dummy optimizer
-        classification_mode=classification_mode
+        classification_mode=classification_mode,
+        chunk_aggregation=chunk_aggregation,
     )
 
     predictions, pred_filenames = trainer.predict(data_loader)
@@ -2544,6 +3749,120 @@ def generate_recommendations(
         filename_prefix=filename_prefix
     )
 
+    # Generate false_positives and false_negatives playlists (train+val errors for label correction)
+    effective_error_size = (
+        error_playlist_size if error_playlist_size is not None
+        else rec_config.get('error_playlist_size', 100)
+    )
+    if effective_error_size <= 0:
+        print("\n  Skipping error playlists (error_playlist_size=0 or disabled)")
+        fp_path = None
+        fn_path = None
+    else:
+        print("\n" + "=" * 80)
+        print("GENERATING ERROR PLAYLISTS (FALSE POSITIVES / FALSE NEGATIVES)")
+        print("=" * 80)
+        rated_songs = [s for s in all_songs if s.is_rated]
+        manifest_path = model_dir / "training_manifest.json"
+        if manifest_path.exists():
+            manifest = TrainingManifest.load_or_create(str(manifest_path))
+            manifest.load()
+            train_val_files = manifest.training_files | manifest.validation_files
+            train_val_songs = [s for s in rated_songs if s.filename in train_val_files]
+            print(f"  Using train+val from manifest: {len(train_val_songs)} rated songs")
+        else:
+            train_val_songs = rated_songs
+            print(f"  No manifest found; using all rated songs: {len(train_val_songs)}")
+
+        if train_val_songs:
+            filenames_tv = [s.filename for s in train_val_songs]
+            num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
+            embeddings_tv = embedding_store.get_embeddings_batch_all_chunks(
+                filenames_tv,
+                model_version=encoder_version,
+                num_chunks=num_chunks
+            )
+            if not embeddings_tv:
+                embeddings_tv = embedding_store.get_embeddings_batch(
+                    filenames_tv,
+                    model_version=encoder_version
+                )
+            train_val_with_emb = [s for s in train_val_songs if s.filename in embeddings_tv]
+            if train_val_with_emb:
+                binary_pos = classifier_config.get('binary_positive_threshold', 4.0)
+                binary_neg = classifier_config.get('binary_negative_threshold', 2.0)
+                dataset_tv = EmbeddingDataset(
+                    embeddings=embeddings_tv,
+                    songs=train_val_with_emb,
+                    only_rated=True,
+                    classification_mode=classification_mode,
+                    binary_positive_threshold=binary_pos,
+                    binary_negative_threshold=binary_neg,
+                    use_genre=use_genre_recommend,
+                    genre_centroids=genre_centroids_recommend,
+                    genre_impute_top_k=classifier_config.get('genre_impute_top_k', 2),
+                    genre_impute_min_votes=classifier_config.get('genre_impute_min_votes', 1),
+                )
+                loader_tv = DataLoader(
+                    dataset_tv,
+                    batch_size=256,
+                    shuffle=False,
+                    num_workers=0,
+                    pin_memory=False
+                )
+                preds_tv, pred_filenames_tv = trainer.predict(loader_tv)
+                filename_to_song = {s.filename: s for s in train_val_with_emb}
+                false_positives = []
+                false_negatives = []
+                for filename, pred in zip(pred_filenames_tv, preds_tv):
+                    song = filename_to_song.get(filename)
+                    if not song or song.rating is None:
+                        continue
+                    r = song.rating
+                    true_pos = r >= binary_pos
+                    true_neg = r <= binary_neg
+                    if not (true_pos or true_neg):
+                        continue
+                    pred_pos = pred > 0.5
+                    if true_neg and pred_pos:
+                        false_positives.append((song, pred))
+                    elif true_pos and not pred_pos:
+                        false_negatives.append((song, pred))
+                false_positives.sort(key=lambda x: x[1], reverse=True)
+                false_negatives.sort(key=lambda x: x[1], reverse=False)
+                fp_songs = [s for s, _ in false_positives[:effective_error_size]]
+                fp_preds = [p for _, p in false_positives[:effective_error_size]]
+                fn_songs = [s for s, _ in false_negatives[:effective_error_size]]
+                fn_preds = [p for _, p in false_negatives[:effective_error_size]]
+                fp_path = playlist_output_dir / f"{filename_prefix}false_positives.xspf"
+                fn_path = playlist_output_dir / f"{filename_prefix}false_negatives.xspf"
+                if fp_songs:
+                    export_to_xspf(
+                        songs=fp_songs,
+                        predictions=fp_preds,
+                        output_path=fp_path,
+                        playlist_title="False Positives (true dislike, predicted like) - correct labels",
+                        annotation_prefix="Predicted"
+                    )
+                    print(f"  Exported {len(fp_songs)} false positives -> {fp_path}")
+                else:
+                    print("  No false positives (train+val)")
+                if fn_songs:
+                    export_to_xspf(
+                        songs=fn_songs,
+                        predictions=fn_preds,
+                        output_path=fn_path,
+                        playlist_title="False Negatives (true like, predicted dislike) - correct labels",
+                        annotation_prefix="Predicted"
+                    )
+                    print(f"  Exported {len(fn_songs)} false negatives -> {fn_path}")
+                else:
+                    print("  No false negatives (train+val)")
+            else:
+                print("  No train+val songs with embeddings; skipping error playlists")
+        else:
+            print("  No rated songs in train+val; skipping error playlists")
+
     print("\n" + "=" * 80)
     print("RECOMMENDATION COMPLETE")
     if genre_filter:
@@ -2553,6 +3872,9 @@ def generate_recommendations(
     print(f"  - {output_path} (text recommendations)")
     print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_help.xspf'} (high uncertainty - maximize learning)")
     print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_best.xspf'} (top predictions - validate quality)")
+    if effective_error_size > 0:
+        print(f"  - {playlist_output_dir / f'{filename_prefix}false_positives.xspf'} (worst false positives - true dislike, predicted like)")
+        print(f"  - {playlist_output_dir / f'{filename_prefix}false_negatives.xspf'} (worst false negatives - true like, predicted dislike)")
     print(f"\nNext steps for human-in-the-loop training:")
     print(f"  1. Open XSPF playlists in Clementine")
     print(f"  2. Listen and rate songs")
@@ -2560,15 +3882,15 @@ def generate_recommendations(
     print(f"  4. Repeat for continuous improvement!")
 
 
-def build_waveform_cache(config: dict):
+def build_waveform_cache(config: dict, overwrite: Optional[bool] = None):
     """Pre-populate waveform cache for consistent training speed.
 
-    Supports two caching modes:
-    1. MoCo mode (chunk_cache enabled): 4 evenly-spaced 30s chunks per song
-    2. Legacy mode: Single crop from specified position
+    MoCo mode (chunk_cache enabled): evenly-spaced 30s chunks per song (num_chunks from config).
 
     Args:
         config: Configuration dictionary
+        overwrite: If True, re-extract and overwrite existing chunk files (e.g. when changing num_chunks).
+                  If None, uses config chunk_cache.overwrite. CLI: --overwrite with build-cache.
     """
     from ml_skeleton.music.clementine_db import ClementineDB
 
@@ -2580,7 +3902,7 @@ def build_waveform_cache(config: dict):
     all_songs = db.get_all_songs()
     print(f"  Found {len(all_songs)} songs")
 
-    # Check if using MoCo chunk cache (new 4-chunk strategy)
+    # Check if using MoCo chunk cache (num_chunks per song, default 8)
     chunk_cache_config = music_config.get('chunk_cache', {})
     use_chunk_cache = chunk_cache_config.get('enabled', False)
 
@@ -2588,8 +3910,8 @@ def build_waveform_cache(config: dict):
         # MoCo mode: Use new 4-chunk cache builder
         from ml_skeleton.music.chunk_cache import build_chunk_cache, get_cache_stats
 
-        cache_dir = chunk_cache_config.get('directory', './cache/chunks')
-        num_chunks = chunk_cache_config.get('num_chunks', 4)
+        cache_dir = os.environ.get('CHUNK_CACHE_DIR') or get_chunk_cache_dir(config)
+        num_chunks = chunk_cache_config.get('num_chunks', 8)
         chunk_duration = chunk_cache_config.get('chunk_duration', 30.0)
         num_workers = chunk_cache_config.get('num_workers', None)  # None = 80% CPU
         sample_rate = music_config.get('sample_rate', 16000)
@@ -2603,6 +3925,9 @@ def build_waveform_cache(config: dict):
         print(f"  Max file duration: {max_duration}s")
         print(f"  Workers: {num_workers if num_workers else 'auto (80% CPU)'}")
 
+        overwrite_val = overwrite if overwrite is not None else chunk_cache_config.get('overwrite', False)
+        if overwrite_val:
+            print("  Overwrite: True (re-extracting all chunks)")
         print("\n[3/3] Building chunk cache...")
         stats = build_chunk_cache(
             songs=all_songs,
@@ -2612,7 +3937,7 @@ def build_waveform_cache(config: dict):
             sample_rate=sample_rate,
             max_duration=max_duration,
             num_workers=num_workers,
-            overwrite=False,
+            overwrite=overwrite_val,
             show_progress=True
         )
 
@@ -2626,23 +3951,24 @@ def build_waveform_cache(config: dict):
     else:
         # No legacy mode - MoCo chunk cache is the only supported method
         print("\nERROR: chunk_cache.enabled must be True in config")
-        print("MoCo v2 encoder requires 4-chunk cache. Update your config:")
+        print("MoCo v2 encoder requires chunk cache (num_chunks in chunk_cache). Update your config:")
         print("  music:")
         print("    chunk_cache:")
         print("      enabled: true")
-        print("      directory: ./cache/chunks")
-        print("      num_chunks: 4")
+        print("      directory: (under music.cache_root, e.g. ./chunks)")
+        print(f"      num_chunks: {num_chunks}")
         print("      chunk_duration: 30.0")
         return
 
 
-def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Optional[int] = None):
+def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Optional[int] = None, all_missing: bool = False):
     """Extract acoustic fingerprints from original audio files.
 
     Args:
         config: Configuration dictionary with music and fingerprinting settings
         exhaust: If True, process up to daily API limit (500 for free tier)
         workers: Number of parallel workers (default: from config or 4)
+        all_missing: If True, process all songs missing fingerprints (no max_songs limit)
     """
     from ml_skeleton.music.file_fingerprinter import fingerprint_songs_from_files
     from ml_skeleton.music.fingerprint_db import FingerprintDB
@@ -2674,9 +4000,9 @@ def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Option
     all_songs = clementine_db.get_all_songs()
     print(f"  Loaded {len(all_songs)} songs")
 
-    # Initialize fingerprint database
+    # Initialize fingerprint database (under music.cache_root when path is relative)
     print("\n[2/4] Initializing fingerprint database...")
-    fp_db_path = fp_config.get('fingerprint_db_path', './cache/fingerprints.db')
+    fp_db_path = get_fingerprint_db_path(config)
     fp_db = FingerprintDB(fp_db_path)
     print(f"  Database: {fp_db_path}")
 
@@ -2695,8 +4021,11 @@ def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Option
     # Get prioritization and limit settings
     prioritize_missing = fp_config.get('prioritize_missing_metadata', True)
 
-    # Determine max_songs based on exhaust flag
-    if exhaust:
+    # Determine max_songs based on exhaust and all_missing flags
+    if all_missing:
+        max_songs = None  # No limit: process all missing
+        print("\n⚡ ALL MODE: Processing all songs missing fingerprints (no limit)")
+    elif exhaust:
         # Use daily API limit for the tier
         tier = fp_config.get('acoustid_tier', 'free')
         max_songs = 500 if tier == 'free' else None  # 500 for free tier, unlimited for paid
@@ -2761,6 +4090,113 @@ def fingerprint_songs_stage(config: dict, exhaust: bool = False, workers: Option
     print("")
 
 
+def backfill_fingerprint_bits_stage(config: dict):
+    """Backfill fingerprint DB 'bits' column using the same pipeline as fingerprint_baseline extraction.
+
+    Decode runs inside encoder.forward() (same code path as extraction); we force 256-dim output
+    and pack to 32-byte blobs for the DB.
+    """
+    import copy
+    import sqlite3
+    import numpy as np
+    from tqdm import tqdm
+
+    from ml_skeleton.music.fingerprint_encoder import collate_fingerprint_baseline
+    from ml_skeleton.music.fingerprint_db import FingerprintDB
+
+    print("=" * 80)
+    print("BACKFILL FINGERPRINT BITS (same pipeline as fingerprint_baseline extraction)")
+    print("=" * 80)
+
+    music_config = config.get("music", {})
+    encoder_config = config.get("encoder", {})
+    fp_config = config.get("fingerprinting", {})
+
+    fp_db_path = get_fingerprint_db_path(config)
+    chromaprint_chunk_idx = fp_config.get("chunk_for_fingerprinting", 0)
+
+    # [1/5] Load Clementine (same as train_encoder)
+    print("\n[1/5] Loading Clementine database...")
+    db = ClementineDB(music_config["database_path"])
+    all_songs = db.get_all_songs()
+    print(f"  Loaded {len(all_songs)} songs")
+    album_to_idx, filename_to_albums = build_album_mapping(all_songs)
+
+    # [2/5] Config: fingerprint_baseline with 256-dim output (no projector) so we can pack to 32 bytes.
+    # Order must match working extraction: create_encoder BEFORE create_dataset (chromaprint loads before DB use).
+    print("\n[2/5] Creating encoder then dataset (fingerprint_baseline, 256-dim)...")
+    config_bf = copy.deepcopy(config)
+    config_bf.setdefault("encoder", {})["encoder_type"] = "fingerprint_baseline"
+    config_bf.setdefault("fingerprinting", {})["fingerprint_db_path"] = fp_db_path
+    bl_cfg = config_bf.setdefault("encoder", {}).setdefault("fingerprint_baseline", {})
+    bl_cfg["project_dim"] = None
+    bl_cfg["embedding_dim"] = 256
+
+    encoder = create_encoder(config_bf)
+    encoder.eval()
+    extraction_dataset = create_dataset(
+        config=config_bf,
+        songs=all_songs,
+        album_to_idx=album_to_idx,
+        filename_to_albums=filename_to_albums,
+        is_training=False,
+    )
+    device = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    encoder.to(device)
+    batch_size = encoder_config.get("batch_size", 64)
+    # num_workers=0: avoid fork so chromaprint C state is not corrupted (decoder runs in main process)
+    num_workers = 0
+    all_loader = DataLoader(
+        extraction_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fingerprint_baseline,
+    )
+    print(f"  Dataset: {len(extraction_dataset)} songs, batch_size={batch_size}, num_workers={num_workers} (no fork)")
+
+    # [3/5] Open fingerprint DB for UPDATE only
+    print("\n[3/5] Opening fingerprint database...")
+    FingerprintDB(fp_db_path)  # ensure bits column exists (migration)
+    conn = sqlite3.connect(fp_db_path)
+    cur = conn.execute("PRAGMA table_info(fingerprints)")
+    columns = [row[1] for row in cur.fetchall()]
+    if "bits" not in columns:
+        print("  Adding 'bits' column...")
+        conn.execute("ALTER TABLE fingerprints ADD COLUMN bits BLOB")
+        conn.commit()
+
+    # [4/5] Run decode inside encoder.forward() (exact same path as extraction), pack output to 32 bytes
+    print("\n[4/5] Backfilling bits (encoder.forward() = same as extraction)...")
+    updated = 0
+    failed = 0
+    with torch.no_grad():
+        for batch in tqdm(all_loader, desc="Backfill"):
+            song_ids = batch["song_id"].to(device)
+            vecs = encoder(song_ids)  # (B, 256) - decode happens here, same as extraction
+            vecs = vecs.cpu().numpy()
+            for i in range(vecs.shape[0]):
+                sid = int(song_ids[i].item())
+                blob = np.packbits((vecs[i] > 0.5).astype(np.uint8)).tobytes()
+                if len(blob) != 32:
+                    failed += 1
+                    continue
+                conn.execute(
+                    "UPDATE fingerprints SET bits = ? WHERE song_id = ? AND chunk_idx = ?",
+                    (blob, sid, chromaprint_chunk_idx),
+                )
+                updated += 1
+            # Commit after each batch so encoder's get_fingerprint() in next batch doesn't get "database is locked"
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+
+    # [5/5] Done
+    print(f"\n[5/5] Done: updated {updated}, failed {failed}, total {updated + failed}")
+    print("")
+
+
 def enrich_metadata_stage(config: dict, exhaust: bool = False):
     """Enrich song metadata using AcoustID and MusicBrainz APIs.
 
@@ -2809,9 +4245,9 @@ def enrich_metadata_stage(config: dict, exhaust: bool = False):
     all_songs = clementine_db.get_all_songs()
     print(f"  Loaded {len(all_songs)} songs")
 
-    # Initialize databases
+    # Initialize databases (fingerprint DB: same path as encoder/classifier HPO)
     print("\n[2/5] Initializing databases...")
-    fp_db_path = fp_config.get('fingerprint_db_path', './cache/fingerprints.db')
+    fp_db_path = get_fingerprint_db_path(config)
     mb_db_path = fp_config.get('musicbrainz_db_path', './musicbrainz_metadata.db')
 
     fp_db = FingerprintDB(fp_db_path)
@@ -2936,7 +4372,7 @@ def main():
         '--stage',
         type=str,
         required=True,
-        choices=['encoder', 'classifier', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache', 'fingerprint', 'enrich-metadata', 'init-baseline', 'generate-model-card'],
+        choices=['encoder', 'classifier', 'joint-finetune', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache', 'clear-chunk-cache', 'fingerprint', 'enrich-metadata', 'backfill-fingerprint-bits', 'init-baseline', 'generate-model-card'],
         help='Training stage, recommendation generation, cache building, fingerprinting, metadata enrichment, or hyperparameter tuning'
     )
     parser.add_argument(
@@ -2965,6 +4401,12 @@ def main():
         help='Timeout in seconds for hyperparameter tuning'
     )
     parser.add_argument(
+        '--reset-study',
+        action='store_true',
+        dest='reset_study',
+        help='Delete existing Optuna study from storage before running (fresh HPO run); only applies when optuna_storage is set'
+    )
+    parser.add_argument(
         '--final-training',
         action='store_true',
         help='Use final_training_epochs (50) instead of epochs (20) for training with best hyperparameters'
@@ -2974,6 +4416,13 @@ def main():
         type=str,
         default=None,
         help='Path to best parameters JSON file (from HPO) to override config values'
+    )
+    parser.add_argument(
+        '--mlflow-run-id',
+        type=str,
+        default=None,
+        dest='mlflow_run_id',
+        help='MLflow run ID (e.g. classifier HPO parent run) to load hyperparameters from instead of --best-params'
     )
     parser.add_argument(
         '--encoder-type',
@@ -3018,11 +4467,24 @@ def main():
         help='Number of parallel workers for fingerprinting (default: 4, or from config)'
     )
     parser.add_argument(
+        '--all',
+        action='store_true',
+        dest='fingerprint_all',
+        help='Fingerprint stage: process all missing songs (no max_songs limit). Skip existing is still applied.'
+    )
+    parser.add_argument(
         '-N', '--num-runs',
         type=int,
         default=1,
         dest='num_runs',
         help='Number of training runs with different seeds (reports mean/std, saves best model)'
+    )
+    parser.add_argument(
+        '--reps',
+        type=int,
+        default=None,
+        dest='reps',
+        help='Classifier HPO only: repetitions per trial with different init seeds; best (min) value and seed reported. Default: 1.'
     )
     parser.add_argument(
         '--prod-dir',
@@ -3046,6 +4508,14 @@ def main():
              'Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world'
     )
     parser.add_argument(
+        '--error-playlist-size',
+        type=int,
+        default=None,
+        dest='error_playlist_size',
+        help='Max songs per false_positives / false_negatives playlist. '
+             'Default: from config (100). Use 0 to disable error playlists.'
+    )
+    parser.add_argument(
         '--random-init',
         action='store_true',
         dest='random_init',
@@ -3055,10 +4525,16 @@ def main():
     parser.add_argument(
         '--vault-size',
         type=int,
-        default=200,
+        default=1000,
         dest='vault_size',
-        help='Number of ratings to reserve in vault for A/B testing only (default: 200). '
+        help='Number of ratings to reserve in vault for A/B testing only (default: 1000). '
              'Vault files are never used for training, only for comparing models.'
+    )
+    parser.add_argument(
+        '--overwrite',
+        action='store_true',
+        dest='overwrite_cache',
+        help='With build-cache: overwrite existing chunk files (use when changing num_chunks).'
     )
 
     args = parser.parse_args()
@@ -3071,14 +4547,50 @@ def main():
     # Load configuration
     config = load_config(args.config)
 
+    # Apply GPU memory limit from config before any CUDA use (avoids OOM, consistent with config)
+    gpu_limit_gb = config.get("gpu_memory_limit_gb", 0)
+    if gpu_limit_gb and float(gpu_limit_gb) > 0:
+        limit_gpu_memory(max_memory_gb=float(gpu_limit_gb))
+
     # Apply encoder type override if provided
     if args.encoder_type:
         config['encoder']['encoder_type'] = args.encoder_type
         print(f"Encoder type overridden to: {args.encoder_type}")
+    elif args.stage == 'tune-encoder' and config.get('encoder', {}).get('encoder_type') == 'fingerprint_baseline':
+        # Encoder HPO must train the real encoder (MoCo), not fingerprint_baseline (extraction-only)
+        config['encoder']['encoder_type'] = 'moco'
+        print("Encoder HPO: using encoder_type=moco (config had fingerprint_baseline; add --encoder-type to override)")
 
-    # Apply best parameters if provided
-    if args.best_params:
-        import json
+    # Apply best parameters: from MLflow run (classifier only) or from JSON file
+    if args.stage == 'classifier' and args.mlflow_run_id:
+        tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
+        print(f"\nLoading classifier hyperparameters from MLflow run: {args.mlflow_run_id}")
+        best_params, hpo_run_name = load_classifier_params_from_mlflow_run(tracking_uri, args.mlflow_run_id)
+        print("Applying parameters to classifier config:")
+        for key, value in best_params.items():
+            config['classifier'][key] = value
+            print(f"  {key} = {value}")
+        config['classifier']['hpo_mlflow_run_id'] = args.mlflow_run_id
+        config['classifier']['hpo_mlflow_run_name'] = hpo_run_name
+        # Fetch HPO best val ROC AUC and best_training_seed from parent run for final-training
+        try:
+            from mlflow.tracking import MlflowClient
+            client = MlflowClient(tracking_uri=tracking_uri)
+            run = client.get_run(args.mlflow_run_id)
+            hpo_auc = (run.data.metrics or {}).get("best_val_roc_auc")
+            if hpo_auc is not None:
+                config['classifier']['hpo_val_roc_auc'] = float(hpo_auc)
+            # Ensure final training uses same seed as HPO best run (param is best_training_seed on parent)
+            seed_param = (run.data.params or {}).get("best_training_seed")
+            if seed_param is not None:
+                try:
+                    config['classifier']['training_seed'] = int(float(seed_param))
+                except (TypeError, ValueError):
+                    config['classifier']['training_seed'] = seed_param
+        except Exception:
+            pass
+        print("")
+    elif args.best_params:
         print(f"\nLoading best parameters from: {args.best_params}")
         with open(args.best_params, 'r') as f:
             best_params = json.load(f)
@@ -3095,6 +4607,13 @@ def main():
             for key, value in best_params.items():
                 config['classifier'][key] = value
                 print(f"  {key} = {value}")
+            if best_params.get('mlflow_parent_run_id'):
+                config['classifier']['hpo_mlflow_run_id'] = best_params['mlflow_parent_run_id']
+                tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
+                try:
+                    config['classifier']['hpo_mlflow_run_name'] = get_mlflow_run_name(tracking_uri, best_params['mlflow_parent_run_id'])
+                except Exception:
+                    config['classifier']['hpo_mlflow_run_name'] = ""
         print("")
 
     # Run stage
@@ -3110,14 +4629,33 @@ def main():
         print("\nNext step: Run with --stage classifier to train the rating predictor")
 
     elif args.stage == 'classifier':
+        # Use same seed as winning HPO run: from MLflow (best_training_seed), JSON (best_reps_seed), or config (init_seed)
+        clf_cfg = config.get('classifier', {})
+        training_seed = None
+        if args.best_params or args.mlflow_run_id:
+            # Prefer: best_reps_seed (from JSON), then training_seed (from MLflow best_training_seed), then init_seed (config)
+            training_seed = clf_cfg.get('best_reps_seed')
+            if training_seed is None:
+                training_seed = clf_cfg.get('training_seed')
+            if training_seed is None:
+                training_seed = clf_cfg.get('init_seed')
+            if training_seed is not None:
+                training_seed = int(training_seed)
+                print(f"Using init seed from HPO best run: {training_seed}")
         model_card = train_classifier(
             config,
             final_training=args.final_training,
             classifier_version_override=args.classifier_version,
             num_runs=args.num_runs,
             init_from_prod=not args.random_init,
-            vault_size=args.vault_size
+            vault_size=args.vault_size,
+            training_seed=training_seed,
         )
+        cleanup_memory()
+        print("\nNext step: Run with --stage recommend or --stage joint-finetune (if enabled) to push accuracy further")
+
+    elif args.stage == 'joint-finetune':
+        train_joint_finetune(config, verbose=True)
         cleanup_memory()
         print("\nNext step: Run with --stage recommend to generate recommendations")
 
@@ -3126,7 +4664,8 @@ def main():
             config,
             prod_dir=args.prod_dir,
             low_rating_ratio=args.low_rating_ratio,
-            genre_filter=args.genre
+            genre_filter=args.genre,
+            error_playlist_size=args.error_playlist_size
         )
         cleanup_memory()
 
@@ -3139,13 +4678,47 @@ def main():
         print("This avoids slowdowns during training when loading uncached files.")
         print("")
 
-        build_waveform_cache(config)
+        build_waveform_cache(config, overwrite=args.overwrite_cache)
         cleanup_memory()
         print("\nCache build complete! Training will now have consistent speed.")
 
+    elif args.stage == 'clear-chunk-cache':
+        # Remove only chunk cache directory; preserve fingerprint DB (same DB for encoder/classifier/fingerprint)
+        music_config = config.get('music', {})
+        chunk_config = music_config.get('chunk_cache', {})
+        chunk_dir = chunk_config.get('directory') or music_config.get('waveform_cache_dir') or './cache/chunks'
+        chunk_dir = os.path.abspath(chunk_dir)
+        fp_path = get_fingerprint_db_path(config)
+        print("\n" + "=" * 60)
+        print("CLEAR CHUNK CACHE (fingerprint DB preserved)")
+        print("=" * 60)
+        print(f"  Chunk cache dir: {chunk_dir}")
+        print(f"  Fingerprint DB (kept): {fp_path}")
+        if not os.path.isdir(chunk_dir):
+            print("  No chunk cache directory found. Nothing to clear.")
+        else:
+            import shutil
+            n_files = 0
+            size_bytes = 0
+            for root, _, files in os.walk(chunk_dir):
+                for f in files:
+                    n_files += 1
+                    try:
+                        size_bytes += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            size_gb = size_bytes / (1024**3)
+            print(f"  Files: {n_files}, size: ~{size_gb:.1f} GB")
+            reply = input("  Delete chunk cache only? [y/N] ").strip().lower()
+            if reply == 'y':
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+                print("  Chunk cache cleared. Fingerprint DB untouched.")
+            else:
+                print("  Skipped.")
+
     elif args.stage == 'fingerprint':
         # Extract acoustic fingerprints from original files
-        fingerprint_songs_stage(config, exhaust=args.exhaust, workers=args.workers)
+        fingerprint_songs_stage(config, exhaust=args.exhaust, workers=args.workers, all_missing=getattr(args, 'fingerprint_all', False))
         cleanup_memory()
 
     elif args.stage == 'enrich-metadata':
@@ -3153,15 +4726,24 @@ def main():
         enrich_metadata_stage(config, exhaust=args.exhaust)
         cleanup_memory()
 
+    elif args.stage == 'backfill-fingerprint-bits':
+        # Backfill fingerprint DB 'bits' column using same pipeline as fingerprint_baseline extraction
+        # (main process, same DataLoader/encoder load order) so chromaprint decoder does not crash
+        backfill_fingerprint_bits_stage(config)
+        cleanup_memory()
+
     elif args.stage == 'all':
-        # Run complete pipeline: encoder -> classifier -> model card
+        # Run complete pipeline: encoder -> classifier -> [joint-finetune if enabled] -> model card
+        jf_enabled = config.get("joint_finetune", {}).get("enabled", False)
         print("\n" + "=" * 80)
         print("RUNNING COMPLETE PIPELINE")
         print("=" * 80)
         print("This will run:")
         print("  1. Encoder training (Stage 1)")
         print("  2. Classifier training (Stage 2)")
-        print("  3. Model card generation")
+        if jf_enabled:
+            print("  3. Joint fine-tune (encoder + classifier on audio)")
+        print("  Model card generation")
         print("")
 
         # Stage 1: Train encoder
@@ -3184,6 +4766,11 @@ def main():
             vault_size=args.vault_size
         )
         cleanup_memory()
+
+        # Optional: Joint fine-tune (freeze → train classifier → unfreeze both)
+        if jf_enabled:
+            train_joint_finetune(config, verbose=True)
+            cleanup_memory()
 
         print("\n" + "=" * 80)
         print("COMPLETE PIPELINE FINISHED")
@@ -3210,20 +4797,23 @@ def main():
             hyperparameters=config['encoder'].copy(),
             seed=config.get('seed', 42),
             checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
-            artifact_dir=config.get('artifact_dir', './artifacts')
+            artifact_dir=config.get('artifact_dir', './artifacts'),
+            tags=config.get('tags', {}),
         )
 
         # Configure MLflow
         if 'mlflow' in config:
             exp_config.mlflow = MLflowConfig(**config['mlflow'])
 
-        # Configure tuning
+        # Configure tuning (optuna_storage for persistence; reset_study for fresh HPO)
         exp_config.tuning = TuningConfig(
             tuner_type=TunerType.OPTUNA if args.tuner == 'optuna' else TunerType.RAY_TUNE,
             n_trials=n_trials,
             timeout=args.timeout,
             sampler=tuning_dict.get('sampler', 'TPESampler'),
-            pruner=tuning_dict.get('pruner', 'MedianPruner')
+            pruner=tuning_dict.get('pruner', 'MedianPruner'),
+            optuna_storage=tuning_dict.get('optuna_storage'),
+            reset_study=getattr(args, 'reset_study', False),
         )
 
         # Set encoder search space
@@ -3232,6 +4822,8 @@ def main():
                 parameters=tuning_dict['encoder_search_space']['parameters']
             )
 
+        tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
+        print(f"MLflow UI: {tracking_uri}")
         print(f"Tuner: {args.tuner}")
         print(f"Trials: {n_trials}")
         if args.num_runs > 1:
@@ -3258,12 +4850,20 @@ def main():
         checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
         best_params_file = checkpoint_dir / 'best_encoder_params.json'
         best_params_file.parent.mkdir(parents=True, exist_ok=True)
+        to_save = dict(results['best_params'])
+        if results.get('mlflow_parent_run_id'):
+            to_save['mlflow_parent_run_id'] = results['mlflow_parent_run_id']
         with open(best_params_file, 'w') as f:
-            json.dump(results['best_params'], f, indent=2)
+            json.dump(to_save, f, indent=2)
         print(f"\nBest parameters saved to: {best_params_file}")
 
-        # Check if HPO best checkpoint exists
+        # Check if HPO best checkpoint exists; write MLflow parent run ID into it for traceability
         hpo_best_checkpoint = checkpoint_dir / 'encoder_hpo_best.pt'
+        if hpo_best_checkpoint.exists() and results.get('mlflow_parent_run_id'):
+            enc_ckpt = torch.load(hpo_best_checkpoint, map_location='cpu', weights_only=False)
+            enc_ckpt['mlflow_parent_run_id'] = results['mlflow_parent_run_id']
+            torch.save(enc_ckpt, hpo_best_checkpoint)
+            print(f"  MLflow HPO parent run ID saved to checkpoint: {hpo_best_checkpoint}")
         if hpo_best_checkpoint.exists():
             print(f"Best HPO model saved to: {hpo_best_checkpoint}")
             print("\nTo continue training from best HPO model with best parameters:")
@@ -3272,6 +4872,16 @@ def main():
         else:
             print("\nTo run final training with best parameters:")
             print("  python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml --final-training")
+
+        if results.get('mlflow_parent_run_id'):
+            tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
+            run_id = results['mlflow_parent_run_id']
+            print("\n" + "=" * 40)
+            print("MLflow best run (HPO parent)")
+            print("=" * 40)
+            print(f"  Run ID: {run_id}")
+            print(f"  View at: {tracking_uri}/#/runs/{run_id}")
+            print("=" * 40)
 
     elif args.stage == 'tune-classifier':
         # Hyperparameter tuning for classifier
@@ -3283,8 +4893,8 @@ def main():
         embedding_db_path = config['music']['embedding_db_path']
         if not Path(embedding_db_path).exists():
             print(f"ERROR: Embeddings database not found: {embedding_db_path}")
-            print("Run encoder training first:")
-            print("  python examples/music_recommendation.py --stage encoder --config configs/music_recommendation.yaml")
+            print("Run encoder training first (or fingerprint-baseline extraction with encoder_type: fingerprint_baseline):")
+            print("  python examples/music_recommendation.py --stage encoder --config configs/music_moco.yaml")
             sys.exit(1)
 
         # Create ExperimentConfig manually (our music config has custom structure)
@@ -3294,27 +4904,37 @@ def main():
         tuning_dict = config.get('tuning', {})
         n_trials = args.n_trials if args.n_trials else tuning_dict.get('n_trials', 20)
 
+        # Experiment name includes encoder_version so each embedding type gets its own
+        # Optuna study (avoids mixing trials when switching e.g. fingerprint_baseline vs moco).
+        base_name = config.get('name', 'music_recommendation_classifier')
+        encoder_version = config.get('music', {}).get('encoder_version', 'default')
+        exp_name = f"{base_name}_classifier_{encoder_version}"
+
         # Create experiment config
         exp_config = ExperimentConfig(
-            name=config.get('name', 'music_recommendation_classifier'),
+            name=exp_name,
             framework=config.get('framework', 'pytorch'),
             hyperparameters=config['classifier'].copy(),
             seed=config.get('seed', 42),
             checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
-            artifact_dir=config.get('artifact_dir', './artifacts')
+            artifact_dir=config.get('artifact_dir', './artifacts'),
+            tags=config.get('tags', {}),
         )
 
         # Configure MLflow
         if 'mlflow' in config:
             exp_config.mlflow = MLflowConfig(**config['mlflow'])
 
-        # Configure tuning
+        # Configure tuning (optuna_storage so studies persist; study name = exp_name + "_optuna")
         exp_config.tuning = TuningConfig(
             tuner_type=TunerType.OPTUNA if args.tuner == 'optuna' else TunerType.RAY_TUNE,
             n_trials=n_trials,
             timeout=args.timeout,
             sampler=tuning_dict.get('sampler', 'TPESampler'),
-            pruner=tuning_dict.get('pruner', 'MedianPruner')
+            pruner=tuning_dict.get('pruner', 'MedianPruner'),
+            optuna_storage=tuning_dict.get('optuna_storage'),
+            reset_study=getattr(args, 'reset_study', False),
+            parent_run_name_prefix="classifier-tune-hpo",
         )
 
         # Set classifier search space
@@ -3323,15 +4943,20 @@ def main():
                 parameters=tuning_dict['classifier_search_space']['parameters']
             )
 
+        # Reps per trial (different init seeds); default from config or 1
+        reps = args.reps if getattr(args, 'reps', None) is not None else tuning_dict.get('reps', 1)
+        reps = max(1, int(reps))
+
+        tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
+        print(f"MLflow UI: {tracking_uri}")
         print(f"Tuner: {args.tuner}")
         print(f"Trials: {n_trials}")
-        if args.num_runs > 1:
-            print(f"Runs per trial: {args.num_runs} (min MAE used as objective)")
+        print(f"Reps per trial: {reps} (best min value and init seed reported)")
         print(f"Search space parameters: {list(exp_config.tuning.search_space.parameters.keys())}")
         print("")
 
-        # Create training function (pass n_trials for progress logging)
-        train_fn = create_classifier_training_fn(config, n_trials=n_trials, hpo_runs=args.num_runs)
+        # Create training function (pass n_trials and reps for progress logging and multi-seed)
+        train_fn = create_classifier_training_fn(config, n_trials=n_trials, hpo_runs=reps)
 
         # Run hyperparameter tuning
         results = run_experiment(train_fn, exp_config, tune=True)
@@ -3340,20 +4965,64 @@ def main():
         print("CLASSIFIER TUNING COMPLETE")
         print("=" * 80)
         print(f"Best value: {results['best_value']:.6f}")
+        # Best init seed (when reps > 1)
+        best_trial = results.get('study') and results['study'].best_trial
+        best_reps_seed = _trial_best_reps_seed.get(best_trial.number) if best_trial is not None else None
+        seed_used = best_reps_seed if best_reps_seed is not None else config.get('seed', 42)
+        if best_trial is not None:
+            print(f"Best trial number: {best_trial.number} (in MLflow: open parent run → find child with tag trial_number={best_trial.number})")
+        print(f"Best run seed: {seed_used} (run name under that trial: seed_{seed_used})")
         print(f"Best parameters:")
         for key, value in results['best_params'].items():
             print(f"  {key}: {value}")
 
-        # Save best parameters to file for automated pipeline
+        # Save best parameters, seed, and best trial number (so you can find the run in MLflow: parent -> trial N -> seed_*)
         import json
         best_params_file = Path(config.get('checkpoint_dir', './checkpoints')) / 'best_classifier_params.json'
         best_params_file.parent.mkdir(parents=True, exist_ok=True)
+        to_save = dict(results['best_params'])
+        to_save['best_reps_seed'] = seed_used
+        if best_trial is not None:
+            to_save['best_trial_number'] = best_trial.number
+        if results.get('mlflow_parent_run_id'):
+            to_save['mlflow_parent_run_id'] = results['mlflow_parent_run_id']
+        # Save HPO best val ROC AUC for final-training comparison (when HPO optimized val_roc_auc)
+        hpo_metric = config.get('classifier', {}).get('hpo_metric', 'val_roc_auc')
+        if hpo_metric == 'val_roc_auc':
+            to_save['hpo_val_roc_auc'] = 1.0 - results['best_value']
         with open(best_params_file, 'w') as f:
-            json.dump(results['best_params'], f, indent=2)
+            json.dump(to_save, f, indent=2)
         print(f"\nBest parameters saved to: {best_params_file}")
+
+        # Save MLflow parent run ID into the classifier checkpoint for traceability
+        checkpoint_path = Path(config.get('checkpoint_dir', './checkpoints')) / 'classifier_best.pt'
+        if results.get('mlflow_parent_run_id') and checkpoint_path.exists():
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            checkpoint['mlflow_parent_run_id'] = results['mlflow_parent_run_id']
+            torch.save(checkpoint, checkpoint_path)
+            print(f"  MLflow HPO parent run ID saved to checkpoint: {checkpoint_path}")
 
         print("\nUpdate your config file with these parameters and run:")
         print("  python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml --final-training")
+
+        if results.get('mlflow_parent_run_id'):
+            tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
+            run_id = results['mlflow_parent_run_id']
+            # Log best run's seed and best val ROC AUC to parent for final-training comparison
+            from mlflow.tracking import MlflowClient
+            try:
+                client = MlflowClient(tracking_uri=tracking_uri)
+                client.log_param(run_id, "best_training_seed", str(seed_used))
+                if hpo_metric == 'val_roc_auc':
+                    client.log_metric(run_id, "best_val_roc_auc", 1.0 - results['best_value'])
+            except Exception as e:
+                print(f"  Note: could not log best_training_seed/best_val_roc_auc to MLflow: {e}")
+            print("\n" + "=" * 40)
+            print("MLflow best run (HPO parent)")
+            print("=" * 40)
+            print(f"  Run ID: {run_id}")
+            print(f"  View at: {tracking_uri}/#/runs/{run_id}")
+            print("=" * 40)
 
     elif args.stage == 'init-baseline':
         # Create a random baseline classifier for A/B testing workflow testing
@@ -3394,7 +5063,9 @@ def main():
         classifier = SimpleRatingClassifier(
             embedding_dim=embedding_dim,
             hidden_dims=hidden_dims,
-            dropout=0.0
+            dropout=0.0,
+            use_batch_norm=classifier_config.get('use_batch_norm', False),
+            use_residual=classifier_config.get('use_residual', False),
         )
 
         # Random initialization is default - just save it
@@ -3408,6 +5079,8 @@ def main():
             'classifier_version': 'random_baseline',
             'embedding_dim': embedding_dim,
             'hidden_dims': hidden_dims,
+            'use_batch_norm': classifier_config.get('use_batch_norm', False),
+            'use_residual': classifier_config.get('use_residual', False),
         }, checkpoint_path)
 
         print(f"  Random baseline classifier saved to: {checkpoint_path}")
@@ -3692,6 +5365,8 @@ def main():
                 'train_size': n_train,
                 'val_size': n_val,
                 'vault_size': n_vault,
+                'train_prevalence': manifest_data.get('metadata', {}).get('train_prevalence'),
+                'val_prevalence': manifest_data.get('metadata', {}).get('val_prevalence'),
                 'metadata': {
                     'ab_test_result': ab_result
                 }

@@ -76,7 +76,7 @@ uptime                  # Load OK?
 ```bash
 ls -lh embeddings.db                    # Embeddings saved?
 ls -lht checkpoints/ | head             # Checkpoints?
-python diagnose_variance_simple.py      # Embedding quality?
+sqlite3 embeddings.db "SELECT COUNT(*) FROM embeddings;"  # Row count
 ```
 
 ---
@@ -134,15 +134,10 @@ ls -lt checkpoints/encoder_*.pth | head -5
 ## ✨ After Training Completes
 
 ```bash
-# 1. Verify embeddings are good
-python diagnose_variance_simple.py
+# 1. Verify embeddings were written
+sqlite3 embeddings.db "SELECT COUNT(*) FROM embeddings;"
 
-# Should see:
-# ✓ Unique embeddings: >90% (not 0.02%)
-# ✓ Mean std: >0.1 (not 0.000002)
-# ✓ Zero variance dims: <10% (not 71%)
-
-# 2. If good, train classifier
+# 2. Train classifier
 ./run_music_pipeline.sh classifier
 
 # 3. If bad, check training logs for issues

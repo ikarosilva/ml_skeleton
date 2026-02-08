@@ -26,6 +26,7 @@ from typing import Optional, Tuple
 from nnAudio.features import CQT2010v2
 
 from ml_skeleton.music.genre_mapper import NUM_GENRES
+from ml_skeleton.music.chunk_fingerprinter import CHROMAPRINT_BITS
 
 
 class CQTTransform(nn.Module):
@@ -182,7 +183,8 @@ class MoCoEncoder(nn.Module):
         queue_size: int = 4096,
         momentum: float = 0.999,
         temperature: float = 0.07,
-        pretrained_backbone: bool = True
+        pretrained_backbone: bool = True,
+        use_chromaprint: bool = False
     ):
         super().__init__()
 
@@ -192,6 +194,7 @@ class MoCoEncoder(nn.Module):
         self.queue_size = queue_size
         self.momentum = momentum
         self.temperature = temperature
+        self.use_chromaprint = use_chromaprint
 
         # CQT transform (GPU-accelerated)
         self.cqt_transform = CQTTransform(
@@ -222,6 +225,12 @@ class MoCoEncoder(nn.Module):
 
         # Genre classification head (uses query encoder backbone)
         self.genre_head = GenreHead(in_dim=embedding_dim, num_genres=num_genres)
+
+        # Optional chromaprint head (predicts 256-bit chromaprint from backbone embedding)
+        if use_chromaprint:
+            self.chromaprint_head = nn.Linear(embedding_dim, CHROMAPRINT_BITS)
+        else:
+            self.chromaprint_head = None
 
         # MoCo queue
         self.register_buffer("queue", torch.randn(projection_dim, queue_size))
@@ -343,6 +352,10 @@ class MoCoEncoder(nn.Module):
             "logits_genre": logits_genre
         }
 
+        # Chromaprint prediction (optional regularization target)
+        if self.chromaprint_head is not None:
+            result["logits_chromaprint"] = self.chromaprint_head(embedding_q)
+
         # Training mode: compute contrastive loss components
         if x_k is not None:
             with torch.no_grad():
@@ -399,32 +412,38 @@ class MoCoEncoder(nn.Module):
 
 
 class MoCoLoss(nn.Module):
-    """Combined loss for MoCo + Genre BCE training.
+    """Combined loss for MoCo + Genre BCE + optional Chromaprint BCE.
 
-    Loss = moco_weight * NT-Xent + genre_weight * BCE
+    Loss = moco_weight * NT-Xent + genre_weight * BCE + chromaprint_weight * BCE_chromaprint
 
     Args:
         moco_weight: Weight for contrastive loss (default: 0.6)
         genre_weight: Weight for genre BCE loss (default: 0.4)
+        chromaprint_weight: Weight for chromaprint BCE (default: 0.0)
     """
 
     def __init__(
         self,
         moco_weight: float = 0.6,
-        genre_weight: float = 0.4
+        genre_weight: float = 0.4,
+        chromaprint_weight: float = 0.0
     ):
         super().__init__()
         self.moco_weight = moco_weight
         self.genre_weight = genre_weight
+        self.chromaprint_weight = chromaprint_weight
         self.ce_loss = nn.CrossEntropyLoss()
-        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction="none")
 
     def forward(
         self,
         logits_contrastive: torch.Tensor,
         labels_contrastive: torch.Tensor,
         logits_genre: torch.Tensor,
-        labels_genre: torch.Tensor
+        labels_genre: torch.Tensor,
+        logits_chromaprint: Optional[torch.Tensor] = None,
+        chromaprint_target: Optional[torch.Tensor] = None,
+        chromaprint_valid: Optional[torch.Tensor] = None
     ) -> dict:
         """Compute combined loss.
 
@@ -433,24 +452,46 @@ class MoCoLoss(nn.Module):
             labels_contrastive: (B,) targets (all zeros)
             logits_genre: (B, num_genres) genre logits
             labels_genre: (B, num_genres) multi-hot genre labels
+            logits_chromaprint: (B, 256) chromaprint logits (optional)
+            chromaprint_target: (B, 256) binary targets 0/1 (optional)
+            chromaprint_valid: (B,) bool, True where chromaprint is available (optional)
 
         Returns:
             Dictionary with:
             - loss: Combined weighted loss
             - loss_moco: Contrastive loss
             - loss_genre: Genre BCE loss
+            - loss_chromaprint: Chromaprint BCE loss (if enabled)
         """
         # MoCo contrastive loss (cross-entropy, positive at index 0)
         loss_moco = self.ce_loss(logits_contrastive, labels_contrastive)
 
         # Genre BCE loss (multi-label)
-        loss_genre = self.bce_loss(logits_genre, labels_genre)
+        loss_genre = self.bce_loss(logits_genre, labels_genre).mean()
 
-        # Combined loss
+        # Combined loss so far
         loss = self.moco_weight * loss_moco + self.genre_weight * loss_genre
 
-        return {
+        loss_chromaprint = None
+        if (
+            self.chromaprint_weight > 0
+            and logits_chromaprint is not None
+            and chromaprint_target is not None
+            and chromaprint_valid is not None
+        ):
+            # Per-element BCE, then mask by valid and mean over valid samples
+            bce_per = self.bce_loss(logits_chromaprint, chromaprint_target)
+            # (B, 256) -> sum over bits, then mask by valid
+            bce_per_sample = bce_per.mean(dim=1)
+            n_valid = chromaprint_valid.sum().clamp(min=1)
+            loss_chromaprint = (bce_per_sample * chromaprint_valid.float()).sum() / n_valid
+            loss = loss + self.chromaprint_weight * loss_chromaprint
+
+        out = {
             "loss": loss,
             "loss_moco": loss_moco,
             "loss_genre": loss_genre
         }
+        if loss_chromaprint is not None:
+            out["loss_chromaprint"] = loss_chromaprint
+        return out

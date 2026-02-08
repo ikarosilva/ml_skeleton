@@ -1,19 +1,16 @@
 """Chunked waveform cache builder for MoCo training.
 
-Caches 4 evenly-spaced 30s chunks per song as .npy files for fast loading.
+Caches N evenly-spaced 30s chunks per song as .npy files (default 8).
 This enables:
 - 15x faster loading vs MP3 decoding
 - Fresh augmentations each epoch (CQT computed on-the-fly)
 - Capturing song structure diversity (intro, verse, chorus, outro)
 
 Cache structure:
-    ./cache/chunks/{song_id}_0.npy  # First chunk (0-30s region)
-    ./cache/chunks/{song_id}_1.npy  # Second chunk
-    ./cache/chunks/{song_id}_2.npy  # Third chunk
-    ./cache/chunks/{song_id}_3.npy  # Fourth chunk (end region)
+    ./cache/chunks/{song_id}_0.npy ... {song_id}_{N-1}.npy
 
 Each .npy file contains float32 PCM at 16kHz, shape (480000,) = 30s.
-Total storage: ~30GB for 60K songs (4 chunks × 30s × 16kHz × 4 bytes).
+Total storage: ~60GB for 60K songs at 8 chunks × 30s × 16kHz × 4 bytes.
 """
 
 import os
@@ -33,7 +30,7 @@ from ml_skeleton.music.clementine_db import Song
 # Default cache parameters
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHUNK_DURATION = 30.0  # seconds per chunk
-DEFAULT_NUM_CHUNKS = 4
+DEFAULT_NUM_CHUNKS = 8
 DEFAULT_CACHE_DIR = "./cache/chunks"
 
 
@@ -55,7 +52,7 @@ def get_chunk_cache_path(
 
     Args:
         song_id: Song row ID from database
-        chunk_idx: Chunk index (0-3)
+        chunk_idx: Chunk index (0 to num_chunks-1)
         cache_dir: Base cache directory
 
     Returns:
@@ -71,7 +68,7 @@ def compute_chunk_offsets(
 ) -> List[float]:
     """Compute evenly-spaced chunk start offsets.
 
-    For a 4-minute song with 4 chunks of 30s each:
+    For a 4-minute song with 8 chunks of 30s each:
     - Total extractable: 240s - 30s = 210s range
     - Spacing: 210s / 3 = 70s between chunk starts
     - Offsets: [0, 70, 140, 210] seconds
@@ -370,7 +367,7 @@ def load_cached_chunk(
 
     Args:
         song_id: Song row ID
-        chunk_idx: Chunk index (0-3)
+        chunk_idx: Chunk index (0 to num_chunks-1)
         cache_dir: Cache directory
 
     Returns:
@@ -383,6 +380,9 @@ def load_cached_chunk(
 
     try:
         data = np.load(cache_path)
+        # Reject corrupted/malformed .npy (avoids malloc invalid size from bad shape)
+        if data.ndim != 1 or data.size < 100_000 or data.size > 2_000_000:
+            return None
         return torch.from_numpy(data)
     except Exception:
         return None

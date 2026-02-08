@@ -136,7 +136,7 @@ def fingerprint_chunk(
 
     Args:
         song_id: Song ID from Clementine database
-        chunk_idx: Chunk index (0-3)
+        chunk_idx: Chunk index (0 to num_chunks-1)
         cache_dir: Directory containing cached chunks
         sample_rate: Audio sample rate
 
@@ -253,7 +253,7 @@ def fingerprint_songs(
         songs: List of Song objects to fingerprint
         cache_dir: Directory containing cached chunks
         fp_db: FingerprintDB instance for storage
-        chunk_idx: Which chunk to use for fingerprinting (0-3, default: 1 = middle)
+        chunk_idx: Which chunk to use for fingerprinting (0 to num_chunks-1, default: 1 = middle)
         sample_rate: Audio sample rate
         num_workers: Number of parallel workers (default: 8)
         skip_existing: Skip songs that already have fingerprints in DB
@@ -350,13 +350,15 @@ def fingerprint_songs(
                     stats["errors"].append(f"Song {result.song_id}: {result.error}")
                 else:
                     stats["fingerprinted"] += 1
+                    bits_blob = _fingerprint_to_bits_blob(result.fingerprint)
                     fingerprints_to_add.append(
                         Fingerprint(
                             song_id=result.song_id,
                             chunk_idx=result.chunk_idx,
                             fingerprint=result.fingerprint,
                             duration=result.duration,
-                            mtime=result.mtime
+                            mtime=result.mtime,
+                            bits=bits_blob,
                         )
                     )
     else:
@@ -368,13 +370,15 @@ def fingerprint_songs(
                 stats["errors"].append(f"Song {result.song_id}: {result.error}")
             else:
                 stats["fingerprinted"] += 1
+                bits_blob = _fingerprint_to_bits_blob(result.fingerprint)
                 fingerprints_to_add.append(
                     Fingerprint(
                         song_id=result.song_id,
                         chunk_idx=result.chunk_idx,
                         fingerprint=result.fingerprint,
                         duration=result.duration,
-                        mtime=result.mtime
+                        mtime=result.mtime,
+                        bits=bits_blob,
                     )
                 )
 
@@ -404,7 +408,7 @@ def fingerprint_all_chunks(
         songs: List of Song objects to fingerprint
         cache_dir: Directory containing cached chunks
         fp_db: FingerprintDB instance for storage
-        num_chunks: Number of chunks per song (default: 4)
+        num_chunks: Number of chunks per song (default: 8)
         sample_rate: Audio sample rate
         num_workers: Number of parallel workers
         skip_existing: Skip songs that already have complete fingerprints
@@ -450,6 +454,82 @@ def fingerprint_all_chunks(
     return total_stats
 
 
+# Chromaprint bit vector size (for encoder regularization target)
+CHROMAPRINT_BITS = 256
+
+
+def fingerprint_to_bits(fingerprint_b64: "str | bytes") -> Optional[np.ndarray]:
+    """Decode base64 chromaprint to a fixed-size bit vector for loss targets.
+
+    Uses pure-Python decoder (chromaprint_decode) to avoid C library malloc crashes
+    in some environments. Falls back to C chromaprint.decode_fingerprint only if
+    USE_CHROMAPRINT_C_DECODE=1 is set.
+
+    Args:
+        fingerprint_b64: Base64- or base64url-encoded chromaprint (str or bytes from FingerprintDB).
+            Base64url (AcoustID style) uses - and _ instead of + and /; we normalize to standard base64.
+
+    Returns:
+        Float32 array of shape (CHROMAPRINT_BITS,) with values 0.0 or 1.0,
+        or None if decoding failed.
+    """
+    import os
+
+    try:
+        # SQLite/DB may return TEXT as bytes; normalize to str for base64url fix
+        if isinstance(fingerprint_b64, bytes):
+            fingerprint_b64 = fingerprint_b64.decode("utf-8")
+        b64 = fingerprint_b64.replace("-", "+").replace("_", "/")
+        pad = 4 - (len(b64) % 4)
+        if pad != 4:
+            b64 += "=" * pad
+
+        raw_uint32 = None
+        if os.environ.get("USE_CHROMAPRINT_C_DECODE") == "1":
+            raw_uint32, _ = chromaprint.decode_fingerprint(b64.encode("utf-8"))
+        else:
+            from ml_skeleton.music.chromaprint_decode import decode_fingerprint_python
+            result = decode_fingerprint_python(fingerprint_b64)
+            if result:
+                raw_uint32 = result[0]
+
+        if raw_uint32 is None or len(raw_uint32) == 0:
+            return None
+        arr = np.asarray(raw_uint32, dtype=np.uint32)
+        # C library returns N subfingerprints; reduce to 8 uint32s via SimHash (256 bits). Python decoder already returns 8.
+        if arr.size > 8:
+            from ml_skeleton.music.chromaprint_decode import _simhash
+            chunk_size = (arr.size + 7) // 8
+            eight = []
+            for i in range(8):
+                start = i * chunk_size
+                end = min((i + 1) * chunk_size, arr.size)
+                if start < arr.size:
+                    eight.append(_simhash(arr[start:end].tolist()))
+                else:
+                    eight.append(0)
+            arr = np.array(eight, dtype=np.uint32)
+        elif arr.size < 8:
+            arr = np.pad(arr, (0, 8 - arr.size), constant_values=0)
+        byte_view = np.frombuffer(arr.tobytes(), dtype=np.uint8)
+        bits = np.unpackbits(byte_view)
+        if len(bits) >= CHROMAPRINT_BITS:
+            bits = bits[:CHROMAPRINT_BITS]
+        else:
+            bits = np.pad(bits, (0, CHROMAPRINT_BITS - len(bits)), constant_values=0)
+        return bits.astype(np.float32)
+    except Exception:
+        return None
+
+
+def _fingerprint_to_bits_blob(fingerprint_b64: "str | bytes") -> Optional[bytes]:
+    """Encode fingerprint to 32-byte packed bits for DB storage (avoids decode at training)."""
+    bits = fingerprint_to_bits(fingerprint_b64)
+    if bits is None:
+        return None
+    return np.packbits(bits.astype(np.uint8)).tobytes()
+
+
 def compare_fingerprints(fp1: str, fp2: str) -> Optional[float]:
     """Compare two chromaprint fingerprints and return similarity score.
 
@@ -462,9 +542,9 @@ def compare_fingerprints(fp1: str, fp2: str) -> Optional[float]:
         Higher score = more similar
     """
     try:
-        # Decode fingerprints
-        raw_fp1 = chromaprint.decode_fingerprint(fp1.encode('utf-8'))[0]
-        raw_fp2 = chromaprint.decode_fingerprint(fp2.encode('utf-8'))[0]
+        # Decode fingerprints (returns (array of uint32, algorithm))
+        raw_fp1 = chromaprint.decode_fingerprint(fp1.encode("utf-8"))[0]
+        raw_fp2 = chromaprint.decode_fingerprint(fp2.encode("utf-8"))[0]
 
         # Calculate bit error rate (BER) between fingerprints
         # Lower BER = more similar

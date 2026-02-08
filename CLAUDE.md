@@ -79,6 +79,8 @@ Two-phase training pipeline for music recommendations using Clementine database:
 - Embedding versioning with encoder/classifier version tracking
 - Version compatibility validation at deployment time
 - READ-ONLY operations: All audio file access is read-only
+- **Chromaprint regularization (MoCo)**: Run `./run_music_pipeline.sh fingerprint` (or the equivalent Python stage) before encoder training to populate the fingerprint DB; the same DB is used for metadata enrichment (enrich-metadata) and optional chromaprint auxiliary loss during encoder training. When a song has no chromaprint in the DB, that sample is masked out for the chromaprint loss term.
+- **Fingerprint-baseline (classifier ablation)**: Set `encoder.encoder_type: "fingerprint_baseline"` and run the encoder stage to export chromaprint-derived "embeddings" (no training). Then set `music.encoder_version: "fingerprint_baseline"` and run the classifier stage. Compare metrics to the main encoder to inform chromaprint loss weighting. See [ml_skeleton/music/fingerprint_encoder.py](ml_skeleton/music/fingerprint_encoder.py).
 
 
 ## Conventions

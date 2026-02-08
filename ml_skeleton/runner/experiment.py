@@ -87,6 +87,8 @@ class Experiment:
         Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.artifact_dir).mkdir(parents=True, exist_ok=True)
 
+        print(f"MLflow UI: {self._tracking_uri}")
+
         # Merge hyperparameters
         params = {**self.config.hyperparameters, **(hyperparameters or {})}
 
@@ -139,6 +141,8 @@ class Experiment:
         # Ensure directories exist
         Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
         Path(self.config.artifact_dir).mkdir(parents=True, exist_ok=True)
+
+        print(f"MLflow UI: {self._tracking_uri}")
 
         tuner_type = self.config.tuning.tuner_type
 

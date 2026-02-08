@@ -24,6 +24,7 @@ from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
 
 from ml_skeleton.music.clementine_db import Song
+from ml_skeleton.music.chunk_fingerprinter import fingerprint_to_bits, CHROMAPRINT_BITS
 from ml_skeleton.music.chunk_cache import (
     load_cached_chunk,
     get_cached_songs,
@@ -208,7 +209,9 @@ class MoCoDataset(Dataset):
 
     Positive pair strategy:
     1. Same-song: Different chunks from same song (default)
-    2. Same-album: Chunks from different songs in same album (30% prob)
+    2. Same-album: Chunks from different songs in same album (when same_album_prob > 0)
+    3. Far-apart chunks: With far_chunk_prob, key chunk is at least min_chunk_distance away
+       from query chunk (e.g. verse vs chorus) to encourage section-invariant representations.
 
     Args:
         songs: List of Song objects
@@ -216,8 +219,12 @@ class MoCoDataset(Dataset):
         num_chunks: Number of chunks per song
         sample_rate: Audio sample rate
         augmentor: AudioAugmentor instance (created if None)
-        same_album_prob: Probability of using same-album positive
+        same_album_prob: Probability of using same-album positive (0 = disabled)
+        far_chunk_prob: Probability of forcing key chunk to be far from query (e.g. 0.35 = 35%)
+        min_chunk_distance: Min |key_idx - query_idx| when far_chunk_prob triggers (e.g. 4 for 8 chunks)
         crop_duration: Fixed crop duration (random if None)
+        fp_db: Optional FingerprintDB for chromaprint regularization (loads full-file chromaprint per song)
+        chromaprint_chunk_idx: Chunk index to load chromaprint from (0 = full-file from CLI fingerprint)
     """
 
     def __init__(
@@ -227,14 +234,23 @@ class MoCoDataset(Dataset):
         num_chunks: int = DEFAULT_NUM_CHUNKS,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         augmentor: Optional[AudioAugmentor] = None,
-        same_album_prob: float = 0.3,
-        crop_duration: Optional[float] = None
+        same_album_prob: float = 0.0,
+        far_chunk_prob: float = 0.0,
+        min_chunk_distance: int = 2,
+        crop_duration: Optional[float] = None,
+        fp_db: Optional[object] = None,
+        chromaprint_chunk_idx: int = 0,
+        preload_chromaprint: bool = True,
     ):
         self.cache_dir = cache_dir
         self.num_chunks = num_chunks
         self.sample_rate = sample_rate
         self.same_album_prob = same_album_prob
+        self.far_chunk_prob = far_chunk_prob
+        self.min_chunk_distance = min_chunk_distance
         self.crop_duration = crop_duration
+        self.fp_db = fp_db
+        self.chromaprint_chunk_idx = chromaprint_chunk_idx
 
         # Filter to songs with complete cache
         self.songs = get_cached_songs(songs, cache_dir, num_chunks)
@@ -245,11 +261,58 @@ class MoCoDataset(Dataset):
         # Create augmentor
         self.augmentor = augmentor or AudioAugmentor(sample_rate=sample_rate)
 
+        # Chromaprint: preload into memory so DataLoader workers never touch the DB (avoids locks, one connection).
+        self._chromaprint_cache: Dict[int, Optional[np.ndarray]] = {}
+        if fp_db is not None:
+            if preload_chromaprint and self.songs:
+                self._preload_chromaprint_cache(fp_db)
+            else:
+                by_chunk = fp_db.get_fingerprint_count_by_chunk()
+                n_at_chunk = by_chunk.get(chromaprint_chunk_idx, 0)
+                print(
+                    f"MoCoDataset: chromaprint lazy-loaded (chunk {chromaprint_chunk_idx}, DB: {getattr(fp_db, 'db_path', '?')}); "
+                    f"{n_at_chunk:,} fingerprints at this chunk in DB"
+                )
+
         # Build album index for same-album positives
         self._build_album_index()
 
         # Build genre index for mixup
         self._build_genre_index()
+
+    def _preload_chromaprint_cache(self, fp_db: object) -> None:
+        """Load all chromaprint bits for self.songs in one batch; fill _chromaprint_cache. Workers then never touch the DB."""
+        song_ids = [s.rowid for s in self.songs]
+        batch = fp_db.get_fingerprints_batch(song_ids, self.chromaprint_chunk_idx)
+        loaded = 0
+        for song_idx, song in enumerate(self.songs):
+            fp_obj = batch.get(song.rowid)
+            if fp_obj is None:
+                self._chromaprint_cache[song_idx] = None
+                continue
+            if getattr(fp_obj, "bits", None) is not None:
+                arr = np.unpackbits(np.frombuffer(fp_obj.bits, dtype=np.uint8))
+                bits = arr[:CHROMAPRINT_BITS].astype(np.float32)
+                if len(bits) < CHROMAPRINT_BITS:
+                    bits = np.pad(bits, (0, CHROMAPRINT_BITS - len(bits)), constant_values=0)
+                self._chromaprint_cache[song_idx] = bits
+                loaded += 1
+            elif fp_obj.fingerprint:
+                fp_str = (
+                    fp_obj.fingerprint.decode("utf-8")
+                    if isinstance(fp_obj.fingerprint, bytes)
+                    else fp_obj.fingerprint
+                )
+                bits = fingerprint_to_bits(fp_str)
+                self._chromaprint_cache[song_idx] = bits
+                if bits is not None:
+                    loaded += 1
+            else:
+                self._chromaprint_cache[song_idx] = None
+        db_path = getattr(fp_db, "db_path", "?")
+        print(
+            f"MoCoDataset: chromaprint preloaded into memory (chunk {self.chromaprint_chunk_idx}, {loaded}/{len(self.songs)} from {db_path})"
+        )
 
     def _build_album_index(self):
         """Build index of songs by album for same-album sampling."""
@@ -279,6 +342,38 @@ class MoCoDataset(Dataset):
         """Load a specific cached chunk."""
         song = self.songs[song_idx]
         return load_cached_chunk(song.rowid, chunk_idx, self.cache_dir)
+
+    def _get_chromaprint_bits(self, song_idx: int) -> Optional[np.ndarray]:
+        """Lazy-load chromaprint bits. Uses precomputed bits from DB when present (no C decode)."""
+        if self.fp_db is None:
+            return None
+        if song_idx in self._chromaprint_cache:
+            return self._chromaprint_cache[song_idx]
+        song = self.songs[song_idx]
+        fp_obj = self.fp_db.get_fingerprint(song.rowid, self.chromaprint_chunk_idx)
+        if fp_obj is None:
+            self._chromaprint_cache[song_idx] = None
+            return None
+        # Precomputed bits in DB (stored at fingerprint time) → no chromaprint C decode
+        if getattr(fp_obj, "bits", None) is not None:
+            arr = np.unpackbits(np.frombuffer(fp_obj.bits, dtype=np.uint8))
+            bits = arr[:CHROMAPRINT_BITS].astype(np.float32)
+            if len(bits) < CHROMAPRINT_BITS:
+                bits = np.pad(bits, (0, CHROMAPRINT_BITS - len(bits)), constant_values=0)
+            self._chromaprint_cache[song_idx] = bits
+            return self._chromaprint_cache[song_idx]
+        # Fallback: decode from base64 (older DB rows without bits column)
+        if fp_obj.fingerprint:
+            fp_str = (
+                fp_obj.fingerprint.decode("utf-8")
+                if isinstance(fp_obj.fingerprint, bytes)
+                else fp_obj.fingerprint
+            )
+            bits = fingerprint_to_bits(fp_str)
+            self._chromaprint_cache[song_idx] = bits
+        else:
+            self._chromaprint_cache[song_idx] = None
+        return self._chromaprint_cache[song_idx]
 
     def _get_mixup_chunk(self, song_idx: int) -> Optional[torch.Tensor]:
         """Get a chunk from the same genre for mixup."""
@@ -365,6 +460,18 @@ class MoCoDataset(Dataset):
         if not use_same_album:
             # Same-song positive: different chunk from same song
             available_chunks = [i for i in range(self.num_chunks) if i != query_chunk_idx]
+            # Optionally force far-apart chunks (e.g. verse vs chorus) 20–50% of the time
+            if (
+                available_chunks
+                and self.far_chunk_prob > 0
+                and random.random() < self.far_chunk_prob
+            ):
+                far_chunks = [
+                    i for i in available_chunks
+                    if abs(i - query_chunk_idx) >= self.min_chunk_distance
+                ]
+                if far_chunks:
+                    available_chunks = far_chunks
             key_chunk_idx = random.choice(available_chunks) if available_chunks else query_chunk_idx
             key_waveform = self._load_chunk(idx, key_chunk_idx)
 
@@ -381,12 +488,59 @@ class MoCoDataset(Dataset):
         # Genre labels
         genre_labels = genre_to_multilabel(song.genre)
 
-        return {
+        out = {
             "query": query_aug,
             "key": key_aug,
             "genre": genre_labels,
             "song_id": song.rowid,
             "filename": song.filename
+        }
+        if self.fp_db is not None:
+            bits = self._get_chromaprint_bits(idx)
+            if bits is not None:
+                out["chromaprint"] = torch.from_numpy(bits)
+                out["chromaprint_valid"] = True
+            else:
+                out["chromaprint"] = torch.zeros(CHROMAPRINT_BITS, dtype=torch.float32)
+                out["chromaprint_valid"] = False
+        return out
+
+
+class ChunkExtractionDataset(Dataset):
+    """Dataset for extracting embeddings for all num_chunks per song (no augmentation)."""
+
+    def __init__(
+        self,
+        songs: List[Song],
+        cache_dir: str = DEFAULT_CACHE_DIR,
+        num_chunks: int = DEFAULT_NUM_CHUNKS,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        crop_duration: float = 10.0
+    ):
+        self.songs = get_cached_songs(songs, cache_dir, num_chunks)
+        self.cache_dir = cache_dir
+        self.num_chunks = num_chunks
+        self.sample_rate = sample_rate
+        self.crop_length = int(crop_duration * sample_rate)
+
+    def __len__(self) -> int:
+        return len(self.songs) * self.num_chunks
+
+    def __getitem__(self, idx: int) -> dict:
+        song_idx = idx // self.num_chunks
+        chunk_idx = idx % self.num_chunks
+        song = self.songs[song_idx]
+        waveform = load_cached_chunk(song.rowid, chunk_idx, self.cache_dir)
+        if waveform is None:
+            waveform = torch.zeros(self.crop_length)
+        elif waveform.shape[0] > self.crop_length:
+            waveform = waveform[:self.crop_length]
+        elif waveform.shape[0] < self.crop_length:
+            waveform = torch.nn.functional.pad(waveform, (0, self.crop_length - waveform.shape[0]))
+        return {
+            "query": waveform.float(),
+            "filename": song.filename,
+            "chunk_idx": chunk_idx
         }
 
 
@@ -424,33 +578,38 @@ class MoCoCollator:
         """Collate batch of samples.
 
         Args:
-            batch: List of sample dicts from MoCoDataset
+            batch: List of sample dicts from MoCoDataset or ChunkExtractionDataset
 
         Returns:
-            Batched dictionary with:
-            - query: (B, T) stacked query audio
-            - key: (B, T) stacked key audio
-            - genre: (B, num_genres) stacked genre labels
-            - song_ids: List of song IDs
-            - filename: List of filenames (for embedding extraction)
+            Batched dictionary with query, filename; if ChunkExtractionDataset also chunk_idx.
+            MoCoDataset batches also have key, genre, song_ids.
         """
         queries = torch.stack([
             self._pad_or_truncate(sample["query"]) for sample in batch
         ])
+        filenames = [sample["filename"] for sample in batch]
+        if "chunk_idx" in batch[0]:
+            return {
+                "query": queries,
+                "filename": filenames,
+                "chunk_idx": [sample["chunk_idx"] for sample in batch]
+            }
         keys = torch.stack([
             self._pad_or_truncate(sample["key"]) for sample in batch
         ])
         genres = torch.stack([sample["genre"] for sample in batch])
         song_ids = [sample["song_id"] for sample in batch]
-        filenames = [sample["filename"] for sample in batch]
-
-        return {
+        result = {
             "query": queries,
             "key": keys,
             "genre": genres,
             "song_ids": song_ids,
             "filename": filenames
         }
+        if "chromaprint" in batch[0]:
+            result["chromaprint"] = torch.stack([s["chromaprint"] for s in batch])
+            result["chromaprint_valid"] = torch.tensor([s["chromaprint_valid"] for s in batch], dtype=torch.bool)
+        return result
 
 
 def create_moco_dataloader(

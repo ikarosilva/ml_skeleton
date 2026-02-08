@@ -6,6 +6,8 @@ Includes:
 - Contrastive loss for self-supervised encoder training
 """
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,11 +139,13 @@ class BinaryRatingLoss(nn.Module):
     Args:
         pos_weight: Weight for positive class to handle class imbalance.
                    If None, computed automatically from data.
+        middle_weight: Weight for middle-rated (2 < x < 4) penalty (pred→0.5). Default 0.1 to avoid over-pulling.
     """
 
-    def __init__(self, pos_weight: float = None):
+    def __init__(self, pos_weight: float = None, middle_weight: float = 0.1):
         super().__init__()
         self.pos_weight = pos_weight
+        self.middle_weight = middle_weight
         if pos_weight is not None:
             self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
         else:
@@ -150,13 +154,24 @@ class BinaryRatingLoss(nn.Module):
     def forward(
         self,
         predictions: torch.Tensor,
-        targets: torch.Tensor
+        targets: torch.Tensor,
+        is_middle: Optional[torch.Tensor] = None,
+        validation: bool = False,
     ) -> torch.Tensor:
-        """Compute BCE loss.
+        """Compute BCE loss, with optional penalty for middle-rated samples (2 < rating < 4).
+
+        For middle samples, loss = (sigmoid(pred) - 0.5)^2 to pull predictions toward 0.5.
+        For positive/negative samples, standard BCE.
+
+        When validation=True, pos_weight is not applied (unweighted BCE). Use this for
+        validation loss so that HPO/early-stopping does not reward collapsed predictors
+        (e.g. predict-all-1) that can achieve low weighted BCE.
 
         Args:
-            predictions: Raw logits (not sigmoid), shape (batch_size, 1)
-            targets: Binary labels (0 or 1), shape (batch_size, 1) or (batch_size,)
+            predictions: Raw logits (not sigmoid), shape (batch_size,) or (batch_size, 1)
+            targets: Binary labels (0 or 1), or 0.5 for middle
+            is_middle: Optional bool tensor, True where sample is middle-rated (2 < x < 4)
+            validation: If True, use unweighted BCE (pos_weight=1) for non-middle samples.
 
         Returns:
             loss: Scalar loss value
@@ -166,24 +181,37 @@ class BinaryRatingLoss(nn.Module):
         if predictions.dim() == 1:
             predictions = predictions.unsqueeze(1)
 
-        # Move pos_weight to same device as predictions if needed
-        if self.pos_weight is not None and self.bce.pos_weight.device != predictions.device:
+        use_weight = self.pos_weight is not None and not validation
+        if use_weight and self.bce.pos_weight.device != predictions.device:
             self.bce.pos_weight = self.bce.pos_weight.to(predictions.device)
 
-        return self.bce(predictions, targets)
+        pos_w = self.bce.pos_weight if use_weight else None
+
+        if is_middle is not None:
+            is_mid = is_middle.view_as(predictions)
+            bce_per = F.binary_cross_entropy_with_logits(
+                predictions, targets,
+                pos_weight=pos_w,
+                reduction="none",
+            )
+            middle_penalty = self.middle_weight * (torch.sigmoid(predictions) - 0.5).pow(2)
+            return torch.where(is_mid, middle_penalty, bce_per).mean()
+        if pos_w is not None:
+            return F.binary_cross_entropy_with_logits(predictions, targets, pos_weight=pos_w)
+        return F.binary_cross_entropy_with_logits(predictions, targets)
 
     @staticmethod
     def compute_pos_weight(labels: list) -> float:
         """Compute pos_weight for class imbalance.
 
         Args:
-            labels: List of binary labels (0 or 1)
+            labels: List of binary labels (0 or 1; 0.5 for middle-rated is ignored)
 
         Returns:
             pos_weight: ratio of negative to positive samples
         """
-        pos_count = sum(labels)
-        neg_count = len(labels) - pos_count
+        pos_count = sum(1 for x in labels if x >= 0.99)
+        neg_count = sum(1 for x in labels if x <= 0.01)
         if pos_count == 0:
             return 1.0
         return neg_count / pos_count

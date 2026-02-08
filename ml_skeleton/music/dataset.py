@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from .clementine_db import Song
+from .genre_mapper import NUM_GENRES
 from .audio_loader import load_audio_file, load_audio_file_with_jitter
 from .metadata_utils import has_valid_metadata, has_excluded_metadata, load_exclusion_lists
 
@@ -353,6 +354,13 @@ class EmbeddingDataset(torch.utils.data.Dataset):
         classification_mode: "regression" (0-1 continuous) or "binary" (0/1 labels)
         binary_positive_threshold: Rating >= this is positive class (default: 4)
         binary_negative_threshold: Rating <= this is negative class (default: 2)
+        use_genre: If True, add 7-dim genre multi-hot per sample (from metadata or centroid imputation)
+        genre_centroids: (NUM_GENRES, D) for imputing missing genre; required when use_genre and many songs lack genre
+        genre_impute_top_k: Top-k closest centroids per chunk for imputation (default 2 for mix-ins)
+        genre_impute_min_votes: Min votes to set a category in imputed multi-hot (default 1)
+        binary_include_middle: If True, use three-way labels with middle band (default False)
+        replace_embeddings_with_noise: If True, return N(0,1) noise instead of real embeddings (same shape); for debugging.
+        noise_seed: RNG seed when replace_embeddings_with_noise is True (default 42).
     """
 
     def __init__(
@@ -362,15 +370,32 @@ class EmbeddingDataset(torch.utils.data.Dataset):
         only_rated: bool = True,
         classification_mode: str = "regression",
         binary_positive_threshold: float = 4.0,
-        binary_negative_threshold: float = 2.0
+        binary_negative_threshold: float = 2.0,
+        use_genre: bool = False,
+        genre_centroids: Optional[np.ndarray] = None,
+        genre_impute_top_k: int = 2,
+        genre_impute_min_votes: int = 1,
+        binary_include_middle: bool = False,
+        replace_embeddings_with_noise: bool = False,
+        noise_seed: Optional[int] = None,
     ):
         super().__init__()
 
         self.classification_mode = classification_mode
+        self._binary_include_middle = binary_include_middle
+        self.use_genre = use_genre
+        self.replace_embeddings_with_noise = replace_embeddings_with_noise
+        self._noise_seed = noise_seed if noise_seed is not None else 42
+        self._genre_centroids = genre_centroids
+        self._genre_impute_top_k = genre_impute_top_k
+        self._genre_impute_min_votes = genre_impute_min_votes
 
         # Filter songs that have embeddings and meet criteria
         self.data = []
         excluded_ambiguous = 0
+
+        if use_genre:
+            from .genre_centroids import get_genre_features
 
         for song in songs:
             if only_rated and not song.is_rated:
@@ -381,55 +406,99 @@ class EmbeddingDataset(torch.utils.data.Dataset):
 
             # Handle classification mode
             if classification_mode == "binary":
-                # Binary: positive (>=4), negative (<=2), exclude middle
-                if song.rating >= binary_positive_threshold:
-                    label = 1.0
-                elif song.rating <= binary_negative_threshold:
-                    label = 0.0
+                if not self._binary_include_middle:
+                    # Simple binary: 0 = rating < positive_threshold, 1 = rating >= positive_threshold (no exclusions)
+                    label = 1.0 if song.rating >= binary_positive_threshold else 0.0
+                    is_middle = False
                 else:
-                    # Exclude ambiguous ratings (between thresholds)
-                    excluded_ambiguous += 1
-                    continue
+                    # With middle band: positive (>=4), negative (<=negative_threshold), middle with penalty toward 0.5
+                    if song.rating >= binary_positive_threshold:
+                        label = 1.0
+                        is_middle = False
+                    elif song.rating <= binary_negative_threshold:
+                        label = 0.0
+                        is_middle = False
+                    else:
+                        label = 0.5
+                        is_middle = True
             else:
                 # Regression: normalize rating to [0, 1]
                 label = song.rating / 5.0
+                is_middle = False  # unused in regression
 
-            self.data.append({
+            # Original 1-5 rating normalized to [0, 1] (for HPO metrics: MSE/correlation with predicted prob)
+            rating_continuous = song.rating / 5.0
+
+            item = {
                 "embedding": embeddings[song.filename],
                 "rating": label,
+                "rating_continuous": rating_continuous,
                 "filename": song.filename,
-                "song": song
-            })
+            }
+            if classification_mode == "binary":
+                item["is_middle"] = is_middle
+            if use_genre:
+                item["genre"] = get_genre_features(
+                    song,
+                    embeddings[song.filename],
+                    genre_centroids,
+                    top_k=genre_impute_top_k,
+                    min_votes=genre_impute_min_votes,
+                )
+            self.data.append(item)
 
         if classification_mode == "binary":
             pos_count = sum(1 for d in self.data if d["rating"] == 1.0)
             neg_count = sum(1 for d in self.data if d["rating"] == 0.0)
+            mid_count = sum(1 for d in self.data if d.get("is_middle"))
             print(f"EmbeddingDataset (binary): {len(self.data)} songs")
-            print(f"  Positive (rating >= {binary_positive_threshold}): {pos_count}")
-            print(f"  Negative (rating <= {binary_negative_threshold}): {neg_count}")
-            print(f"  Excluded (ambiguous): {excluded_ambiguous}")
+            if self._binary_include_middle:
+                print(f"  Positive (rating >= {binary_positive_threshold}): {pos_count}")
+                print(f"  Negative (rating <= {binary_negative_threshold}): {neg_count}")
+                print(f"  Middle (|pred-0.5| penalty): {mid_count}")
+            else:
+                print(f"  Positive (rating >= {binary_positive_threshold}): {pos_count}")
+                print(f"  Negative (rating < {binary_positive_threshold}): {neg_count}")
+            if excluded_ambiguous:
+                print(f"  Excluded (ambiguous): {excluded_ambiguous}")
         else:
             print(f"EmbeddingDataset: {len(self.data)} songs with embeddings")
+        if self.replace_embeddings_with_noise:
+            print("  Replace embeddings with normalized noise (N(0,1)) - labels unchanged")
 
     def __len__(self) -> int:
         return len(self.data)
 
     def __getitem__(self, idx: int) -> dict:
-        """Return embedding and rating.
+        """Return embedding, rating, and optional genre.
 
         Returns:
             Dictionary with:
-            - embedding: Embedding vector (embedding_dim,)
+            - embedding: Embedding vector (embedding_dim,) or (4, embedding_dim)
             - rating: Rating value in [0, 1]
             - filename: Song filename
+            - genre: (NUM_GENRES,) multi-hot, only if use_genre=True
         """
         item = self.data[idx]
-
-        return {
-            "embedding": torch.from_numpy(item["embedding"]).float(),
+        raw = np.asarray(item["embedding"], dtype=np.float32)
+        if self.replace_embeddings_with_noise:
+            # Normalized noise N(0,1) same shape; deterministic per sample for reproducibility
+            rng = np.random.default_rng(self._noise_seed + idx)
+            emb = rng.standard_normal(raw.shape).astype(np.float32)
+        else:
+            emb = raw
+        out = {
+            "embedding": torch.from_numpy(emb).float(),
             "rating": torch.tensor(item["rating"], dtype=torch.float32),
-            "filename": item["filename"]
+            "filename": item["filename"],
         }
+        if "is_middle" in item:
+            out["is_middle"] = torch.tensor(item["is_middle"], dtype=torch.bool)
+        if "rating_continuous" in item:
+            out["rating_continuous"] = torch.tensor(item["rating_continuous"], dtype=torch.float32)
+        if self.use_genre:
+            out["genre"] = torch.from_numpy(np.asarray(item["genre"], dtype=np.float32))
+        return out
 
     def get_all_filenames(self) -> list[str]:
         """Get all filenames in the dataset.
@@ -467,6 +536,13 @@ class EmbeddingDataset(torch.utils.data.Dataset):
         # Create a new dataset with filtered data
         subset = EmbeddingDataset.__new__(EmbeddingDataset)
         subset.classification_mode = self.classification_mode
+        subset._binary_include_middle = self._binary_include_middle
+        subset.use_genre = self.use_genre
+        subset._genre_centroids = self._genre_centroids
+        subset._genre_impute_top_k = self._genre_impute_top_k
+        subset._genre_impute_min_votes = self._genre_impute_min_votes
+        subset.replace_embeddings_with_noise = self.replace_embeddings_with_noise
+        subset._noise_seed = self._noise_seed
         subset.data = [d for d in self.data if d["filename"] in filenames]
         return subset
 

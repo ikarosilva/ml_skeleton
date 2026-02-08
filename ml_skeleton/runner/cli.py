@@ -96,12 +96,19 @@ def run(config_path: str, train_fn: str, override: tuple):
     default=None,
     help="Timeout in seconds",
 )
+@click.option(
+    "--reset-study",
+    is_flag=True,
+    default=False,
+    help="Delete existing Optuna study from storage before running (fresh HPO run)",
+)
 def tune(
     config_path: str,
     train_fn: str,
     n_trials: Optional[int],
     tuner: Optional[str],
     timeout: Optional[int],
+    reset_study: bool,
 ):
     """
     Run hyperparameter tuning.
@@ -121,6 +128,7 @@ def tune(
         config.tuning.tuner_type = TunerType(tuner)
     if timeout is not None:
         config.tuning.timeout = timeout
+    config.tuning.reset_study = reset_study
 
     # Ensure tuner is set
     if config.tuning.tuner_type == TunerType.NONE:

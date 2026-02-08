@@ -164,6 +164,7 @@ temp/
 
 # Music Recommendation Pipeline
 cache/
+*.db
 embeddings.db
 recommendations.txt
 recommender_*.xspf

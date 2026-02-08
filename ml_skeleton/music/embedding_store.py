@@ -9,7 +9,7 @@ This module provides persistent storage for audio embeddings, allowing:
 import sqlite3
 import numpy as np
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import io
 import time
 
@@ -71,6 +71,24 @@ class EmbeddingStore:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_updated_at 
             ON embeddings(updated_at)
+        """)
+        
+        # Table for per-chunk embeddings (num_chunks per song for classifier average)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS embedding_chunks (
+                filename TEXT NOT NULL,
+                chunk_idx INTEGER NOT NULL,
+                model_version TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                embedding_dim INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (filename, chunk_idx, model_version)
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_embedding_chunks_version
+            ON embedding_chunks(model_version)
         """)
         
         conn.commit()
@@ -168,6 +186,62 @@ class EmbeddingStore:
         
         conn.close()
     
+    def store_embedding_chunk(
+        self,
+        filename: str,
+        chunk_idx: int,
+        embedding: np.ndarray,
+        model_version: str = "default"
+    ):
+        """Store one embedding for a specific chunk of a song (0..3)."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        embedding_blob = self._serialize_embedding(embedding)
+        embedding_dim = len(embedding)
+        current_time = time.time()
+        cursor.execute("""
+            INSERT OR REPLACE INTO embedding_chunks
+            (filename, chunk_idx, model_version, embedding, embedding_dim, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?,
+                    COALESCE((SELECT created_at FROM embedding_chunks
+                              WHERE filename = ? AND chunk_idx = ? AND model_version = ?), ?),
+                    ?)
+        """, (
+            filename, chunk_idx, model_version, embedding_blob, embedding_dim,
+            filename, chunk_idx, model_version, current_time,
+            current_time
+        ))
+        conn.commit()
+        conn.close()
+
+    def get_embeddings_batch_all_chunks(
+        self,
+        filenames: List[str],
+        model_version: str = "default",
+        num_chunks: int = 8
+    ) -> dict:
+        """Return dict filename -> (num_chunks, D) array. Only songs with all num_chunks chunks."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        placeholders = ','.join('?' * len(filenames))
+        cursor.execute(f"""
+            SELECT filename, chunk_idx, embedding FROM embedding_chunks
+            WHERE model_version = ? AND filename IN ({placeholders})
+        """, [model_version] + filenames)
+        rows = cursor.fetchall()
+        conn.close()
+        by_file = {}
+        for filename, chunk_idx, embedding_blob in rows:
+            by_file.setdefault(filename, []).append((chunk_idx, self._deserialize_embedding(embedding_blob)))
+        results = {}
+        for filename in filenames:
+            chunks = by_file.get(filename, [])
+            if len(chunks) != num_chunks:
+                continue
+            chunks.sort(key=lambda x: x[0])
+            results[filename] = np.stack([c[1] for c in chunks], axis=0)
+        return results
+
     def get_embedding(
         self,
         filename: str,

@@ -285,13 +285,9 @@ stat /git/ml_skeleton/checkpoints/*.pth 2>/dev/null | grep Modify | tail -1
 
 ### Verify Embeddings After Training
 ```bash
-# After encoder completes, run diagnostic
-python diagnose_variance_simple.py
-
-# Expected healthy results:
-# - Unique embeddings: >90% (not 0.02% like before)
-# - Mean std: >0.1 (not 0.000002)
-# - Dimensions with zero variance: <10% (not 71%)
+# After encoder completes, check that embeddings were written
+sqlite3 embeddings.db "SELECT COUNT(*) FROM embeddings;"
+ls -lt checkpoints/encoder_*.pth | head -3
 ```
 
 ---
@@ -404,16 +400,11 @@ gpu_memory_limit_gb: 16           # Even more conservative
 - **Cache:** `/git/ml_skeleton/cache/chunks/` (427 GB)
 - **Logs:** Training logs in current directory
 
-### Diagnostic Scripts
+### Verify State
 ```bash
-# Check embedding quality
-python diagnose_variance_simple.py
-
-# Comprehensive diagnostics
-python diagnose_zero_variance.py
-
-# Test classifier fixes
-python test_classifier_fixes.py
+# Embedding count and latest checkpoints
+sqlite3 embeddings.db "SELECT COUNT(*) FROM embeddings;"
+ls -lt checkpoints/*.pth | head -5
 ```
 
 ---

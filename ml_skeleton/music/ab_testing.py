@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .baseline_classifier import SimpleRatingClassifier
+from .baseline_classifier import LegacySimpleRatingClassifier, SimpleRatingClassifier
 from .dataset import EmbeddingDataset
 from .losses import BinaryRatingLoss, RatingLoss
 
@@ -21,12 +21,15 @@ def load_classifier_from_checkpoint(
     checkpoint_path: str,
     embedding_dim: int,
     device: str = "cuda"
-) -> tuple[SimpleRatingClassifier, dict]:
+) -> tuple[SimpleRatingClassifier | LegacySimpleRatingClassifier, dict]:
     """Load classifier from checkpoint, inferring architecture.
+
+    Supports current format (blocks/skips/output) and legacy format (mlp.*).
+    Old production checkpoints may use the legacy 'mlp' layout.
 
     Args:
         checkpoint_path: Path to checkpoint file
-        embedding_dim: Embedding dimension
+        embedding_dim: Embedding dimension (from encoder; genre adds NUM_GENRES if use_genre)
         device: Device to load model to
 
     Returns:
@@ -34,23 +37,45 @@ def load_classifier_from_checkpoint(
     """
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     state_dict = checkpoint['model_state_dict']
+    use_genre = checkpoint.get('use_genre', False)
+    use_batch_norm = checkpoint.get('use_batch_norm', False)
+    use_residual = checkpoint.get('use_residual', False)
 
-    # Infer hidden_dims from state dict
-    hidden_dims = []
-    layer_idx = 0
-    while f"mlp.{layer_idx}.weight" in state_dict:
-        weight = state_dict[f"mlp.{layer_idx}.weight"]
-        out_features = weight.shape[0]
-        if out_features > 1:
-            hidden_dims.append(out_features)
-        layer_idx += 3
+    # Get hidden_dims from checkpoint or infer from state dict
+    hidden_dims = checkpoint.get('hidden_dims')
+    if hidden_dims is None:
+        hidden_dims = []
+        if "blocks.0.0.weight" in state_dict:
+            i = 0
+            while f"blocks.{i}.0.weight" in state_dict:
+                hidden_dims.append(state_dict[f"blocks.{i}.0.weight"].shape[0])
+                i += 1
+        else:
+            layer_idx = 0
+            while f"mlp.{layer_idx}.weight" in state_dict:
+                weight = state_dict[f"mlp.{layer_idx}.weight"]
+                out_features = weight.shape[0]
+                if out_features > 1:
+                    hidden_dims.append(out_features)
+                layer_idx += 3
 
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=hidden_dims,
-        dropout=0.0  # Dropout doesn't matter for inference
-    )
-    classifier.load_state_dict(state_dict)
+    # Legacy checkpoints use a single 'mlp' Sequential; current use 'blocks'/'skips'/'output'
+    if "mlp.0.weight" in state_dict:
+        classifier = LegacySimpleRatingClassifier(
+            embedding_dim=embedding_dim,
+            hidden_dims=hidden_dims,
+            use_genre=use_genre,
+        )
+    else:
+        classifier = SimpleRatingClassifier(
+            embedding_dim=embedding_dim,
+            hidden_dims=hidden_dims,
+            dropout=0.0,  # Dropout doesn't matter for inference
+            use_genre=use_genre,
+            use_batch_norm=use_batch_norm,
+            use_residual=use_residual,
+        )
+    classifier.load_state_dict(state_dict, strict=True)
     classifier = classifier.to(device)
     classifier.eval()
 
@@ -63,7 +88,8 @@ def run_ab_test(
     test_dataset: EmbeddingDataset,
     classification_mode: str = "binary",
     device: str = "cuda",
-    verbose: bool = True
+    verbose: bool = True,
+    prod_test_dataset: Optional[EmbeddingDataset] = None,
 ) -> dict:
     """Run A/B test comparing new classifier vs production classifier.
 
@@ -73,10 +99,14 @@ def run_ab_test(
     Args:
         new_classifier_path: Path to new classifier checkpoint
         prod_classifier_path: Path to production classifier checkpoint
-        test_dataset: Dataset of new ratings (held-out from training)
+        test_dataset: Dataset for NEW model (e.g. new encoder's embeddings)
         classification_mode: 'binary' or 'regression'
         device: Device for inference
         verbose: Print detailed results
+        prod_test_dataset: If provided, production model is run on this dataset
+            (e.g. original embeddings) so prod pipeline never changes. Must have
+            same length and sample order as test_dataset. When None, both models
+            run on test_dataset.
 
     Returns:
         Dictionary with A/B test results including:
@@ -93,39 +123,91 @@ def run_ab_test(
             'error': 'No test samples available',
             'n_samples': 0
         }
+    if prod_test_dataset is not None and len(prod_test_dataset) != len(test_dataset):
+        return {
+            'error': f'prod_test_dataset length {len(prod_test_dataset)} != test_dataset length {len(test_dataset)}',
+            'n_samples': 0
+        }
 
-    # Get embedding dimension from dataset
+    # Get embedding dimension from dataset (support per-song (D,) or (C, D) chunks)
     sample = test_dataset[0]
-    embedding_dim = sample['embedding'].shape[0]
+    emb = sample['embedding']
+    if hasattr(emb, 'ndim') and emb.ndim == 2:
+        embedding_dim = int(emb.shape[-1])
+    else:
+        embedding_dim = int(emb.shape[0])
 
-    # Load both classifiers
-    new_classifier, _ = load_classifier_from_checkpoint(
+    # Load both classifiers (each may have use_genre from its checkpoint)
+    new_classifier, new_ckpt = load_classifier_from_checkpoint(
         new_classifier_path, embedding_dim, device
     )
-    prod_classifier, _ = load_classifier_from_checkpoint(
+    prod_classifier, prod_ckpt = load_classifier_from_checkpoint(
         prod_classifier_path, embedding_dim, device
     )
+    new_use_genre = new_ckpt.get('use_genre', False)
+    prod_use_genre = prod_ckpt.get('use_genre', False)
+    chunk_agg_new = new_ckpt.get('chunk_aggregation', 'mean')
+    chunk_agg_prod = prod_ckpt.get('chunk_aggregation', 'mean')
 
-    # Create data loader
+    def aggregate(view):  # (B, C) -> (B,)
+        return view.max(dim=1)[0] if (view.shape[1] > 1 and chunk_agg_new == 'max') else view.mean(dim=1)
+    def aggregate_prod(view):
+        return view.max(dim=1)[0] if (view.shape[1] > 1 and chunk_agg_prod == 'max') else view.mean(dim=1)
+
+    # Data loaders: new model on test_dataset; prod on prod_test_dataset or same
     test_loader = DataLoader(
         test_dataset,
         batch_size=256,
         shuffle=False,
         num_workers=0
     )
+    prod_loader: DataLoader
+    if prod_test_dataset is not None:
+        prod_loader = DataLoader(
+            prod_test_dataset,
+            batch_size=256,
+            shuffle=False,
+            num_workers=0
+        )
+    else:
+        prod_loader = test_loader
 
-    # Get predictions from both models
+    # Get predictions: new on test_dataset, prod on prod_test_dataset (or same)
     new_preds = []
     prod_preds = []
     targets = []
 
     with torch.no_grad():
-        for batch in test_loader:
-            embeddings = batch['embedding'].to(device)
-            ratings = batch['rating'].cpu().numpy()
+        for batch_new, batch_prod in zip(test_loader, prod_loader):
+            emb_new = batch_new['embedding'].to(device)
+            emb_prod = batch_prod['embedding'].to(device)
+            ratings = batch_new['rating'].cpu().numpy()
+            genre_new = batch_new.get('genre')
+            genre_prod = batch_prod.get('genre')
+            if genre_new is not None:
+                genre_new = genre_new.to(device)
+            if genre_prod is not None:
+                genre_prod = genre_prod.to(device)
 
-            new_out = new_classifier(embeddings).cpu().numpy()
-            prod_out = prod_classifier(embeddings).cpu().numpy()
+            new_genre = genre_new if new_use_genre else None
+            prod_genre = genre_prod if prod_use_genre else None
+            # All chunks per song: (B, C, D) -> predict per chunk, then aggregate (mean/max) to one rating per song
+            if emb_new.dim() == 3:
+                B, C, D = emb_new.shape
+                emb_new_flat = emb_new.view(B * C, D)
+                if new_genre is not None:
+                    new_genre = new_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, new_genre.size(-1))
+                new_out = aggregate(new_classifier(emb_new_flat, new_genre).view(B, C)).cpu().numpy()
+            else:
+                new_out = new_classifier(emb_new, new_genre).cpu().numpy()
+            if emb_prod.dim() == 3:
+                B, C, D = emb_prod.shape
+                emb_prod_flat = emb_prod.view(B * C, D)
+                if prod_genre is not None:
+                    prod_genre = prod_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, prod_genre.size(-1))
+                prod_out = aggregate_prod(prod_classifier(emb_prod_flat, prod_genre).view(B, C)).cpu().numpy()
+            else:
+                prod_out = prod_classifier(emb_prod, prod_genre).cpu().numpy()
 
             new_preds.extend(new_out.flatten())
             prod_preds.extend(prod_out.flatten())
@@ -140,7 +222,6 @@ def run_ab_test(
         # Binary classification: use McNemar's test
         new_probs = 1 / (1 + np.exp(-new_preds))  # Sigmoid
         prod_probs = 1 / (1 + np.exp(-prod_preds))
-
         new_binary = (new_probs > 0.5).astype(int)
         prod_binary = (prod_probs > 0.5).astype(int)
         targets_binary = targets.astype(int)
@@ -279,6 +360,45 @@ def run_ab_test(
         print("=" * 60)
 
     return result
+
+
+def ab_result_to_mlflow_metrics(result: dict) -> dict:
+    """Build a flat dict of A/B test metrics for MLflow (all numeric).
+
+    Use with MlflowClient().log_metric(run_id, k, v) or log_metrics().
+
+    Args:
+        result: Result dict from run_ab_test (must not be error dict).
+
+    Returns:
+        Dict of metric name -> float (keys prefixed with ab_ for clarity).
+    """
+    if result.get("n_samples", 0) == 0 or "classification_mode" not in result:
+        return {}
+    out = {
+        "ab_n_samples": float(result["n_samples"]),
+        "ab_new_accuracy": float(result["new_accuracy"]),
+        "ab_prod_accuracy": float(result["prod_accuracy"]),
+        "ab_improvement": float(result["improvement"]),
+        "ab_improvement_pct": float(result.get("improvement_pct", 0)),
+        "ab_p_value": float(result["p_value"]),
+        "ab_significant": float(result["significant"]),
+    }
+    if result["classification_mode"] == "binary":
+        nm = result.get("new_metrics") or {}
+        pm = result.get("prod_metrics") or {}
+        out["ab_new_precision"] = float(nm.get("precision", 0))
+        out["ab_new_recall"] = float(nm.get("recall", 0))
+        out["ab_new_f1"] = float(nm.get("f1", 0))
+        out["ab_prod_precision"] = float(pm.get("precision", 0))
+        out["ab_prod_recall"] = float(pm.get("recall", 0))
+        out["ab_prod_f1"] = float(pm.get("f1", 0))
+    else:
+        out["ab_new_mae"] = float(result["new_mae"])
+        out["ab_prod_mae"] = float(result["prod_mae"])
+        out["ab_new_correlation"] = float(result.get("new_correlation", 0))
+        out["ab_prod_correlation"] = float(result.get("prod_correlation", 0))
+    return out
 
 
 def format_ab_test_summary(result: dict) -> str:

@@ -8,7 +8,8 @@ Usage:
         create_encoder,
         create_loss_fn,
         create_dataset,
-        get_encoder_type
+        get_encoder_type,
+        get_fingerprint_db_path,
     )
 
     encoder = create_encoder(config)
@@ -16,10 +17,69 @@ Usage:
     dataset = create_dataset(config, songs, album_to_idx, filename_to_albums)
 """
 
+import os
 from typing import Optional
 import torch.nn as nn
 
 from ..music.clementine_db import Song
+
+# Default root for all cache stores (fingerprints DB, chunk cache)
+DEFAULT_CACHE_ROOT = "./cache"
+DEFAULT_FINGERPRINT_DB_PATH = "./cache/fingerprints.db"
+
+
+def get_cache_root(config: dict, resolve_absolute: bool = True) -> str:
+    """Return the root directory for all cache stores (fingerprints DB, chunks, etc.).
+
+    Args:
+        config: Full config dict; music.cache_root used if set.
+        resolve_absolute: If True, return absolute path.
+
+    Returns:
+        Path to the cache root (e.g. ./cache or /path/to/cache).
+    """
+    root = config.get("music", {}).get("cache_root", DEFAULT_CACHE_ROOT)
+    if resolve_absolute:
+        root = os.path.abspath(root)
+    return root
+
+
+def get_chunk_cache_dir(config: dict, resolve_absolute: bool = True) -> str:
+    """Return the chunk cache directory (under music.cache_root when path is relative)."""
+    music_config = config.get("music", {})
+    chunk_config = music_config.get("chunk_cache", {})
+    raw = chunk_config.get("directory", os.path.join(DEFAULT_CACHE_ROOT, "chunks"))
+    if not os.path.isabs(raw):
+        root = get_cache_root(config, resolve_absolute=False)
+        path = os.path.normpath(os.path.join(root, raw.lstrip("./")))
+    else:
+        path = raw
+    if resolve_absolute:
+        path = os.path.abspath(path)
+    return path
+
+
+def get_fingerprint_db_path(config: dict, resolve_absolute: bool = True) -> str:
+    """Return the canonical fingerprint DB path from config (same DB for encoder, classifier, fingerprint, enrich).
+
+    Path is under music.cache_root when fingerprint_db_path is relative.
+
+    Args:
+        config: Full config dict (fingerprinting.fingerprint_db_path or derived from cache_root).
+        resolve_absolute: If True, return absolute path so cwd does not change which file is used.
+
+    Returns:
+        Path to the fingerprint SQLite database.
+    """
+    raw = config.get("fingerprinting", {}).get("fingerprint_db_path") or "fingerprints.db"
+    if not os.path.isabs(raw):
+        root = get_cache_root(config, resolve_absolute=False)
+        path = os.path.normpath(os.path.join(root, raw.lstrip("./")))
+    else:
+        path = raw
+    if resolve_absolute:
+        path = os.path.abspath(path)
+    return path
 
 
 def get_encoder_type(config: dict) -> str:
@@ -41,18 +101,31 @@ def create_encoder(config: dict) -> nn.Module:
         config: Configuration dictionary with 'encoder' and 'music' sections
 
     Returns:
-        MoCoEncoder module
+        MoCoEncoder or FingerprintEncoder module
     """
     encoder_config = config['encoder']
     music_config = config['music']
     encoder_type = get_encoder_type(config)
 
+    if encoder_type == 'fingerprint_baseline':
+        from .fingerprint_encoder import FingerprintEncoder
+        fp_config = config.get('fingerprinting', {})
+        bl_config = encoder_config.get('fingerprint_baseline', {})
+        return FingerprintEncoder(
+            fp_db_path=get_fingerprint_db_path(config),
+            embedding_dim=bl_config.get('embedding_dim'),
+            project_dim=bl_config.get('project_dim'),
+            chromaprint_chunk_idx=fp_config.get('chunk_for_fingerprinting', 1),
+        )
+
     if encoder_type != 'moco':
-        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' and 'fingerprint_baseline' are supported.")
 
     from .moco_encoder import MoCoEncoder
     moco_config = encoder_config.get('moco', {})
     cqt_config = config.get('cqt', {})
+
+    chromaprint_loss_weight = encoder_config.get('chromaprint_loss_weight', 0.0)
 
     return MoCoEncoder(
         sample_rate=music_config['sample_rate'],
@@ -65,7 +138,8 @@ def create_encoder(config: dict) -> nn.Module:
         num_genres=encoder_config.get('genre', {}).get('num_categories', 7),
         n_bins=cqt_config.get('n_bins', 84),
         fmin=cqt_config.get('fmin', 32.7),
-        hop_length=cqt_config.get('hop_length', 512)
+        hop_length=cqt_config.get('hop_length', 512),
+        use_chromaprint=(chromaprint_loss_weight > 0)
     )
 
 
@@ -76,19 +150,26 @@ def create_loss_fn(config: dict) -> nn.Module:
         config: Configuration dictionary with 'encoder' section
 
     Returns:
-        MoCoLoss module
+        MoCoLoss module (or dummy for fingerprint_baseline; not used for training)
     """
     encoder_type = get_encoder_type(config)
 
+    if encoder_type == 'fingerprint_baseline':
+        # Not used; fingerprint baseline only does extraction, no training
+        from .fingerprint_encoder import _DummyLoss
+        return _DummyLoss()
+
     if encoder_type != 'moco':
-        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' and 'fingerprint_baseline' are supported.")
 
     from .moco_encoder import MoCoLoss
     encoder_config = config['encoder']
     loss_weights = encoder_config.get('loss_weights', {})
+    chromaprint_loss_weight = encoder_config.get('chromaprint_loss_weight', 0.0)
     return MoCoLoss(
         moco_weight=loss_weights.get('moco', 0.6),
-        genre_weight=loss_weights.get('genre_bce', 0.4)
+        genre_weight=loss_weights.get('genre_bce', 0.4),
+        chromaprint_weight=chromaprint_loss_weight
     )
 
 
@@ -111,18 +192,34 @@ def create_dataset(
         speech_results: Optional speech detection scores for filtering
 
     Returns:
-        MoCoDataset instance
+        MoCoDataset or FingerprintBaselineDataset instance
     """
     encoder_config = config['encoder']
     music_config = config['music']
     encoder_type = get_encoder_type(config)
 
+    if encoder_type == 'fingerprint_baseline':
+        from .fingerprint_encoder import FingerprintBaselineDataset
+        fp_config = config.get('fingerprinting', {})
+        return FingerprintBaselineDataset(
+            songs=songs,
+            fp_db_path=fp_config.get('fingerprint_db_path', './cache/fingerprints.db'),
+            chromaprint_chunk_idx=fp_config.get('chunk_for_fingerprinting', 1),
+        )
+
     if encoder_type != 'moco':
-        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' is supported.")
+        raise ValueError(f"Unsupported encoder type: {encoder_type}. Only 'moco' and 'fingerprint_baseline' are supported.")
 
     from .moco_dataset import MoCoDataset, AudioAugmentor
+    from .fingerprint_db import FingerprintDB
+
     chunk_cache_config = music_config.get('chunk_cache', {})
     aug_config = encoder_config.get('augmentation', {})
+
+    chromaprint_loss_weight = encoder_config.get('chromaprint_loss_weight', 0.0)
+    fp_db = None
+    if chromaprint_loss_weight > 0:
+        fp_db = FingerprintDB(get_fingerprint_db_path(config))
 
     augmentor = AudioAugmentor(
         sample_rate=music_config['sample_rate'],
@@ -143,13 +240,23 @@ def create_dataset(
         mixup_alpha=aug_config.get('mixup_alpha', 0.1)
     )
 
+    fp_config = config.get('fingerprinting', {})
+    chromaprint_chunk_idx = fp_config.get('chunk_for_fingerprinting', 1)
+    preload_chromaprint = encoder_config.get('preload_chromaprint', True)
+    if fp_db is not None:
+        print(f"  Chromaprint chunk index: {chromaprint_chunk_idx} (config: chunk_for_fingerprinting)")
     return MoCoDataset(
         songs=songs,
-        cache_dir=chunk_cache_config.get('directory', './cache/chunks'),
-        num_chunks=chunk_cache_config.get('num_chunks', 4),
+        cache_dir=get_chunk_cache_dir(config),
+        num_chunks=chunk_cache_config.get('num_chunks', 8),
         sample_rate=music_config['sample_rate'],
         augmentor=augmentor,
-        same_album_prob=aug_config.get('same_album_positive_prob', 0.3)
+        same_album_prob=aug_config.get('same_album_positive_prob', 0.0),
+        far_chunk_prob=aug_config.get('far_chunk_prob', 0.0),
+        min_chunk_distance=aug_config.get('min_chunk_distance', 2),
+        fp_db=fp_db,
+        chromaprint_chunk_idx=chromaprint_chunk_idx,
+        preload_chromaprint=preload_chromaprint,
     )
 
 

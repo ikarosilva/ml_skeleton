@@ -13,6 +13,8 @@ import time
 import numpy as np
 
 from ..utils.early_stopping import EarlyStopping
+from ..utils.gpu import GPUMonitor
+from ..music.losses import BinaryRatingLoss
 
 
 def get_encoder_version_from_checkpoint(checkpoint_path: str) -> str:
@@ -112,31 +114,70 @@ class ClassifierTrainer:
         tracker: Optional[Any] = None,
         encoder_version: str = "v1",
         classifier_version: str = "v1",
-        classification_mode: str = "regression"
+        classification_mode: str = "regression",
+        genre_centroids: Optional[np.ndarray] = None,
+        chunk_aggregation: str = "mean",
+        clip_grad: bool = False,
+        clip_grad_norm: float = 1.0,
+        training_label_noise: float = 0.0,
+        hpo_mlflow_run_id: Optional[str] = None,
+        hpo_mlflow_run_name: Optional[str] = None,
     ):
         self.classifier = classifier.to(device)
         self.device = device
         self.loss_fn = loss_fn
         self.optimizer = optimizer
+        self.genre_centroids = genre_centroids  # (NUM_GENRES, D), saved in checkpoint when use_genre
         self.tracker = tracker  # MLflow tracker for logging learning curves
         self.classification_mode = classification_mode
+        self.chunk_aggregation = chunk_aggregation  # "mean" or "max" over chunk predictions per song
+        self.clip_grad = clip_grad
+        self.clip_grad_norm = clip_grad_norm
+        # Label smoothing for training only (reduces bias toward positives): 0 = none; 10 = 10% (0.1)
+        if training_label_noise >= 1.0:
+            self._label_noise_epsilon = float(training_label_noise) / 100.0
+        else:
+            self._label_noise_epsilon = float(training_label_noise)
 
         # Version tracking for compatibility validation
         self.encoder_version = encoder_version  # Encoder version this classifier was trained with
         self.classifier_version = classifier_version  # This classifier's version
+        self.hpo_mlflow_run_id = hpo_mlflow_run_id  # HPO run params were loaded from (traceability)
+        self.hpo_mlflow_run_name = hpo_mlflow_run_name  # HPO parent run display name
+
+        # GPU monitoring (samples utilization during training)
+        self.gpu_monitor = GPUMonitor() if device == "cuda" else None
 
         # Training state
         self.current_epoch = 0
         self.best_loss = float('inf')
         self.best_mae = float('inf')  # Also used for accuracy in binary mode
         self.best_accuracy = 0.0
+        self.best_recall = 0.0
+        self.best_precision = 0.0
+        self.best_roc_auc = 0.0
+        self.roc_auc_at_best_checkpoint: Optional[float] = None  # ROC AUC of the saved best model (early stopping)
+        self.best_epoch_saved: Optional[int] = None  # Epoch (1-based) when best checkpoint was saved
         self.best_correlation = 0.0
         self.history = {
             "train_loss": [],
             "val_loss": [],
-            "val_mae": [],  # In binary mode, this stores accuracy
-            "val_accuracy": []
+            "val_mae": [],  # In binary mode, this stores (1 - accuracy)
+            "val_accuracy": [],
+            "val_precision": [],  # Binary only: PPV = TP/(TP+FP) per epoch
+            "val_recall": [],  # Binary only: recall per epoch
+            "val_f1": [],  # Binary only: F1 per epoch
+            "val_roc_auc": [],  # Binary only: ROC AUC (probs vs binary labels)
+            "val_rating_mse": [],  # Binary: MSE(pred_prob, normalized 1-5 rating)
+            "val_rating_corr": [],  # Binary: correlation(pred_prob, normalized 1-5 rating)
         }
+
+    def _aggregate_chunk_predictions(self, pred_chunks: torch.Tensor, B: int, C: int) -> torch.Tensor:
+        """Aggregate per-chunk predictions to one per song. pred_chunks shape (B*C,) or (B*C, 1)."""
+        view = pred_chunks.view(B, C)
+        if self.chunk_aggregation == "max":
+            return view.max(dim=1)[0]
+        return view.mean(dim=1)
 
     def train_epoch(self, train_loader: DataLoader) -> dict:
         """Train for one epoch.
@@ -157,21 +198,56 @@ class ClassifierTrainer:
             # Move data to device
             embeddings = batch["embedding"].to(self.device)
             ratings = batch["rating"].to(self.device)
+            # Apply label smoothing during training only (soften 0/1 to reduce positive bias)
+            if self._label_noise_epsilon > 0 and self.classification_mode == "binary":
+                eps = self._label_noise_epsilon
+                # Hard 0 -> eps, hard 1 -> 1-eps, middle (0.5) unchanged
+                ratings = torch.where(
+                    ratings <= 0.01,
+                    torch.full_like(ratings, eps, device=ratings.device),
+                    torch.where(ratings >= 0.99, torch.full_like(ratings, 1.0 - eps, device=ratings.device), ratings),
+                )
+            genre = batch.get("genre")
+            if genre is not None:
+                genre = genre.to(self.device)
 
-            # Forward pass
-            predictions = self.classifier(embeddings)
+            # Forward pass (all chunks per song: (B, C, D) -> predict per chunk, average to one rating)
+            if embeddings.dim() == 3:
+                B, C, D = embeddings.shape
+                emb_flat = embeddings.view(B * C, D)
+                if genre is not None:
+                    # One genre vector per song; repeat for each chunk
+                    genre_flat = genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, genre.size(-1))
+                    pred_chunks = self.classifier(emb_flat, genre_flat)
+                else:
+                    pred_chunks = self.classifier(emb_flat)
+                predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
+            else:
+                if genre is not None:
+                    predictions = self.classifier(embeddings, genre)
+                else:
+                    predictions = self.classifier(embeddings)
 
             # Compute loss (predictions are already (batch_size,))
-            loss = self.loss_fn(predictions, ratings)
+            if isinstance(self.loss_fn, BinaryRatingLoss) and "is_middle" in batch:
+                loss = self.loss_fn(predictions, ratings, is_middle=batch["is_middle"].to(self.device))
+            else:
+                loss = self.loss_fn(predictions, ratings)
 
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+            if self.clip_grad:
+                torch.nn.utils.clip_grad_norm_(self.classifier.parameters(), self.clip_grad_norm)
             self.optimizer.step()
 
             # Update metrics
             total_loss += loss.item()
             num_batches += 1
+
+            # Sample GPU utilization every 10 batches
+            if self.gpu_monitor and num_batches % 10 == 0:
+                self.gpu_monitor.sample()
 
             # Update progress bar
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -179,9 +255,16 @@ class ClassifierTrainer:
         avg_loss = total_loss / num_batches
         self.history["train_loss"].append(avg_loss)
 
+        # Get GPU stats for this epoch
+        gpu_stats = {}
+        if self.gpu_monitor:
+            gpu_stats = self.gpu_monitor.get_stats()
+            self.gpu_monitor.reset()
+
         return {
             "loss": avg_loss,
-            "num_batches": num_batches
+            "num_batches": num_batches,
+            "gpu_stats": gpu_stats,
         }
 
     def validate(self, val_loader: DataLoader) -> dict:
@@ -200,6 +283,7 @@ class ClassifierTrainer:
 
         all_predictions = []
         all_targets = []
+        all_rating_continuous = []  # Original 1-5 normalized to [0,1], for rating MSE/corr
 
         # Binary classification metrics
         correct = 0
@@ -212,12 +296,38 @@ class ClassifierTrainer:
             for batch in tqdm(val_loader, desc="Validation"):
                 embeddings = batch["embedding"].to(self.device)
                 ratings = batch["rating"].to(self.device)
+                genre = batch.get("genre")
+                if genre is not None:
+                    genre = genre.to(self.device)
 
-                # Forward pass
-                predictions = self.classifier(embeddings)
+                # Forward pass (all chunks per song: (B, C, D) -> average predictions)
+                if embeddings.dim() == 3:
+                    B, C, D = embeddings.shape
+                    emb_flat = embeddings.view(B * C, D)
+                    if genre is not None:
+                        genre_flat = genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, genre.size(-1))
+                        pred_chunks = self.classifier(emb_flat, genre_flat)
+                    else:
+                        pred_chunks = self.classifier(emb_flat)
+                    predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
+                else:
+                    if genre is not None:
+                        predictions = self.classifier(embeddings, genre)
+                    else:
+                        predictions = self.classifier(embeddings)
 
                 # Compute loss (predictions are already (batch_size,))
-                loss = self.loss_fn(predictions, ratings)
+                # Use unweighted BCE for validation so val_loss does not reward collapse (predict-all-1)
+                if isinstance(self.loss_fn, BinaryRatingLoss) and "is_middle" in batch:
+                    loss = self.loss_fn(
+                        predictions, ratings,
+                        is_middle=batch["is_middle"].to(self.device),
+                        validation=True,
+                    )
+                elif isinstance(self.loss_fn, BinaryRatingLoss):
+                    loss = self.loss_fn(predictions, ratings, validation=True)
+                else:
+                    loss = self.loss_fn(predictions, ratings)
                 total_loss += loss.item()
                 num_batches += 1
 
@@ -226,19 +336,23 @@ class ClassifierTrainer:
                     probs = torch.sigmoid(predictions).squeeze()
                     predicted_labels = (probs > 0.5).float()
                     target_labels = ratings.squeeze()
-
-                    # Accuracy
-                    correct += (predicted_labels == target_labels).sum().item()
-                    total += target_labels.size(0)
-
-                    # Precision/Recall stats
-                    true_positives += ((predicted_labels == 1) & (target_labels == 1)).sum().item()
-                    false_positives += ((predicted_labels == 1) & (target_labels == 0)).sum().item()
-                    false_negatives += ((predicted_labels == 0) & (target_labels == 1)).sum().item()
+                    # Exclude middle-rated samples from accuracy (they have target 0.5; we only score like/dislike)
+                    non_middle = ~batch["is_middle"].to(self.device) if "is_middle" in batch else torch.ones_like(target_labels, dtype=torch.bool)
+                    if non_middle.any():
+                        correct += ((predicted_labels == target_labels) & non_middle).sum().item()
+                        total += non_middle.sum().item()
+                        # Precision/Recall only over non-middle
+                        true_positives += ((predicted_labels == 1) & (target_labels == 1) & non_middle).sum().item()
+                        false_positives += ((predicted_labels == 1) & (target_labels == 0) & non_middle).sum().item()
+                        false_negatives += ((predicted_labels == 0) & (target_labels == 1) & non_middle).sum().item()
 
                     # Store probabilities for analysis
                     all_predictions.extend(probs.cpu().numpy().tolist())
                     all_targets.extend(target_labels.cpu().numpy().tolist())
+                    # Continuous rating (1-5 normalized) for rating MSE/correlation
+                    rc = batch.get("rating_continuous")
+                    if rc is not None:
+                        all_rating_continuous.extend(rc.cpu().numpy().tolist())
                 else:
                     # Regression: compute MAE
                     mae = torch.abs(predictions - ratings).mean()
@@ -259,21 +373,71 @@ class ClassifierTrainer:
 
             self.history["val_loss"].append(avg_loss)
             self.history["val_accuracy"].append(accuracy)
+            self.history["val_precision"].append(precision)
+            self.history["val_recall"].append(recall)
             self.history["val_mae"].append(1.0 - accuracy)  # For compatibility, store error rate
+            self.history["val_f1"].append(f1)
+
+            # ROC AUC: use only binary (0/1) labels, exclude middle-rated
+            roc_auc = 0.5
+            if all_predictions and all_targets:
+                pred_arr = np.array(all_predictions)
+                tgt_arr = np.array(all_targets)
+                # Exclude middle: keep only strict 0 and 1
+                binary_mask = (tgt_arr < 0.25) | (tgt_arr > 0.75)
+                if binary_mask.sum() > 0:
+                    y_score = pred_arr[binary_mask]
+                    y_true = (tgt_arr[binary_mask] > 0.5).astype(np.float64)
+                    n_pos = int(y_true.sum())
+                    n_neg = len(y_true) - n_pos
+                    if n_pos > 0 and n_neg > 0:
+                        order = np.argsort(y_score)[::-1]
+                        y_true = np.take(y_true, order)
+                        ranks = np.arange(1, len(y_true) + 1, dtype=np.float64)
+                        roc_auc = float(
+                            (np.sum(ranks * y_true) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+                        )
+                    if roc_auc > self.best_roc_auc:
+                        self.best_roc_auc = roc_auc
+            self.history["val_roc_auc"].append(roc_auc)
+
+            # Rating MSE/correlation: predicted prob vs original 1-5 (normalized)
+            rating_mse = None
+            rating_corr = None
+            if all_rating_continuous:
+                pred_arr = np.array(all_predictions)
+                cont_arr = np.array(all_rating_continuous)
+                rating_mse = float(np.mean((pred_arr - cont_arr) ** 2))
+                self.history["val_rating_mse"].append(rating_mse)
+                if pred_arr.std() >= 1e-8 and cont_arr.std() >= 1e-8:
+                    rating_corr = float(np.corrcoef(pred_arr, cont_arr)[0, 1])
+                else:
+                    rating_corr = float("nan")
+                self.history["val_rating_corr"].append(rating_corr)
 
             # Update best
             if accuracy > self.best_accuracy:
                 self.best_accuracy = accuracy
+            if recall > self.best_recall:
+                self.best_recall = recall
+            if precision > self.best_precision:
+                self.best_precision = precision
 
-            return {
+            out = {
                 "loss": avg_loss,
                 "accuracy": accuracy,
                 "precision": precision,
                 "recall": recall,
                 "f1": f1,
+                "roc_auc": roc_auc,
                 "mae": 1.0 - accuracy,  # Error rate for compatibility
                 "num_batches": num_batches
             }
+            if rating_mse is not None:
+                out["rating_mse"] = rating_mse
+            if rating_corr is not None and not np.isnan(rating_corr):
+                out["rating_corr"] = rating_corr
+            return out
         else:
             # Regression metrics
             avg_mae = total_mae / num_batches
@@ -305,6 +469,35 @@ class ClassifierTrainer:
                 "target_std": target_std
             }
 
+    def _compute_val_rating_corr_and_f1(
+        self,
+        val_metrics: dict,
+        w_corr: float,
+        w_f1: float,
+    ) -> Optional[float]:
+        """Compute val_rating_corr_and_f1 composite from validation metrics (binary mode).
+
+        Returns None if neither correlation nor F1 is available.
+        """
+        if self.classification_mode != "binary":
+            return None
+        rating_corr = val_metrics.get("rating_corr")
+        f1 = val_metrics.get("f1")
+        total_w = w_corr + w_f1
+        if total_w <= 0:
+            return None
+        w_corr, w_f1 = w_corr / total_w, w_f1 / total_w
+        norm_corr = None
+        if rating_corr is not None and not (isinstance(rating_corr, float) and np.isnan(rating_corr)):
+            norm_corr = (float(rating_corr) + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+        if norm_corr is not None and f1 is not None:
+            return w_corr * norm_corr + w_f1 * float(f1)
+        if norm_corr is not None:
+            return norm_corr
+        if f1 is not None:
+            return float(f1)
+        return None
+
     def train(
         self,
         train_loader: DataLoader,
@@ -313,7 +506,10 @@ class ClassifierTrainer:
         checkpoint_dir: str = "./checkpoints",
         save_best_only: bool = True,
         early_stopping_patience: Optional[int] = None,
-        early_stopping_min_delta: float = 0.0
+        early_stopping_min_delta: float = 0.0,
+        monitor_metric: Optional[str] = None,
+        hpo_metric_corr_weight: float = 0.5,
+        hpo_metric_f1_weight: float = 0.5,
     ) -> dict:
         """Full training loop with optional early stopping.
 
@@ -326,6 +522,11 @@ class ClassifierTrainer:
             early_stopping_patience: Number of epochs to wait for improvement before stopping
                                      (None = no early stopping)
             early_stopping_min_delta: Minimum improvement to count as progress
+            monitor_metric: If 'val_rating_corr_and_f1', early stopping and best checkpoint
+                            use this composite (maximize) instead of val loss. Ensures the
+                            saved model matches the HPO objective.
+            hpo_metric_corr_weight: Weight for correlation in composite (when monitor_metric set).
+            hpo_metric_f1_weight: Weight for F1 in composite (when monitor_metric set).
 
         Returns:
             Dictionary with training history
@@ -333,16 +534,52 @@ class ClassifierTrainer:
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+        use_composite = (
+            monitor_metric == "val_rating_corr_and_f1"
+            and self.classification_mode == "binary"
+            and early_stopping_patience is not None
+            and val_loader is not None
+        )
+        use_f1_monitor = (
+            monitor_metric == "val_f1"
+            and self.classification_mode == "binary"
+            and early_stopping_patience is not None
+            and val_loader is not None
+        )
+        use_roc_auc_monitor = (
+            monitor_metric == "val_roc_auc"
+            and self.classification_mode == "binary"
+            and early_stopping_patience is not None
+            and val_loader is not None
+        )
+        use_max_metric = use_composite or use_f1_monitor or use_roc_auc_monitor
+
         # Initialize early stopping if enabled
         early_stop = None
         if early_stopping_patience is not None and val_loader is not None:
             early_stop = EarlyStopping(
                 patience=early_stopping_patience,
                 min_delta=early_stopping_min_delta,
-                mode='min',
-                verbose=True
+                mode="max" if use_max_metric else "min",
+                verbose=True,
             )
-            print(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
+            if use_composite:
+                print(
+                    f"Early stopping enabled (monitor=val_rating_corr_and_f1): "
+                    f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
+                )
+            elif use_f1_monitor:
+                print(
+                    f"Early stopping enabled (monitor=val_f1): "
+                    f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
+                )
+            elif use_roc_auc_monitor:
+                print(
+                    f"Early stopping enabled (monitor=val_roc_auc): "
+                    f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
+                )
+            else:
+                print(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
 
         print(f"Training classifier for up to {num_epochs} epochs")
         print(f"Device: {self.device}")
@@ -365,37 +602,24 @@ class ClassifierTrainer:
             # Print metrics
             print(f"\nEpoch {epoch + 1}/{num_epochs} ({epoch_time:.1f}s)")
             print(f"  Train Loss: {train_metrics['loss']:.4f}")
+            gpu_stats = train_metrics.get("gpu_stats", {})
+            if gpu_stats:
+                print(f"  GPU Util: {gpu_stats.get('gpu_util_avg', 0):.1f}% avg "
+                      f"(min={gpu_stats.get('gpu_util_min', 0):.0f}%, max={gpu_stats.get('gpu_util_max', 0):.0f}%)")
             if val_metrics:
                 print(f"  Val Loss: {val_metrics['loss']:.4f}")
                 if self.classification_mode == "binary":
                     print(f"  Val Accuracy: {val_metrics['accuracy']:.4f}")
-                    print(f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}")
+                    print(f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}, ROC AUC: {val_metrics.get('roc_auc', 0.5):.4f}")
+                    if "rating_mse" in val_metrics:
+                        rc_str = f"{val_metrics['rating_corr']:.4f}" if "rating_corr" in val_metrics and not np.isnan(val_metrics["rating_corr"]) else "nan"
+                        print(f"  Val Rating MSE: {val_metrics['rating_mse']:.4f}, Corr(prob,1-5): {rc_str}")
                 else:
                     print(f"  Val MAE: {val_metrics['mae']:.4f}")
                     corr_str = f"{val_metrics['correlation']:.4f}" if not np.isnan(val_metrics['correlation']) else "nan"
                     print(f"  Val Correlation: {corr_str}")
                     if epoch < 3:  # Log variance diagnostics for first few epochs
                         print(f"  Pred StdDev: {val_metrics.get('pred_std', 0):.4f}, Target StdDev: {val_metrics.get('target_std', 0):.4f}")
-
-            # Log metrics to MLflow for learning curves
-            if self.tracker is not None:
-                self.tracker.log_metric('classifier/train_loss', train_metrics['loss'], step=epoch)
-                if val_metrics:
-                    self.tracker.log_metric('classifier/val_loss', val_metrics['loss'], step=epoch)
-                    if self.classification_mode == "binary":
-                        self.tracker.log_metric('classifier/val_accuracy', val_metrics['accuracy'], step=epoch)
-                        self.tracker.log_metric('classifier/val_precision', val_metrics['precision'], step=epoch)
-                        self.tracker.log_metric('classifier/val_recall', val_metrics['recall'], step=epoch)
-                        self.tracker.log_metric('classifier/val_f1', val_metrics['f1'], step=epoch)
-                    else:
-                        self.tracker.log_metric('classifier/val_mae', val_metrics['mae'], step=epoch)
-                        # Only log correlation if not NaN
-                        if not np.isnan(val_metrics['correlation']):
-                            self.tracker.log_metric('classifier/val_correlation', val_metrics['correlation'], step=epoch)
-                        # Log variance diagnostics
-                        self.tracker.log_metric('classifier/pred_std', val_metrics.get('pred_std', 0), step=epoch)
-                        self.tracker.log_metric('classifier/target_std', val_metrics.get('target_std', 0), step=epoch)
-                self.tracker.log_metric('classifier/epoch_time', epoch_time, step=epoch)
 
             # Track best metrics
             if val_metrics:
@@ -413,19 +637,65 @@ class ClassifierTrainer:
 
             # Save checkpoint
             current_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
+            # When monitoring composite, F1, or ROC AUC, use that for early stop and save; otherwise use loss
+            if use_composite and val_metrics:
+                monitored_value = self._compute_val_rating_corr_and_f1(
+                    val_metrics, hpo_metric_corr_weight, hpo_metric_f1_weight
+                )
+            elif use_f1_monitor and val_metrics:
+                monitored_value = val_metrics.get('f1')
+            elif use_roc_auc_monitor and val_metrics:
+                monitored_value = val_metrics.get('roc_auc')
+            else:
+                monitored_value = current_loss
 
-            # Check early stopping
-            if early_stop is not None:
-                if early_stop(current_loss, epoch):
-                    # Early stopping triggered
-                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                    print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
-                    break
+            # Minimum composite/F1 to count as "improvement" (avoids saving collapsed model with F1=0)
+            MIN_MAX_METRIC_THRESHOLD = 0.01
+            # Bounds to allow saving as "best" in binary mode (avoid both collapses)
+            MIN_RECALL_FOR_BEST = 0.05    # avoid predict-all-negative
+            MIN_PRECISION_FOR_BEST = 0.10  # avoid predict-all-positive (PPV/precision then low)
+            current_recall = val_metrics.get("recall", 0.0) if val_metrics and self.classification_mode == "binary" else 1.0
+            current_precision = val_metrics.get("precision", 0.0) if val_metrics and self.classification_mode == "binary" else 1.0
+            recall_acceptable = current_recall >= MIN_RECALL_FOR_BEST and current_precision >= MIN_PRECISION_FOR_BEST
+            composite_acceptable = (
+                (use_composite or use_f1_monitor or use_roc_auc_monitor)
+                and monitored_value is not None
+                and not (isinstance(monitored_value, float) and np.isnan(monitored_value))
+                and monitored_value > MIN_MAX_METRIC_THRESHOLD
+                and recall_acceptable
+            )
+
+            # Check early stopping (only when we have a valid monitored value; for composite, only when above threshold)
+            if early_stop is not None and monitored_value is not None:
+                if not (isinstance(monitored_value, float) and np.isnan(monitored_value)):
+                    if use_composite and not composite_acceptable:
+                        pass  # Don't update early_stop when composite is 0 or trivial (avoid "best" = epoch 1 with 0.0)
+                    else:
+                        if early_stop(monitored_value, epoch):
+                            # Early stopping triggered
+                            print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                            if use_composite:
+                                print(f"Best val_rating_corr_and_f1: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            elif use_f1_monitor:
+                                print(f"Best val_f1: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            elif use_roc_auc_monitor:
+                                print(f"Best val_roc_auc: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            else:
+                                print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            break
 
             if save_best_only:
-                # Save only if this is the best model (either by early stopping or manual check)
-                if early_stop and early_stop.should_save_checkpoint():
+                # Save best model: by composite when acceptable, else by loss (fallback when model is collapsed)
+                should_save = False
+                if (use_composite or use_f1_monitor or use_roc_auc_monitor) and composite_acceptable:
+                    should_save = early_stop and early_stop.should_save_checkpoint()
+                elif not (use_composite or use_f1_monitor or use_roc_auc_monitor):
+                    should_save = (early_stop and early_stop.should_save_checkpoint()) or (not early_stop and current_loss < self.best_loss)
+                if should_save:
                     self.best_loss = current_loss
+                    if val_metrics and "roc_auc" in val_metrics:
+                        self.roc_auc_at_best_checkpoint = val_metrics["roc_auc"]
+                    self.best_epoch_saved = epoch + 1
                     self.save_checkpoint(
                         checkpoint_dir / "classifier_best.pt",
                         metrics={
@@ -435,19 +705,43 @@ class ClassifierTrainer:
                             "epoch": epoch
                         }
                     )
-                    print(f"  Saved best model (loss: {current_loss:.4f})")
-                elif not early_stop and current_loss < self.best_loss:
-                    self.best_loss = current_loss
-                    self.save_checkpoint(
-                        checkpoint_dir / "classifier_best.pt",
-                        metrics={
-                            "loss": current_loss,
-                            "mae": val_metrics.get('mae') if val_metrics else None,
-                            "correlation": val_metrics.get('correlation') if val_metrics else None,
-                            "epoch": epoch
-                        }
-                    )
-                    print(f"  Saved best model (loss: {current_loss:.4f})")
+                    if use_composite:
+                        print(f"  Saved best model (val_rating_corr_and_f1: {monitored_value:.4f})")
+                    elif use_f1_monitor:
+                        print(f"  Saved best model (val_f1: {monitored_value:.4f})")
+                    elif use_roc_auc_monitor:
+                        print(f"  Saved best model (val_roc_auc: {monitored_value:.4f})")
+                    else:
+                        print(f"  Saved best model (loss: {current_loss:.4f})")
+                elif ((use_composite or use_f1_monitor or use_roc_auc_monitor) or not early_stop) and current_loss < self.best_loss:
+                    # Fallback: save by loss only if recall is acceptable (never save collapsed model as best)
+                    if (use_composite or use_f1_monitor or use_roc_auc_monitor) and not recall_acceptable:
+                        if current_recall < 0.02:
+                            print(f"  Skipping save by loss (recall={current_recall:.2%} < 5%, avoid predict-all-negative)")
+                        elif current_precision < MIN_PRECISION_FOR_BEST:
+                            print(f"  Skipping save by loss (precision={current_precision:.2%} < {MIN_PRECISION_FOR_BEST:.0%}, avoid predict-all-positive)")
+                    else:
+                        self.best_loss = current_loss
+                        if val_metrics and "roc_auc" in val_metrics:
+                            self.roc_auc_at_best_checkpoint = val_metrics["roc_auc"]
+                        self.best_epoch_saved = epoch + 1
+                        self.save_checkpoint(
+                            checkpoint_dir / "classifier_best.pt",
+                            metrics={
+                                "loss": current_loss,
+                                "mae": val_metrics.get('mae') if val_metrics else None,
+                                "correlation": val_metrics.get('correlation') if val_metrics else None,
+                                "epoch": epoch
+                            }
+                        )
+                        if use_composite:
+                            print(f"  Saved best model by loss (val_rating_corr_and_f1 still below threshold, loss: {current_loss:.4f})")
+                        elif use_f1_monitor:
+                            print(f"  Saved best model by loss (val_f1 still below threshold, loss: {current_loss:.4f})")
+                        elif use_roc_auc_monitor:
+                            print(f"  Saved best model by loss (val_roc_auc still below threshold, loss: {current_loss:.4f})")
+                        else:
+                            print(f"  Saved best model (loss: {current_loss:.4f})")
             else:
                 self.save_checkpoint(
                     checkpoint_dir / f"classifier_epoch_{epoch + 1}.pt",
@@ -460,20 +754,40 @@ class ClassifierTrainer:
             metrics={"epoch": num_epochs}
         )
 
-        # Log final summary metrics to MLflow
+        # ROC AUC and epoch of the saved best model (early-stopping checkpoint); fallback to max if never set
+        if self.roc_auc_at_best_checkpoint is not None:
+            self.history["roc_auc"] = self.roc_auc_at_best_checkpoint
+        elif self.history.get("val_roc_auc"):
+            self.history["roc_auc"] = max(self.history["val_roc_auc"])
+        else:
+            self.history["roc_auc"] = None
+        if self.best_epoch_saved is not None:
+            self.history["best_epoch"] = self.best_epoch_saved
+
+        # Log final summary metrics to MLflow (unified names; use tag "stage" = "classifier" to identify)
         if self.tracker is not None:
+            self.tracker.set_tag("stage", "classifier")
             epochs_completed = len(self.history['train_loss'])
-            self.tracker.log_metric('classifier/epochs_completed', epochs_completed)
-            self.tracker.log_metric('classifier/best_val_loss', self.best_loss)
+            self.tracker.log_metric('epochs_completed', epochs_completed)
+            self.tracker.log_metric('val_loss', self.best_loss)
             if self.classification_mode == "binary":
-                self.tracker.log_metric('classifier/best_val_accuracy', self.best_accuracy)
+                self.tracker.log_metric('val_accuracy', self.best_accuracy)
+                self.tracker.log_metric('val_precision', self.best_precision)
+                self.tracker.log_metric('val_ppv', self.best_precision)  # PPV = precision
+                self.tracker.log_metric('val_recall', self.best_recall)
+                # Log ROC AUC of the saved checkpoint (early stopping)
+                roc_auc_saved = self.roc_auc_at_best_checkpoint
+                if roc_auc_saved is None and self.history.get("val_roc_auc"):
+                    roc_auc_saved = max(self.history["val_roc_auc"])
+                if roc_auc_saved is not None:
+                    self.tracker.log_metric('roc_auc', roc_auc_saved)
             else:
-                self.tracker.log_metric('classifier/best_val_mae', self.best_mae)
-                self.tracker.log_metric('classifier/best_val_correlation', self.best_correlation)
+                self.tracker.log_metric('val_mae', self.best_mae)
+                self.tracker.log_metric('val_correlation', self.best_correlation)
             if self.history['train_loss']:
-                self.tracker.log_metric('classifier/final_train_loss', self.history['train_loss'][-1])
+                self.tracker.log_metric('final_train_loss', self.history['train_loss'][-1])
             if self.history['val_loss']:
-                self.tracker.log_metric('classifier/final_val_loss', self.history['val_loss'][-1])
+                self.tracker.log_metric('final_val_loss', self.history['val_loss'][-1])
 
         return self.history
 
@@ -494,11 +808,25 @@ class ClassifierTrainer:
             "epoch": self.current_epoch,
             "history": self.history,
             "encoder_version": self.encoder_version,  # Required for compatibility check
-            "classifier_version": self.classifier_version
+            "classifier_version": self.classifier_version,
+            "chunk_aggregation": self.chunk_aggregation,
+            "hpo_mlflow_run_id": getattr(
+                self, "hpo_mlflow_run_id", None
+            ),  # HPO run params came from (traceability)
+            "hpo_mlflow_run_name": getattr(
+                self, "hpo_mlflow_run_name", None
+            ),  # HPO parent run display name
+            "use_genre": getattr(self.classifier, "use_genre", False),
+            "embedding_dim": getattr(self.classifier, "embedding_dim", 0),
+            "hidden_dims": getattr(self.classifier, "hidden_dims", None),
+            "use_batch_norm": getattr(self.classifier, "use_batch_norm", False),
+            "use_residual": getattr(self.classifier, "use_residual", False),
         }
 
         if metrics:
             checkpoint["metrics"] = metrics
+        if self.genre_centroids is not None:
+            checkpoint["genre_centroids"] = self.genre_centroids
 
         torch.save(checkpoint, path)
 
@@ -537,6 +865,7 @@ class ClassifierTrainer:
         })
         self.encoder_version = checkpoint_encoder_version
         self.classifier_version = checkpoint_classifier_version
+        self.chunk_aggregation = checkpoint.get("chunk_aggregation", "mean")
 
         print(f"Loaded classifier checkpoint from epoch {self.current_epoch}")
         print(f"  Classifier version: {self.classifier_version}")
@@ -563,9 +892,25 @@ class ClassifierTrainer:
             for batch in tqdm(data_loader, desc="Predicting"):
                 embeddings = batch["embedding"].to(self.device)
                 batch_filenames = batch["filename"]
+                genre = batch.get("genre")
+                if genre is not None:
+                    genre = genre.to(self.device)
 
-                # Predict (predictions are already (batch_size,))
-                preds = self.classifier(embeddings)
+                # Predict (all chunks per song: (B, C, D) -> average to one rating per song)
+                if embeddings.dim() == 3:
+                    B, C, D = embeddings.shape
+                    emb_flat = embeddings.view(B * C, D)
+                    if genre is not None:
+                        genre_flat = genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, genre.size(-1))
+                        pred_chunks = self.classifier(emb_flat, genre_flat)
+                    else:
+                        pred_chunks = self.classifier(emb_flat)
+                    preds = self._aggregate_chunk_predictions(pred_chunks, B, C)
+                else:
+                    if genre is not None:
+                        preds = self.classifier(embeddings, genre)
+                    else:
+                        preds = self.classifier(embeddings)
 
                 # For binary mode, apply sigmoid to get probabilities
                 if self.classification_mode == "binary":
@@ -596,9 +941,25 @@ class ClassifierTrainer:
             for batch in tqdm(data_loader, desc="Evaluating"):
                 embeddings = batch["embedding"].to(self.device)
                 ratings = batch["rating"].to(self.device)
+                genre = batch.get("genre")
+                if genre is not None:
+                    genre = genre.to(self.device)
 
-                # Predict (predictions are already (batch_size,))
-                predictions = self.classifier(embeddings)
+                # Predict (support num_chunks per song, default 8)
+                if embeddings.dim() == 3:
+                    B, C, D = embeddings.shape
+                    emb_flat = embeddings.view(B * C, D)
+                    if genre is not None:
+                        genre_flat = genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, genre.size(-1))
+                        pred_chunks = self.classifier(emb_flat, genre_flat)
+                    else:
+                        pred_chunks = self.classifier(emb_flat)
+                    predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
+                else:
+                    if genre is not None:
+                        predictions = self.classifier(embeddings, genre)
+                    else:
+                        predictions = self.classifier(embeddings)
 
                 # Compute loss
                 loss = self.loss_fn(predictions, ratings)

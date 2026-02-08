@@ -63,6 +63,7 @@ class BaseTuner(ABC):
         hyperparameters: Dict[str, Any],
         trial_id: Optional[str] = None,
         trial_number: Optional[int] = None,
+        parent_run_id: Optional[str] = None,
     ) -> TrainingContext:
         """
         Build TrainingContext for a trial.
@@ -71,14 +72,21 @@ class BaseTuner(ABC):
             hyperparameters: Sampled hyperparameters for this trial
             trial_id: Unique identifier for this trial
             trial_number: Sequential trial number
+            parent_run_id: Optional MLflow parent run ID so the trial run is nested
+                under the HPO parent (used by Optuna tuner).
 
         Returns:
             Configured TrainingContext
         """
+        run_name = f"trial_{trial_number}" if trial_number is not None else None
+        # Use resolved MLflow experiment name when tuner set it (e.g. after creating new experiment for deleted one)
+        experiment_name = getattr(self, "_mlflow_experiment_name", None) or self.config.name
         tracker = ExplrTracker(
             tracking_uri=self.mlflow_tracking_uri,
-            experiment_name=self.config.name,
-            nested=True,  # Nested runs for tuning trials
+            experiment_name=experiment_name,
+            run_name=run_name,
+            nested=True,  # Required: trials must nest under HPO parent
+            parent_run_id=parent_run_id,  # Required for nesting; Optuna sets this
         )
 
         return TrainingContext(
@@ -86,7 +94,7 @@ class BaseTuner(ABC):
             tracker=tracker,
             trial_id=trial_id,
             trial_number=trial_number,
-            experiment_name=self.config.name,
+            experiment_name=experiment_name,
             seed=self.config.seed,
             checkpoint_dir=self.config.checkpoint_dir,
             artifact_dir=self.config.artifact_dir,

@@ -27,6 +27,7 @@ class Fingerprint:
     fingerprint: str  # Chromaprint hash (base64 encoded)
     duration: float  # Chunk duration in seconds (typically 30.0)
     mtime: float  # Cache file modification time
+    bits: Optional[bytes] = None  # Precomputed 256 bits as 32 bytes (packed); avoids decode at training
 
 
 @dataclass
@@ -95,6 +96,12 @@ class FingerprintDB:
                 ON fingerprints(song_id)
             """)
 
+            # Migration: add bits column if missing (existing DBs created before precomputed bits)
+            cursor.execute("PRAGMA table_info(fingerprints)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "bits" not in columns:
+                cursor.execute("ALTER TABLE fingerprints ADD COLUMN bits BLOB")
+
             # Duplicates table: maps duplicate songs to canonical versions
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS duplicates (
@@ -111,22 +118,23 @@ class FingerprintDB:
             """)
 
     def add_fingerprint(self, song_id: int, chunk_idx: int, fingerprint: str,
-                       duration: float, mtime: float) -> None:
+                       duration: float, mtime: float, bits: Optional[bytes] = None) -> None:
         """Add or update a fingerprint for a chunk.
 
         Args:
             song_id: Song ID from Clementine database
-            chunk_idx: Chunk index (0-3 for 4-chunk cache)
+            chunk_idx: Chunk index (0 to num_chunks-1)
             fingerprint: Chromaprint hash (base64 encoded string)
             duration: Chunk duration in seconds
             mtime: Cache file modification time (Unix timestamp)
+            bits: Optional precomputed 256 bits as 32 packed bytes (avoids decode at training)
         """
         with self._get_conn() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO fingerprints
-                (song_id, chunk_idx, fingerprint, duration, mtime)
-                VALUES (?, ?, ?, ?, ?)
-            """, (song_id, chunk_idx, fingerprint, duration, mtime))
+                (song_id, chunk_idx, fingerprint, duration, mtime, bits)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (song_id, chunk_idx, fingerprint, duration, mtime, bits))
 
     def add_fingerprints_batch(self, fingerprints: List[Fingerprint]) -> int:
         """Add multiple fingerprints in a single transaction.
@@ -140,9 +148,9 @@ class FingerprintDB:
         with self._get_conn() as conn:
             conn.executemany("""
                 INSERT OR REPLACE INTO fingerprints
-                (song_id, chunk_idx, fingerprint, duration, mtime)
-                VALUES (?, ?, ?, ?, ?)
-            """, [(f.song_id, f.chunk_idx, f.fingerprint, f.duration, f.mtime)
+                (song_id, chunk_idx, fingerprint, duration, mtime, bits)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [(f.song_id, f.chunk_idx, f.fingerprint, f.duration, f.mtime, getattr(f, 'bits', None))
                   for f in fingerprints])
             return len(fingerprints)
 
@@ -158,7 +166,7 @@ class FingerprintDB:
         """
         with self._get_conn() as conn:
             cursor = conn.execute("""
-                SELECT song_id, chunk_idx, fingerprint, duration, mtime
+                SELECT song_id, chunk_idx, fingerprint, duration, mtime, bits
                 FROM fingerprints
                 WHERE song_id = ? AND chunk_idx = ?
             """, (song_id, chunk_idx))
@@ -167,6 +175,27 @@ class FingerprintDB:
             if row:
                 return Fingerprint(**dict(row))
             return None
+
+    def get_fingerprints_batch(
+        self, song_ids: List[int], chunk_idx: int
+    ) -> Dict[int, Optional[Fingerprint]]:
+        """Get fingerprints for many songs at once (single query). Used to preload chromaprint cache so DataLoader workers never touch the DB."""
+        if not song_ids:
+            return {}
+        result: Dict[int, Optional[Fingerprint]] = {sid: None for sid in song_ids}
+        with self._get_conn() as conn:
+            placeholders = ",".join("?" * len(song_ids))
+            cursor = conn.execute(
+                f"""
+                SELECT song_id, chunk_idx, fingerprint, duration, mtime, bits
+                FROM fingerprints
+                WHERE chunk_idx = ? AND song_id IN ({placeholders})
+                """,
+                [chunk_idx] + list(song_ids),
+            )
+            for row in cursor.fetchall():
+                result[row["song_id"]] = Fingerprint(**dict(row))
+        return result
 
     def get_song_fingerprints(self, song_id: int) -> List[Fingerprint]:
         """Get all fingerprints for a song (all chunks).
@@ -179,7 +208,7 @@ class FingerprintDB:
         """
         with self._get_conn() as conn:
             cursor = conn.execute("""
-                SELECT song_id, chunk_idx, fingerprint, duration, mtime
+                SELECT song_id, chunk_idx, fingerprint, duration, mtime, bits
                 FROM fingerprints
                 WHERE song_id = ?
                 ORDER BY chunk_idx
@@ -207,14 +236,14 @@ class FingerprintDB:
             count = cursor.fetchone()['count']
             return count == num_chunks
 
-    def get_fingerprinted_song_ids(self, num_chunks: int = 4) -> Set[int]:
-        """Get set of song IDs that have complete fingerprints.
+    def get_fingerprinted_song_ids(self, num_chunks: int = 8) -> Set[int]:
+        """Get set of song IDs that have fingerprints for all chunk indices.
 
         Args:
-            num_chunks: Expected number of chunks per song
+            num_chunks: Expected number of chunks per song (default 8)
 
         Returns:
-            Set of song IDs with complete fingerprints
+            Set of song IDs with num_chunks fingerprints each
         """
         with self._get_conn() as conn:
             cursor = conn.execute("""
@@ -231,6 +260,47 @@ class FingerprintDB:
         with self._get_conn() as conn:
             cursor = conn.execute("SELECT COUNT(*) as count FROM fingerprints")
             return cursor.fetchone()['count']
+
+    def count_missing_bits(self) -> int:
+        """Count rows that have fingerprint text but no precomputed bits (would trigger decode at training).
+
+        Returns 0 if the bits column does not exist (e.g. pre-migration DB).
+        """
+        with self._get_conn() as conn:
+            cursor = conn.execute("PRAGMA table_info(fingerprints)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "bits" not in columns:
+                return 0
+            cursor = conn.execute("""
+                SELECT COUNT(*) as count FROM fingerprints
+                WHERE (bits IS NULL OR bits = '') AND fingerprint IS NOT NULL AND fingerprint != ''
+            """)
+            return cursor.fetchone()['count']
+
+    def get_fingerprint_count_by_chunk(self) -> Dict[int, int]:
+        """Get fingerprint count per chunk index (for diagnostics).
+
+        Returns:
+            Dict mapping chunk_idx -> count. Use to verify chunk_for_fingerprinting matches populated chunks.
+        """
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                SELECT chunk_idx, COUNT(*) as count
+                FROM fingerprints
+                GROUP BY chunk_idx
+                ORDER BY chunk_idx
+            """)
+            return {row['chunk_idx']: row['count'] for row in cursor.fetchall()}
+
+    def get_sample_song_ids_for_chunk(self, chunk_idx: int, limit: int = 5) -> List[int]:
+        """Return a few song_ids that have a fingerprint at the given chunk (for diagnostics)."""
+        with self._get_conn() as conn:
+            cursor = conn.execute("""
+                SELECT song_id FROM fingerprints
+                WHERE chunk_idx = ?
+                LIMIT ?
+            """, (chunk_idx, limit))
+            return [row['song_id'] for row in cursor.fetchall()]
 
     def get_song_count(self) -> int:
         """Get number of unique songs with at least one fingerprint."""
@@ -377,7 +447,7 @@ class FingerprintDB:
             Dictionary with statistics:
             - total_fingerprints: Total fingerprint count
             - unique_songs: Number of songs with fingerprints
-            - songs_with_complete_fingerprints: Songs with all 4 chunks
+            - songs_with_complete_fingerprints: Songs with fingerprints at all 8 chunk indices (typical: 1 chromaprint per song at one chunk)
             - canonical_songs: Number of canonical (non-duplicate) songs
             - duplicate_songs: Number of duplicate songs
             - duplicate_groups: Number of canonical songs with duplicates
@@ -385,7 +455,7 @@ class FingerprintDB:
         """
         total_fingerprints = self.get_fingerprint_count()
         unique_songs = self.get_song_count()
-        complete_songs = len(self.get_fingerprinted_song_ids(num_chunks=4))
+        complete_songs = len(self.get_fingerprinted_song_ids(num_chunks=8))
         duplicate_count = self.get_duplicate_count()
         canonical_ids = self.get_all_canonical_ids()
 
@@ -402,10 +472,12 @@ class FingerprintDB:
         if self.db_path.exists():
             db_size_mb = self.db_path.stat().st_size / (1024 * 1024)
 
+        by_chunk = self.get_fingerprint_count_by_chunk()
         return {
             "total_fingerprints": total_fingerprints,
             "unique_songs": unique_songs,
             "songs_with_complete_fingerprints": complete_songs,
+            "fingerprints_by_chunk": by_chunk,
             "canonical_songs": len(canonical_ids),
             "duplicate_songs": duplicate_count,
             "duplicate_groups": duplicate_groups,

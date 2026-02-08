@@ -93,6 +93,9 @@ class EncoderTrainer:
 
         pbar = tqdm(train_loader, desc=f"Epoch {self.current_epoch + 1}")
 
+        chromaprint_loss_sum = 0.0
+        chromaprint_batches = 0
+
         for batch in pbar:
             # MoCo v2 mode (query/key pairs with genre labels)
             if use_moco and "query" in batch:
@@ -103,20 +106,30 @@ class EncoderTrainer:
                 # Forward through MoCo encoder
                 output = self.encoder(query, key)
 
-                # MoCo loss (contrastive + genre BCE) - returns dict
-                loss_result = self.loss_fn(
-                    output['logits_contrastive'],
-                    output['labels_contrastive'],
-                    output['logits_genre'],
-                    genre
-                )
-                loss = loss_result['loss']
+                # MoCo loss (contrastive + genre BCE + optional chromaprint BCE)
+                loss_kwargs = {
+                    "logits_contrastive": output["logits_contrastive"],
+                    "labels_contrastive": output["labels_contrastive"],
+                    "logits_genre": output["logits_genre"],
+                    "labels_genre": genre,
+                }
+                if "logits_chromaprint" in output and "chromaprint" in batch and "chromaprint_valid" in batch:
+                    loss_kwargs["logits_chromaprint"] = output["logits_chromaprint"]
+                    loss_kwargs["chromaprint_target"] = batch["chromaprint"].to(self.device)
+                    loss_kwargs["chromaprint_valid"] = batch["chromaprint_valid"].to(self.device)
+
+                loss_result = self.loss_fn(**loss_kwargs)
+                loss = loss_result["loss"]
 
                 loss_dict = {
                     "total": loss.item(),
-                    "moco": loss_result['loss_moco'].item(),
-                    "genre": loss_result['loss_genre'].item()
+                    "moco": loss_result["loss_moco"].item(),
+                    "genre": loss_result["loss_genre"].item(),
                 }
+                if "loss_chromaprint" in loss_result:
+                    loss_dict["chromaprint"] = loss_result["loss_chromaprint"].item()
+                    chromaprint_loss_sum += loss_result["loss_chromaprint"].item()
+                    chromaprint_batches += 1
 
             # Check for augmentation mode (dual audio views - waveform based)
             elif use_augmentation and "audio_view1" in batch:
@@ -218,11 +231,14 @@ class EncoderTrainer:
             gpu_stats = self.gpu_monitor.get_stats()
             self.gpu_monitor.reset()
 
-        return {
+        result = {
             "loss": avg_loss,
             "num_batches": num_batches,
             "gpu_stats": gpu_stats
         }
+        if chromaprint_batches > 0:
+            result["loss_chromaprint"] = chromaprint_loss_sum / chromaprint_batches
+        return result
 
     def validate(
         self,
@@ -255,13 +271,19 @@ class EncoderTrainer:
                     genre = batch["genre"].to(self.device)
 
                     output = self.encoder(query, key)
-                    loss_result = self.loss_fn(
-                        output['logits_contrastive'],
-                        output['labels_contrastive'],
-                        output['logits_genre'],
-                        genre
-                    )
-                    loss = loss_result['loss']
+                    loss_kwargs = {
+                        "logits_contrastive": output["logits_contrastive"],
+                        "labels_contrastive": output["labels_contrastive"],
+                        "logits_genre": output["logits_genre"],
+                        "labels_genre": genre,
+                    }
+                    if "logits_chromaprint" in output and "chromaprint" in batch and "chromaprint_valid" in batch:
+                        loss_kwargs["logits_chromaprint"] = output["logits_chromaprint"]
+                        loss_kwargs["chromaprint_target"] = batch["chromaprint"].to(self.device)
+                        loss_kwargs["chromaprint_valid"] = batch["chromaprint_valid"].to(self.device)
+
+                    loss_result = self.loss_fn(**loss_kwargs)
+                    loss = loss_result["loss"]
 
                 # Check for augmentation mode (dual audio views)
                 elif use_augmentation and "audio_view1" in batch:
@@ -425,17 +447,6 @@ class EncoderTrainer:
                 print(f"  GPU Util: {gpu_stats.get('gpu_util_avg', 0):.1f}% avg "
                       f"(min={gpu_stats.get('gpu_util_min', 0):.0f}%, max={gpu_stats.get('gpu_util_max', 0):.0f}%)")
 
-            # Log metrics to MLflow for learning curves
-            if self.tracker is not None:
-                self.tracker.log_metric('encoder/train_loss', train_metrics['loss'], step=epoch)
-                if val_metrics:
-                    self.tracker.log_metric('encoder/val_loss', val_metrics['loss'], step=epoch)
-                self.tracker.log_metric('encoder/epoch_time', epoch_time, step=epoch)
-                # Log GPU metrics
-                if gpu_stats:
-                    self.tracker.log_metric('encoder/gpu_util_avg', gpu_stats.get('gpu_util_avg', 0), step=epoch)
-                    self.tracker.log_metric('encoder/memory_used_gb', gpu_stats.get('memory_used_avg_gb', 0), step=epoch)
-
             # Save checkpoint
             current_loss = val_metrics['loss'] if val_metrics else train_metrics['loss']
 
@@ -449,11 +460,7 @@ class EncoderTrainer:
 
             # Step the learning rate scheduler
             if self.scheduler is not None:
-                old_lr = self.optimizer.param_groups[0]['lr']
                 self.scheduler.step()
-                new_lr = self.optimizer.param_groups[0]['lr']
-                if self.tracker is not None:
-                    self.tracker.log_metric('encoder/learning_rate', new_lr, step=epoch)
 
             # Versioned checkpoint naming (e.g., encoder_v2_best.pt)
             version_suffix = f"_{self.model_version}" if self.model_version != "default" else ""
@@ -501,15 +508,16 @@ class EncoderTrainer:
             metrics={"epoch": num_epochs}
         )
 
-        # Log final summary metrics to MLflow
+        # Log final summary metrics to MLflow (unified names; use tag "stage" = "encoder" to identify)
         if self.tracker is not None:
+            self.tracker.set_tag("stage", "encoder")
             epochs_completed = len(self.history['train_loss'])
-            self.tracker.log_metric('encoder/epochs_completed', epochs_completed)
-            self.tracker.log_metric('encoder/best_val_loss', self.best_loss)
+            self.tracker.log_metric('epochs_completed', epochs_completed)
+            self.tracker.log_metric('val_loss', self.best_loss)
             if self.history['train_loss']:
-                self.tracker.log_metric('encoder/final_train_loss', self.history['train_loss'][-1])
+                self.tracker.log_metric('final_train_loss', self.history['train_loss'][-1])
             if self.history['val_loss']:
-                self.tracker.log_metric('encoder/final_val_loss', self.history['val_loss'][-1])
+                self.tracker.log_metric('final_val_loss', self.history['val_loss'][-1])
 
         return self.history
 
@@ -595,7 +603,11 @@ class EncoderTrainer:
                 filenames = batch["filename"]
 
                 # Handle different data formats
-                if use_moco and "query" in batch:
+                if "song_id" in batch:
+                    # Fingerprint-baseline: encoder expects song rowids, returns (B, D) tensor
+                    x = batch["song_id"].to(self.device)
+                    embeddings = self.encoder(x)
+                elif use_moco and "query" in batch:
                     # MoCo: use query for embedding extraction from MoCoDataset
                     x = batch["query"].to(self.device)
                     # MoCo encoder returns dict with 'embedding' key when x_k=None
@@ -621,15 +633,22 @@ class EncoderTrainer:
                 # Store embeddings
                 embeddings_cpu = embeddings.cpu()
                 for i, filename in enumerate(filenames):
-                    embeddings_dict[filename] = embeddings_cpu[i]
-
-                    # Save to store if requested
-                    if save_to_store and self.embedding_store:
-                        self.embedding_store.store_embedding(
-                            filename,
-                            embeddings_cpu[i].numpy(),
-                            self.model_version
-                        )
+                    if "chunk_idx" in batch:
+                        chunk_idx = batch["chunk_idx"][i]
+                        if save_to_store and self.embedding_store:
+                            self.embedding_store.store_embedding_chunk(
+                                filename, chunk_idx,
+                                embeddings_cpu[i].numpy(),
+                                self.model_version
+                            )
+                    else:
+                        embeddings_dict[filename] = embeddings_cpu[i]
+                        if save_to_store and self.embedding_store:
+                            self.embedding_store.store_embedding(
+                                filename,
+                                embeddings_cpu[i].numpy(),
+                                self.model_version
+                            )
 
         print(f"Extracted {len(embeddings_dict)} embeddings")
 

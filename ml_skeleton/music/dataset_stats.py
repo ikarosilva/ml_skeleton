@@ -148,7 +148,7 @@ def collect_training_stats(
         "training_time_seconds": training_time_seconds,
         "final_train_loss": final_train_loss,
         "final_val_loss": final_val_loss,
-        "best_val_loss": best_val_loss,
+        "val_loss": best_val_loss,
         "best_epoch": best_epoch,
     }
 
