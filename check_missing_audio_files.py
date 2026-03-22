@@ -85,7 +85,7 @@ def main():
     )
     parser.add_argument(
         "--db",
-        default="/Music/database/clementine_backup_2026-01.db",
+        default="/Music/database/clementine_backup_2026-03.db",
         help="Path to Clementine database"
     )
     parser.add_argument(

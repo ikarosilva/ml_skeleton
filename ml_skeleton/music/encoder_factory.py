@@ -179,7 +179,8 @@ def create_dataset(
     album_to_idx: dict[str, int],
     filename_to_albums: dict[str, list[str]],
     is_training: bool = True,
-    speech_results: Optional[dict[str, float]] = None
+    speech_results: Optional[dict[str, float]] = None,
+    chunk_indices_override: Optional[list[int]] = None,
 ):
     """Factory function to create dataset.
 
@@ -190,6 +191,8 @@ def create_dataset(
         filename_to_albums: Mapping from filename to list of album keys
         is_training: If True, applies augmentations
         speech_results: Optional speech detection scores for filtering
+        chunk_indices_override: If set (e.g. for HPO), MoCo uses only these chunk indices
+            so fewer chunks are loaded per song (e.g. 4 instead of 8) to fit in RAM.
 
     Returns:
         MoCoDataset or FingerprintBaselineDataset instance
@@ -243,6 +246,7 @@ def create_dataset(
     fp_config = config.get('fingerprinting', {})
     chromaprint_chunk_idx = fp_config.get('chunk_for_fingerprinting', 1)
     preload_chromaprint = encoder_config.get('preload_chromaprint', True)
+    min_chunks = chunk_cache_config.get('min_chunks_for_training', 3)  # exclude 1–2 chunk songs for MoCo
     if fp_db is not None:
         print(f"  Chromaprint chunk index: {chromaprint_chunk_idx} (config: chunk_for_fingerprinting)")
     return MoCoDataset(
@@ -257,6 +261,8 @@ def create_dataset(
         fp_db=fp_db,
         chromaprint_chunk_idx=chromaprint_chunk_idx,
         preload_chromaprint=preload_chromaprint,
+        chunk_indices=chunk_indices_override,
+        min_chunks=min_chunks,
     )
 
 

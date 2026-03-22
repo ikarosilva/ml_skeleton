@@ -16,7 +16,7 @@ Usage:
     from ml_skeleton.music.fingerprint_db import FingerprintDB
 
     # Load songs and databases
-    db = ClementineDB("/Music/database/clementine_backup_2026-01.db")
+    db = ClementineDB("/Music/database/clementine_backup_2026-03.db")
     songs = db.get_all_songs()
     fp_db = FingerprintDB("./cache/fingerprints.db")
 

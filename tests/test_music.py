@@ -80,3 +80,20 @@ def test_encoder_with_spec_augment(dummy_song):
     assert p1.shape == (2, encoder.projection_dim)
     assert z1.shape == (2, encoder.projection_dim)
 
+
+def test_chunk_16bit_roundtrip():
+    """int16 cache format: float32 -> int16 -> _chunk_array_to_float32 recovers within int16 precision."""
+    from ml_skeleton.music.chunk_cache import extract_chunk, _chunk_array_to_float32
+
+    # Synthetic float32 in [-1, 1]
+    np.random.seed(42)
+    float32_arr = np.clip(np.random.randn(48000).astype(np.float32), -1.0, 1.0)
+    # Quantize to int16 (as in extract_chunk with use_16bit=True)
+    int16_arr = (float32_arr * 32767).astype(np.int16)
+    # Convert back to float32 (as in load_cached_chunk)
+    recovered = _chunk_array_to_float32(int16_arr)
+    # Error from int16 quantize + scale 32768: at most ~2/32768
+    max_err = np.abs(recovered - float32_arr).max()
+    assert max_err < 2.0 / 32768.0, f"max error {max_err} exceeds int16 precision"
+    assert recovered.dtype == np.float32
+    assert recovered.min() >= -1.0 and recovered.max() <= 1.0

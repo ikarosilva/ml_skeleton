@@ -5,31 +5,31 @@
 - **Model Type**: Binary Rating Classifier (like/dislike)
 - **Encoder Version**: v1
 - **Classifier Version**: v1
-- **Promoted to Production**: 2026-02-03 02:13:07
+- **Promoted to Production**: 2026-03-21 22:56:37
 
 ## Architecture
 
 - **Encoder**: MoCo v2 + Genre BCE (ResNet-50 backbone)
-- **Embedding Dimension**: 2048
-- **Classifier Hidden Layers**: []
+- **Embedding Dimension**: 4096
+- **Classifier Hidden Layers**: [256, 128]
 - **Classification Mode**: binary
 
 ## Training Data
 
-- **Training Songs**: 4,124
-- **Validation Songs**: 1,036
-- **Total Rated Songs**: 5,160
+- **Training Songs**: 4,807
+- **Validation Songs**: 4,020
+- **Total Rated Songs**: 8,827
 
 ## A/B Test Results
 
 | Metric | New Model | Production | Improvement |
 |--------|-----------|------------|-------------|
-| Accuracy | 50.0% | 50.0% (baseline) | +0.0% |
+| Accuracy | 52.3% | 50.0% (baseline) | +2.3% |
 
-- **Test Samples**: 155 (new ratings since last training)
+- **Test Samples**: 1000 (new ratings since last training)
 - **Statistical Test**: McNemar's test
-- **p-value**: 0.7237
-- **Significant**: No
+- **p-value**: 0.0049
+- **Significant**: ✓ Yes (p < 0.05)
 
 ## Usage
 

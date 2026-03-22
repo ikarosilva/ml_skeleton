@@ -8,8 +8,38 @@ import os
 from pathlib import Path
 from urllib.parse import unquote
 from typing import Optional
+import xml.etree.ElementTree as ET
 
 from .clementine_db import Song
+
+
+def parse_xspf_locations(xspf_path: Path) -> list[str]:
+    """Read <location> URLs/paths from an XSPF file (Clementine-compatible).
+
+    Returns raw location strings (often ``file:///...``, or paths relative to the
+    ``.xspf`` file. For library matching, ``rag-query`` joins relative paths to that directory.
+    Empty list if none found.
+    """
+    path = Path(xspf_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"XSPF not found: {path}")
+    tree = ET.parse(path)
+    root = tree.getroot()
+    # Default namespace in XSPF 0
+    ns_uri = "http://xspf.org/ns/0/"
+    if root.tag.startswith("{"):
+        ns_uri = root.tag[1 : root.tag.index("}")]
+    ns = {"x": ns_uri}
+    locs: list[str] = []
+    for loc in root.findall(".//x:location", ns):
+        if loc.text and loc.text.strip():
+            locs.append(loc.text.strip())
+    if not locs:
+        # Some files omit the default namespace prefix
+        for elem in root.iter():
+            if elem.tag.endswith("location") and elem.text and elem.text.strip():
+                locs.append(elem.text.strip())
+    return locs
 
 
 def export_to_xspf(
@@ -17,7 +47,9 @@ def export_to_xspf(
     predictions: list[float],
     output_path: Path,
     playlist_title: str = "Music Recommendations",
-    annotation_prefix: str = "Predicted rating"
+    annotation_prefix: str = "Predicted rating",
+    *,
+    scale_scores_to_five: bool = True,
 ) -> None:
     """Export songs with predictions to XSPF playlist (Clementine-compatible).
 
@@ -54,9 +86,11 @@ def export_to_xspf(
             album = html.escape(song.album)
             location = html.escape(location)
 
-            # Create annotation with predicted rating (scaled to 0-5 for Clementine)
-            rating_5_scale = prediction * 5.0
-            annotation = f"{annotation_prefix}: {rating_5_scale:.2f}/5.00"
+            if scale_scores_to_five:
+                rating_5_scale = prediction * 5.0
+                annotation = f"{annotation_prefix}: {rating_5_scale:.2f}/5.00"
+            else:
+                annotation = f"{annotation_prefix}: {prediction:.4f}"
             annotation = html.escape(annotation)
 
             f.write('    <track>\n')
@@ -271,6 +305,14 @@ def compute_prediction_uncertainty(
     return uncertainties
 
 
+def _song_filename_key(song: Song) -> str:
+    """Stable string key for set membership (handles bytes paths)."""
+    fn = song.filename
+    if isinstance(fn, bytes):
+        return fn.decode("utf-8", errors="replace")
+    return str(fn)
+
+
 def generate_human_feedback_playlists(
     songs: list[Song],
     predictions: list[float],
@@ -284,11 +326,17 @@ def generate_human_feedback_playlists(
 
     This is the main function for human-in-the-loop reinforcement learning.
 
+    **Disjoint playlists:** ``recommender_best`` uses the globally highest scores in
+    this pool. ``recommender_help`` uses the most uncertain tracks **excluding** any
+    path that appears in ``recommender_best``, so the two XSPF lists do not overlap.
+
     Args:
-        songs: List of unrated Song objects
+        songs: All scored unrated songs (parallel to ``predictions``), typically
+               every unrated track that had an embedding for this run.
         predictions: List of predicted ratings in [0, 1]
         output_dir: Directory to save playlists
-        top_n_uncertain: Number of uncertain songs for human rating
+        top_n_uncertain: Target size for the uncertainty playlist (may be smaller if
+                        the pool is small after excluding best picks).
         top_n_best: Number of best predictions for validation
         uncertainty_method: Method for computing uncertainty
         filename_prefix: Optional prefix for playlist filenames (e.g., "rock_")
@@ -299,52 +347,82 @@ def generate_human_feedback_playlists(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Compute uncertainties
+    if len(songs) != len(predictions):
+        raise ValueError(f"Songs ({len(songs)}) and predictions ({len(predictions)}) must have same length")
+
+    # Best playlist: global top scores in this pool
+    sorted_by_pred = sorted(range(len(predictions)), key=lambda i: predictions[i], reverse=True)
+    n_best = min(top_n_best, len(sorted_by_pred))
+    best_indices = sorted_by_pred[:n_best]
+    best_filenames = {_song_filename_key(songs[i]) for i in best_indices}
+
+    best_songs = [songs[i] for i in best_indices]
+    best_predictions = [predictions[i] for i in best_indices]
+
     print("\nComputing prediction uncertainties...")
     uncertainties = compute_prediction_uncertainty(predictions, method=uncertainty_method)
 
-    # Generate uncertainty playlist (for maximum learning)
-    print(f"\nGenerating high-uncertainty playlist ({top_n_uncertain} songs)...")
+    # Help: highest uncertainty, excluding best playlist paths
+    sorted_by_unc = sorted(range(len(uncertainties)), key=lambda i: uncertainties[i], reverse=True)
+    help_indices: list[int] = []
+    for i in sorted_by_unc:
+        if _song_filename_key(songs[i]) in best_filenames:
+            continue
+        help_indices.append(i)
+        if len(help_indices) >= top_n_uncertain:
+            break
+
+    help_songs = [songs[i] for i in help_indices]
+    help_predictions = [predictions[i] for i in help_indices]
+    help_uncertainties = [uncertainties[i] for i in help_indices]
+
     uncertainty_path = output_dir / f"{filename_prefix}recommender_help.xspf"
-    generate_uncertainty_playlist(
-        songs=songs,
-        predictions=predictions,
-        uncertainties=uncertainties,
-        output_path=uncertainty_path,
-        top_n=top_n_uncertain,
-        playlist_title="High Uncertainty - Help Train Model"
-    )
+    print(f"\nGenerating high-uncertainty playlist (target {top_n_uncertain}, disjoint from best)...")
+    if help_songs:
+        generate_uncertainty_playlist(
+            songs=help_songs,
+            predictions=help_predictions,
+            uncertainties=help_uncertainties,
+            output_path=uncertainty_path,
+            top_n=len(help_songs),
+            playlist_title="High Uncertainty - Help Train Model",
+        )
+    else:
+        print(f"  No tracks left for help playlist after excluding {n_best} best picks; skipping {uncertainty_path}")
 
-    # Generate best predictions playlist (for validation)
-    print(f"\nGenerating best-predictions playlist ({top_n_best} songs)...")
     best_path = output_dir / f"{filename_prefix}recommender_best.xspf"
-    generate_best_predictions_playlist(
-        songs=songs,
-        predictions=predictions,
-        output_path=best_path,
-        top_n=top_n_best,
-        playlist_title="Top Predictions - Validate Quality"
-    )
+    print(f"\nGenerating best-predictions playlist ({len(best_songs)} songs)...")
+    if best_songs:
+        export_to_xspf(
+            songs=best_songs,
+            predictions=best_predictions,
+            output_path=best_path,
+            playlist_title="Top Predictions - Validate Quality",
+            annotation_prefix="Predicted rating",
+        )
+        print(f"Average predicted rating: {sum(best_predictions) / len(best_predictions):.3f}")
+    else:
+        print("  No songs available for best playlist")
 
-    # Compute statistics
     stats = {
         "total_songs": len(songs),
-        "uncertainty_playlist_size": top_n_uncertain,
-        "best_predictions_playlist_size": top_n_best,
+        "uncertainty_playlist_size": len(help_songs),
+        "best_predictions_playlist_size": len(best_songs),
         "uncertainty_playlist_path": str(uncertainty_path),
         "best_predictions_playlist_path": str(best_path),
         "avg_uncertainty": sum(uncertainties) / len(uncertainties) if uncertainties else 0.0,
         "max_uncertainty": max(uncertainties) if uncertainties else 0.0,
         "avg_prediction": sum(predictions) / len(predictions) if predictions else 0.0,
         "max_prediction": max(predictions) if predictions else 0.0,
-        "min_prediction": min(predictions) if predictions else 0.0
+        "min_prediction": min(predictions) if predictions else 0.0,
+        "best_excluded_from_help_count": n_best,
     }
 
     print("\n" + "=" * 60)
     print("HUMAN FEEDBACK PLAYLISTS GENERATED")
     print("=" * 60)
-    print(f"Uncertainty playlist: {uncertainty_path}")
-    print(f"Best predictions playlist: {best_path}")
+    print(f"Uncertainty playlist: {uncertainty_path} ({len(help_songs)} tracks, excludes {n_best} best picks)")
+    print(f"Best predictions playlist: {best_path} ({len(best_songs)} tracks)")
     print(f"\nNext steps:")
     print(f"1. Open playlists in Clementine music player")
     print(f"2. Listen and rate songs in your library")

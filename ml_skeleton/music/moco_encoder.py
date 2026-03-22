@@ -1,7 +1,7 @@
 """MoCo v2 encoder with nnAudio CQT for music representation learning.
 
 Architecture:
-    Audio (B, T) → nnAudio CQT (B, 84, T') → ResNet-50 2D → 2048-dim embedding
+    Audio (B, T) → nnAudio CQT (B, 84, T') → ResNet-50 2D → 2048-dim (or 4096 with projection)
     ↓
     ├── MoCo v2 projection head → contrastive loss (NT-Xent)
     └── Genre BCE head → multi-label classification
@@ -9,13 +9,16 @@ Architecture:
 MoCo v2 features:
     - Momentum encoder with EMA (m=0.999)
     - Queue of 4096 negatives
-    - MLP projection head (2048→2048→128)
+    - MLP projection head (embedding_dim→embedding_dim→projection_dim), e.g. 4096→4096→1024
     - Temperature τ=0.07 for NT-Xent
 
 Reference:
     "Improved Baselines with Momentum Contrastive Learning" (Chen et al., 2020)
     https://arxiv.org/abs/2003.04297
 """
+
+# ResNet-50 final feature dimension (before any optional projection to embedding_dim)
+RESNET50_FEATURE_DIM = 2048
 
 import copy
 import torch
@@ -150,8 +153,8 @@ class MoCoEncoder(nn.Module):
     """MoCo v2 encoder with CQT and genre head for music.
 
     Full architecture:
-        Audio → CQT → ResNet-50 → 2048-dim embedding
-        ├── MoCo projection → 128-dim for contrastive
+        Audio → CQT → ResNet-50 → [2048 or 4096]-dim embedding (4096 via optional linear projection)
+        ├── MoCo projection → projection_dim (e.g. 1024) for contrastive
         └── Genre head → 7-dim logits for BCE
 
     Training mode returns all outputs for loss computation.
@@ -205,7 +208,7 @@ class MoCoEncoder(nn.Module):
         )
 
         # Query encoder (backbone + projection)
-        self.backbone = self._create_backbone(pretrained_backbone)
+        self.backbone = self._create_backbone(pretrained_backbone, embedding_dim)
         self.projector = ProjectionMLP(
             in_dim=embedding_dim,
             hidden_dim=embedding_dim,
@@ -237,10 +240,12 @@ class MoCoEncoder(nn.Module):
         self.queue = F.normalize(self.queue, dim=0)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
-    def _create_backbone(self, pretrained: bool) -> nn.Module:
+    def _create_backbone(self, pretrained: bool, embedding_dim: int) -> nn.Module:
         """Create ResNet-50 backbone for CQT spectrograms.
 
         Modifies first conv layer to accept 1-channel CQT input.
+        If embedding_dim != ResNet-50 output (2048), adds a linear projection
+        so backbone output shape is (B, embedding_dim).
         """
         weights = "IMAGENET1K_V1" if pretrained else None
         backbone = models.resnet50(weights=weights)
@@ -263,7 +268,13 @@ class MoCoEncoder(nn.Module):
         # Remove classification head
         backbone.fc = nn.Identity()
 
-        return backbone
+        if embedding_dim == RESNET50_FEATURE_DIM:
+            return backbone
+        # Project ResNet-50 2048-dim output to desired embedding_dim (e.g. 4096)
+        return nn.Sequential(
+            backbone,
+            nn.Linear(RESNET50_FEATURE_DIM, embedding_dim)
+        )
 
     @torch.no_grad()
     def _momentum_update(self):
@@ -412,14 +423,11 @@ class MoCoEncoder(nn.Module):
 
 
 class MoCoLoss(nn.Module):
-    """Combined loss for MoCo + Genre BCE + optional Chromaprint BCE.
+    """Combined loss for MoCo contrastive + optional Genre BCE + optional Chromaprint BCE.
 
     Loss = moco_weight * NT-Xent + genre_weight * BCE + chromaprint_weight * BCE_chromaprint
 
-    Args:
-        moco_weight: Weight for contrastive loss (default: 0.6)
-        genre_weight: Weight for genre BCE loss (default: 0.4)
-        chromaprint_weight: Weight for chromaprint BCE (default: 0.0)
+    Set genre_weight=0 to use only MoCo (no genre labels). Chromaprint is optional.
     """
 
     def __init__(

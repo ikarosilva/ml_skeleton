@@ -306,3 +306,106 @@ class EnsembleRatingClassifier(nn.Module):
         weighted_pred = (predictions * weights).sum(dim=0)
 
         return weighted_pred
+
+
+class AttentionRatingClassifier(nn.Module):
+    """Rating classifier with attention over chunk sequence.
+
+    Uses a single learned query to attend over all chunks (e.g. 8 segments per song),
+    then an MLP on the resulting context vector. Interpretable (attention weights show
+    which chunks matter) and uses full song structure.
+
+    Architecture:
+        (B, C, D) -> project to d_model -> optional pos encoding
+        -> query attention (learned q, softmax over C) -> (B, d_model)
+        -> concat genre if use_genre -> MLP (hidden_dims) -> sigmoid -> (B,)
+
+    Same forward interface as SimpleRatingClassifier: (embeddings, genre?) -> (B,).
+    Set handles_chunk_sequence = True so the trainer passes (B, C, D) and gets (B,) directly.
+    """
+
+    handles_chunk_sequence = True  # Trainer passes (B, C, D) and uses (B,) output without flatten+aggregate
+
+    def __init__(
+        self,
+        embedding_dim: int = 2048,
+        hidden_dims: list[int] = None,
+        dropout: float = 0.3,
+        use_genre: bool = False,
+        use_batch_norm: bool = False,
+        use_residual: bool = False,
+        d_model: int = 512,
+        num_heads: int = 4,
+        max_chunks: int = 16,
+        use_pos_encoding: bool = True,
+    ):
+        super().__init__()
+        if hidden_dims is None:
+            hidden_dims = [512, 256, 128]
+        self.embedding_dim = embedding_dim
+        self.hidden_dims = list(hidden_dims)
+        self.use_genre = use_genre
+        self.use_batch_norm = use_batch_norm
+        self.use_residual = use_residual
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.use_pos_encoding = use_pos_encoding
+        self.head_dim = d_model // num_heads
+        assert self.head_dim * num_heads == d_model, "d_model must be divisible by num_heads"
+
+        self.chunk_proj = nn.Linear(embedding_dim, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_chunks, d_model)) if use_pos_encoding else None
+        self.query = nn.Parameter(torch.randn(1, num_heads, self.head_dim) * 0.02)
+
+        mlp_in_dim = d_model + (NUM_GENRES if use_genre else 0)
+        self.blocks = nn.ModuleList()
+        self.skips = nn.ModuleList()
+        for hidden_dim in hidden_dims:
+            layer_list = [nn.Linear(mlp_in_dim, hidden_dim)]
+            if use_batch_norm:
+                layer_list.append(nn.BatchNorm1d(hidden_dim))
+            layer_list.extend([nn.ReLU(inplace=True), nn.Dropout(dropout)])
+            self.blocks.append(nn.Sequential(*layer_list))
+            self.skips.append(
+                nn.Identity() if mlp_in_dim == hidden_dim else nn.Linear(mlp_in_dim, hidden_dim)
+            )
+            mlp_in_dim = hidden_dim
+        self.output = nn.Sequential(nn.Linear(mlp_in_dim, 1), nn.Sigmoid())
+
+    def _attention_pool(self, x: torch.Tensor) -> torch.Tensor:
+        """(B, C, d_model) -> (B, d_model) using multi-head query attention over C."""
+        B, C, D = x.shape
+        # x: (B, C, d_model) -> split to (B, C, num_heads, head_dim) -> (B, num_heads, C, head_dim)
+        x_heads = x.view(B, C, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, C, head_dim)
+        # query: (1, H, head_dim) -> (B, H, 1, head_dim)
+        q = self.query.expand(B, -1, -1).unsqueeze(2)
+        # scores: (B, H, 1, C)
+        scores = torch.matmul(q, x_heads.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn = scores.softmax(dim=-1)  # (B, H, 1, C)
+        # context: (B, H, 1, head_dim) -> (B, H, head_dim) -> (B, d_model)
+        context = torch.matmul(attn, x_heads).squeeze(2).reshape(B, -1)
+        return context
+
+    def forward(
+        self,
+        embeddings: torch.Tensor,
+        genre: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict ratings. Accepts (B, D) or (B, C, D); returns (B,)."""
+        if embeddings.dim() == 2:
+            embeddings = embeddings.unsqueeze(1)  # (B, D) -> (B, 1, D)
+        # (B, C, D)
+        x = self.chunk_proj(embeddings)  # (B, C, d_model)
+        if self.pos_embed is not None:
+            C = x.size(1)
+            x = x + self.pos_embed[:, :C]
+        pooled = self._attention_pool(x)  # (B, d_model)
+        if self.use_genre and genre is not None:
+            pooled = torch.cat([pooled, genre], dim=-1)
+        if self.use_residual:
+            for block, skip in zip(self.blocks, self.skips):
+                pooled = block(pooled) + skip(pooled)
+        else:
+            for block in self.blocks:
+                pooled = block(pooled)
+        return self.output(pooled).squeeze(-1)

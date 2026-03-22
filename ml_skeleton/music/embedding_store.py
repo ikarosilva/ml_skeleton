@@ -242,6 +242,26 @@ class EmbeddingStore:
             results[filename] = np.stack([c[1] for c in chunks], axis=0)
         return results
 
+    def list_filenames_with_all_chunks(
+        self, model_version: str, num_chunks: int
+    ) -> List[str]:
+        """Return filenames that have all chunk indices 0..num_chunks-1 for this version."""
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT filename, COUNT(DISTINCT chunk_idx) AS c
+            FROM embedding_chunks
+            WHERE model_version = ?
+            GROUP BY filename
+            HAVING c = ?
+            """,
+            (model_version, num_chunks),
+        )
+        rows = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return rows
+
     def get_embedding(
         self,
         filename: str,
@@ -398,7 +418,44 @@ class EmbeddingStore:
         
         conn.commit()
         conn.close()
-    
+
+    def copy_version(self, source_version: str, target_version: str) -> int:
+        """Copy all embeddings from one model version to another (e.g. fingerprint_baseline -> v1).
+
+        Useful when MoCo embeddings were saved under fingerprint_baseline; copy to v1 for clearer config.
+
+        Args:
+            source_version: Existing model version to copy from
+            target_version: New model version to copy to (overwrites if exists)
+
+        Returns:
+            Number of embedding rows copied (embeddings table only; chunks copied separately).
+        """
+        conn = sqlite3.connect(str(self.db_path))
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO embeddings
+                (filename, model_version, embedding, embedding_dim, created_at, updated_at)
+            SELECT filename, ?, embedding, embedding_dim, created_at, updated_at
+            FROM embeddings WHERE model_version = ?
+            """,
+            (target_version, source_version),
+        )
+        n_emb = cursor.rowcount
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO embedding_chunks
+                (filename, chunk_idx, model_version, embedding, embedding_dim, created_at, updated_at)
+            SELECT filename, chunk_idx, ?, embedding, embedding_dim, created_at, updated_at
+            FROM embedding_chunks WHERE model_version = ?
+            """,
+            (target_version, source_version),
+        )
+        conn.commit()
+        conn.close()
+        return n_emb
+
     def get_stats(self) -> dict:
         """Get storage statistics.
         

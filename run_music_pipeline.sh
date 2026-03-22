@@ -10,6 +10,7 @@ fi
 #   ./run_music_pipeline.sh encoder          # Run Stage 1 only (MoCo v2 + Genre)
 #   ./run_music_pipeline.sh classifier       # Run Stage 2 only
 #   ./run_music_pipeline.sh recommend        # Run Stage 3 only
+#   ./run_music_pipeline.sh rag-query /path/to/playlist.xspf   # prod/embeddings.db → rag_<name>.xspf
 #   ./run_music_pipeline.sh quick            # Quick test (5 epochs, 500 rated songs)
 #   ./run_music_pipeline.sh hpo              # Full hyperparameter optimization pipeline
 #   ./run_music_pipeline.sh build-cache      # Build 4-chunk waveform cache (~30GB)
@@ -134,8 +135,8 @@ run_encoder() {
     [ -n "$ENCODER_VERSION" ] && header="$header [encoder: $ENCODER_VERSION]"
     print_header "$header"
 
-    echo "Architecture: Audio → CQT → ResNet-50 2D → 2048-dim"
-    echo "Loss: 0.6×MoCo(NT-Xent) + 0.4×Genre_BCE"
+    echo "Architecture: Audio → CQT → ResNet-50 2D → 4096-dim"
+    echo "Loss: MoCo(NT-Xent) only (genre_bce=0)"
     echo ""
 
     # Track training time
@@ -237,6 +238,61 @@ run_recommend() {
     echo ""
 }
 
+run_rag_query() {
+    if [ $# -lt 1 ]; then
+        print_error "rag-query requires PLAYLIST.xspf as the first argument"
+        echo ""
+        echo "Usage: $0 rag-query PLAYLIST.xspf [options]"
+        echo "  Uses prod/embeddings.db (run promote-to-prod first)."
+        echo "  Playlist path: use /Music/... in Docker; ~/Music → /root/Music and is usually wrong."
+        echo "  Options: --rag-top-n N  --rag-num-pc N  --rag-unrated-only  --rag-likes-only (no --prod)"
+        exit 1
+    fi
+    local playlist="$1"
+    shift
+    if [[ "$playlist" == -* ]]; then
+        print_error "First argument must be the playlist path, not a flag"
+        exit 1
+    fi
+    # Expand leading ~/ if passed quoted (unquoted ~ is expanded by the shell before we see it)
+    if [[ "$playlist" == "~/"* ]]; then
+        playlist="${HOME}/${playlist#~/}"
+    fi
+    # Docker / dev containers: repo often uses /Music mount while HOME is /root → ~/Music → missing
+    if [ ! -f "$playlist" ]; then
+        local home_music="${HOME%/}/Music"
+        if [[ "$playlist" == "$home_music"/* ]]; then
+            local alt="/Music/${playlist#"$home_music"/}"
+            if [ -f "$alt" ]; then
+                print_warning "Playlist not at $playlist — using $alt (container: use /Music/...)"
+                playlist="$alt"
+            fi
+        fi
+    fi
+    if [ ! -f "$playlist" ]; then
+        print_error "Playlist not found: $playlist"
+        echo "  Tip: in Docker, libraries are often mounted at /Music/ (not ~/Music)."
+        exit 1
+    fi
+
+    for arg in "$@"; do
+        if [ "$arg" = "--prod" ]; then
+            print_error "rag-query does not take --prod (it always uses prod/embeddings.db)"
+            exit 1
+        fi
+    done
+
+    print_header "RAG query (prod embeddings)"
+    if [ ! -f "prod/embeddings.db" ]; then
+        print_error "prod/embeddings.db not found"
+        echo "Run '$0 promote-to-prod' first."
+        exit 1
+    fi
+    python "$SCRIPT" --stage rag-query --config "$CONFIG" "$@" "$playlist" --prod-dir prod
+    print_success "RAG query complete (rag_*.xspf under recommendations.output_dir in config)"
+    echo ""
+}
+
 run_promote_to_prod() {
     print_header "Promoting Models to Production"
 
@@ -321,14 +377,14 @@ run_sync_db() {
 
     # The Clementine database is always read fresh, so this command
     # just verifies the database is accessible and shows stats
-    echo "Database path: ${CLEMENTINE_DB_PATH:-/Music/database/clementine_backup_2026-01.db}"
+    echo "Database path: ${CLEMENTINE_DB_PATH:-/Music/database/clementine_backup_2026-03.db}"
     echo ""
 
     python -c "
 from ml_skeleton.music.clementine_db import ClementineDB
 import os
 
-db_path = os.environ.get('CLEMENTINE_DB_PATH', '/Music/database/clementine_backup_2026-01.db')
+db_path = os.environ.get('CLEMENTINE_DB_PATH', '/Music/database/clementine_backup_2026-03.db')
 db = ClementineDB(db_path)
 songs = db.get_all_songs()
 
@@ -530,7 +586,6 @@ run_encoder_hpo() {
 
     print_header "HPO Step 1: Encoder Hyperparameter Tuning"
     echo "Running Optuna with $n_trials trials (may take hours)..."
-    echo "  (If malloc crash in first batch: run backfill-fingerprint-bits, or EXPLR_HPO_ENCODER_BATCH_SIZE=24, or EXPLR_HPO_DISABLE_CHROMAPRINT=1)"
     echo ""
 
     # Backup config
@@ -550,6 +605,8 @@ run_encoder_hpo() {
     grep -A 10 "Best parameters:" "$HPO_LOG" | grep ":" | head -4
     echo ""
     print_success "Encoder HPO complete! Review parameters above and update config manually."
+    echo "Run next:"
+    echo "  ./run_music_pipeline.sh encoder --encoder-type moco --final-training --best-params checkpoints/best_encoder_params.json --resume-checkpoint checkpoints/encoder_hpo_best.pt"
     echo ""
 }
 
@@ -610,13 +667,17 @@ display_ab_history() {
 
     # Check if current training has A/B results
     local has_current=false
+    local has_ckpt_val_metrics=false
     if [ -f "checkpoints/training_manifest.json" ]; then
         if grep -q '"ab_test_result"' checkpoints/training_manifest.json 2>/dev/null; then
             has_current=true
         fi
+        if grep -qE '"val_ppv"|"val_recall"|"val_precision_at_5"|"val_precision_at_20"' checkpoints/training_manifest.json 2>/dev/null; then
+            has_ckpt_val_metrics=true
+        fi
     fi
 
-    if [ "$has_history" = false ] && [ "$has_current" = false ]; then
+    if [ "$has_history" = false ] && [ "$has_current" = false ] && [ "$has_ckpt_val_metrics" = false ]; then
         return  # Nothing to show
     fi
 
@@ -650,6 +711,10 @@ if history_dir.exists():
                     'val_size': classifier_stats.get('val_size', '-'),
                     'train_prevalence': classifier_stats.get('train_prevalence'),
                     'val_prevalence': classifier_stats.get('val_prevalence'),
+                    'val_ppv': classifier_stats.get('val_ppv'),
+                    'val_recall': classifier_stats.get('val_recall'),
+                    'val_precision_at_5': classifier_stats.get('val_precision_at_5'),
+                    'val_precision_at_20': classifier_stats.get('val_precision_at_20'),
                     'n_samples': ab.get('n_samples', 0),
                     'improvement': ab.get('improvement', 0),
                     'p_value': ab.get('p_value', 1.0),
@@ -659,6 +724,16 @@ if history_dir.exists():
         except Exception:
             pass
 
+def _overlay_val_metrics(stats, meta):
+    """Fill val_ppv / val_recall / P@5 from manifest metadata if missing."""
+    if not meta:
+        return stats
+    out = dict(stats)
+    for k in ('val_ppv', 'val_recall', 'val_precision_at_5', 'val_precision_at_20', 'train_prevalence', 'val_prevalence'):
+        if out.get(k) is None and meta.get(k) is not None:
+            out[k] = meta[k]
+    return out
+
 # Check current prod model card
 if Path('prod/model_card.json').exists():
     try:
@@ -666,6 +741,11 @@ if Path('prod/model_card.json').exists():
             data = json.load(fp)
         classifier_stats = data.get('classifier_stats', {})
         ab = classifier_stats.get('metadata', {}).get('ab_test_result', {})
+        prod_meta = {}
+        if Path('prod/training_manifest.json').exists():
+            with open('prod/training_manifest.json') as fp:
+                prod_meta = json.load(fp).get('metadata') or {}
+        classifier_stats = _overlay_val_metrics(classifier_stats, prod_meta)
         if ab:
             results.append({
                 'date': 'PROD',
@@ -673,6 +753,10 @@ if Path('prod/model_card.json').exists():
                 'val_size': classifier_stats.get('val_size', '-'),
                 'train_prevalence': classifier_stats.get('train_prevalence'),
                 'val_prevalence': classifier_stats.get('val_prevalence'),
+                'val_ppv': classifier_stats.get('val_ppv'),
+                'val_recall': classifier_stats.get('val_recall'),
+                'val_precision_at_5': classifier_stats.get('val_precision_at_5'),
+                'val_precision_at_20': classifier_stats.get('val_precision_at_20'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
@@ -688,7 +772,8 @@ if Path('checkpoints/training_manifest.json').exists():
         with open('checkpoints/training_manifest.json') as fp:
             data = json.load(fp)
         metadata = data.get('metadata', {})
-        ab = metadata.get('ab_test_result', {})
+        ab = metadata.get('ab_test_result')
+        vault_n = len(data.get('vault_files') or [])
         if ab:
             results.append({
                 'date': 'NEW',
@@ -696,12 +781,44 @@ if Path('checkpoints/training_manifest.json').exists():
                 'val_size': metadata.get('val_size', '-'),
                 'train_prevalence': metadata.get('train_prevalence'),
                 'val_prevalence': metadata.get('val_prevalence'),
+                'val_ppv': metadata.get('val_ppv'),
+                'val_recall': metadata.get('val_recall'),
+                'val_precision_at_5': metadata.get('val_precision_at_5'),
+                'val_precision_at_20': metadata.get('val_precision_at_20'),
                 'n_samples': ab.get('n_samples', 0),
                 'improvement': ab.get('improvement', 0),
                 'p_value': ab.get('p_value', 1.0),
                 'significant': ab.get('significant', False),
                 'label': '← just trained'
             })
+        elif metadata.get('val_ppv') is not None or metadata.get('val_recall') is not None or metadata.get('val_precision_at_5') is not None or metadata.get('val_precision_at_20') is not None:
+            lt = {
+                'date': 'last train',
+                'train_size': metadata.get('train_size', '-'),
+                'val_size': metadata.get('val_size', '-'),
+                'train_prevalence': metadata.get('train_prevalence'),
+                'val_prevalence': metadata.get('val_prevalence'),
+                'val_ppv': metadata.get('val_ppv'),
+                'val_recall': metadata.get('val_recall'),
+                'val_precision_at_5': metadata.get('val_precision_at_5'),
+                'val_precision_at_20': metadata.get('val_precision_at_20'),
+                'n_samples': vault_n if vault_n else '-',
+                'improvement': None,
+                'p_value': None,
+                'significant': False,
+                'label': '← val (no vault A/B)'
+            }
+            ck_mc = Path('checkpoints/model_card.json')
+            if ck_mc.exists():
+                try:
+                    with open(ck_mc) as fp:
+                        cs = (json.load(fp).get('classifier_stats') or {})
+                    for k in ('val_ppv', 'val_recall', 'val_precision_at_5', 'val_precision_at_20'):
+                        if lt.get(k) is None and cs.get(k) is not None:
+                            lt[k] = cs[k]
+                except Exception:
+                    pass
+            results.append(lt)
     except Exception:
         pass
 
@@ -714,21 +831,49 @@ def fmt_prev(p):
         return '-'
 
 if results:
-    print(f"{'Date':<20} {'Train':>6} {'Val':>6} {'Vault@':>6} {'TrPrev':>7} {'ValPrev':>7} {'Δ Accuracy':>11} {'p-value':>9} {'Sig?':>5}  Notes")
-    print('-' * 99)
+    print(f"{'Date':<20} {'Train':>6} {'Val':>6} {'Vault@':>6} {'TrPrev':>7} {'ValPrev':>7} {'PPV':>6} {'Rec':>6} {'P@5':>6} {'P@20':>6} {'Δ Accuracy':>11} {'p-value':>9} {'Sig?':>5}  Notes")
+    print('-' * 125)
     for r in results:
-        sig = '✓' if r['significant'] else ''
-        imp = f"{r['improvement']:+.4f}" if r['improvement'] != 0 else ' 0.0000'
+        sig = '✓' if r.get('significant') else ''
+        if r.get('improvement') is None:
+            imp = '     —     '
+        elif r['improvement'] != 0:
+            imp = f"{r['improvement']:+.4f}"
+        else:
+            imp = ' 0.0000'
+        if r.get('p_value') is None:
+            pv = '    —    '
+        else:
+            pv = f"{r['p_value']:>9.4f}"
         train_str = str(r['train_size']) if r['train_size'] != '-' else '-'
         val_str = str(r['val_size']) if r['val_size'] != '-' else '-'
         vault_str = str(r['n_samples'])
         tr_prev = fmt_prev(r.get('train_prevalence'))
         val_prev = fmt_prev(r.get('val_prevalence'))
-        print(f"{r['date']:<20} {train_str:>6} {val_str:>6} {vault_str:>6} {tr_prev:>7} {val_prev:>7} {imp:>11} {r['p_value']:>9.4f} {sig:>5}  {r['label']}")
+        ppv = r.get('val_ppv')
+        rec = r.get('val_recall')
+        ppv_str = f"{float(ppv):.3f}" if ppv is not None else '-'
+        rec_str = f"{float(rec):.3f}" if rec is not None else '-'
+        p5 = r.get('val_precision_at_5')
+        try:
+            p5_str = f"{float(p5):.3f}" if p5 is not None and p5 == p5 else '-'
+        except (TypeError, ValueError):
+            p5_str = '-'
+        p20 = r.get('val_precision_at_20')
+        try:
+            p20_str = f"{float(p20):.3f}" if p20 is not None and p20 == p20 else '-'
+        except (TypeError, ValueError):
+            p20_str = '-'
+        print(f"{r['date']:<20} {train_str:>6} {val_str:>6} {vault_str:>6} {tr_prev:>7} {val_prev:>7} {ppv_str:>6} {rec_str:>6} {p5_str:>6} {p20_str:>6} {imp:>11} {pv} {sig:>5}  {r['label']}")
     print()
-    sig_count = sum(1 for r in results if r['significant'])
+    sig_count = sum(1 for r in results if r.get('significant'))
     print(f'Models in history: {len(results)} | Significant improvements: {sig_count}')
     print("  Vault@ = vault size when that run's A/B test was done. When comparing two models, both are evaluated on the same current vault.")
+    if any(r.get('date') == 'PROD' and r.get('val_ppv') is None for r in results):
+        print("  PROD PPV/Rec/P@5/P@20: fill by running promote-to-prod (copies checkpoint manifest + regenerates model_card.json with val metrics).")
+    if any(r.get('date') == 'last train' for r in results):
+        print("  last train = val set metrics for checkpoints/classifier; — in Δ Acc/p = vault A/B not run (e.g. prod embedding dim mismatch).")
+        print("  Backfill P@20 in manifest without retrain: python examples/music_recommendation.py --stage refresh-val-precision --config <yaml>")
 else:
     print('No A/B test results found.')
 ABHISTEOF
@@ -737,6 +882,7 @@ ABHISTEOF
 
 run_hpo_pipeline() {
     print_header "FULL HYPERPARAMETER OPTIMIZATION PIPELINE"
+    local from_step="${HPO_FROM_STEP:-1}"
     echo "Steps:"
     echo "  1. Tune encoder ($HPO_ENCODER_TRIALS trials × 20 epochs each)"
     echo "  2. AUTOMATED: Train encoder with best parameters (100 epochs)"
@@ -745,17 +891,24 @@ run_hpo_pipeline() {
     echo "  5. Display model card"
     echo "  6. Generate recommendations"
     echo ""
-    echo "This is fully automated! Best parameters are applied automatically."
-    echo "WARNING: This takes many hours!"
-    echo ""
+    if [ "$from_step" -gt 1 ]; then
+        echo "Starting from Step $from_step (--from-step $from_step)."
+        echo ""
+    else
+        echo "This is fully automated! Best parameters are applied automatically."
+        echo "WARNING: This takes many hours!"
+        echo ""
+    fi
 
     # Step 1: Encoder HPO
-    run_encoder_hpo "$HPO_ENCODER_TRIALS"
+    if [ "$from_step" -le 1 ]; then
+        run_encoder_hpo -N "$HPO_ENCODER_TRIALS"
+    fi
 
     # Step 2: Train encoder with best params - AUTOMATED
     BEST_ENCODER_PARAMS="checkpoints/best_encoder_params.json"
     HPO_BEST_CHECKPOINT="checkpoints/encoder_hpo_best.pt"
-    if [ -f "$BEST_ENCODER_PARAMS" ]; then
+    if [ "$from_step" -le 2 ] && [ -f "$BEST_ENCODER_PARAMS" ]; then
         print_header "HPO Step 2: Training Encoder with Best Parameters (100 epochs)"
         print_success "Using best parameters from: $BEST_ENCODER_PARAMS"
 
@@ -771,35 +924,41 @@ run_hpo_pipeline() {
         fi
         print_success "Encoder training with best params complete!"
         echo ""
-    else
+    elif [ "$from_step" -le 2 ]; then
         print_error "Best encoder parameters not found: $BEST_ENCODER_PARAMS"
-        echo "Running encoder HPO should have created this file."
+        echo "Running encoder HPO should have created this file (or run: $0 hpo-encoder -N 0 to save from existing study)."
         exit 1
     fi
 
     # Step 3: Classifier HPO
-    run_classifier_hpo "$HPO_CLASSIFIER_TRIALS"
+    if [ "$from_step" -le 3 ]; then
+        run_classifier_hpo -N "$HPO_CLASSIFIER_TRIALS"
+    fi
 
     # Step 4: Train classifier with best params - AUTOMATED
     BEST_CLASSIFIER_PARAMS="checkpoints/best_classifier_params.json"
-    if [ -f "$BEST_CLASSIFIER_PARAMS" ]; then
+    if [ "$from_step" -le 4 ] && [ -f "$BEST_CLASSIFIER_PARAMS" ]; then
         print_header "HPO Step 4: Training Classifier with Best Parameters (20 epochs)"
         print_success "Using best parameters from: $BEST_CLASSIFIER_PARAMS"
         python "$SCRIPT" --stage classifier --config "$CONFIG" \
             --final-training --best-params "$BEST_CLASSIFIER_PARAMS"
         print_success "Classifier training with best params complete!"
         echo ""
-    else
+    elif [ "$from_step" -le 4 ]; then
         print_error "Best classifier parameters not found: $BEST_CLASSIFIER_PARAMS"
         echo "Running classifier HPO should have created this file."
         exit 1
     fi
 
     # Step 5: Model card
-    display_model_card
+    if [ "$from_step" -le 5 ]; then
+        display_model_card
+    fi
 
     # Step 6: Recommendations
-    run_recommend
+    if [ "$from_step" -le 6 ]; then
+        run_recommend
+    fi
 
     # Final summary
     print_header "HPO PIPELINE COMPLETE!"
@@ -857,9 +1016,19 @@ main() {
     EXTRA_ARGS=()
     ALL_HPO=0
 
+    HPO_FROM_STEP=1  # 1=run all steps; 2=skip encoder HPO, start at "train encoder with best params"; etc.
+
     # Parse additional arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --from-step)
+                HPO_FROM_STEP="${2:-1}"
+                shift 2
+                ;;
+            --from-step=*)
+                HPO_FROM_STEP="${1#*=}"
+                shift
+                ;;
             --resume-checkpoint)
                 RESUME_CHECKPOINT="$2"
                 shift 2
@@ -940,6 +1109,9 @@ main() {
         recommend)
             run_recommend "${EXTRA_ARGS[@]}"
             ;;
+        rag-query)
+            run_rag_query "${EXTRA_ARGS[@]}"
+            ;;
         promote-to-prod)
             run_promote_to_prod
             ;;
@@ -985,6 +1157,18 @@ main() {
         hpo-classifier)
             run_classifier_hpo "${EXTRA_ARGS[@]}"
             ;;
+        convert-cache-16bit)
+            print_header "Convert Chunk Cache to 16-bit (in place, faster than clear + rebuild)"
+            python "$SCRIPT" --stage convert-cache-to-16bit --config "$CONFIG"
+            ;;
+        chunk-cache-stats)
+            print_header "Chunk cache: chunks-per-song distribution"
+            python "$SCRIPT" --stage chunk-cache-stats --config "$CONFIG"
+            ;;
+        prune-chunk-cache)
+            print_header "Prune chunk cache (remove redundant chunks for short songs)"
+            python "$SCRIPT" --stage prune-chunk-cache --config "$CONFIG" "$@"
+            ;;
         clear-cache)
             print_header "Clearing Waveform Chunk Cache (preserves fingerprint DB)"
             python "$SCRIPT" --stage clear-chunk-cache --config "$CONFIG"
@@ -1010,7 +1194,7 @@ else:
 PYEOF
             ;;
         *)
-            echo "Usage: $0 {all|encoder|classifier|joint-finetune|recommend|quick|hpo|...} [options]"
+            echo "Usage: $0 {all|encoder|classifier|joint-finetune|recommend|rag-query|quick|hpo|...} [options]"
             echo ""
             echo "Stages:"
             echo "  all                 - Run complete pipeline (encoder + classifier + [joint-finetune if enabled] + recommend)"
@@ -1019,11 +1203,15 @@ PYEOF
             echo "  classifier          - Train rating classifier"
             echo "  joint-finetune      - Unfreeze encoder+classifier, train on audio→rating (run after classifier; requires joint_finetune.enabled)"
             echo "  recommend           - Generate recommendations"
+            echo "  rag-query PLAYLIST.xspf  → rag_<name>.xspf (prod embeddings)"
             echo "  quick               - Quick test (5 epochs, 500 songs)"
-            echo "  hpo                 - Full hyperparameter optimization (encoder + classifier)"
-            echo "  hpo-encoder         - Hyperparameter optimization for encoder only (-N trials, --reset-study; if malloc crash use EXPLR_HPO_DATALOADER_WORKERS=0)"
+            echo "  hpo                 - Full hyperparameter optimization (encoder + classifier). Use --from-step N to start from step N (e.g. 2 = skip encoder HPO, train encoder with best params)."
+            echo "  hpo-encoder         - Hyperparameter optimization for encoder only (-N trials, -N 0 = save best params only; --reset-study; if malloc crash use EXPLR_HPO_DATALOADER_WORKERS=0)"
             echo "  hpo-classifier      - Hyperparameter optimization for classifier only (supports -N trials, --reps, --reset-study)"
             echo "  build-cache         - Build 4-chunk waveform cache (~30GB)"
+            echo "  convert-cache-16bit - Convert existing float32 chunk cache to int16 in place (faster than clear+rebuild)"
+            echo "  chunk-cache-stats   - Print distribution of chunks per song (frequency counts)"
+            echo "  prune-chunk-cache   - Delete chunks with index >= N per song (N from duration); use --dry-run to preview"
             echo "  fingerprint         - Extract acoustic fingerprints from original files (for AcoustID)"
             echo "  enrich              - Complete pipeline: fingerprint + enrich + stats (recommended)"
             echo "  enrich-metadata     - Enrich metadata via AcoustID/MusicBrainz (requires API key)"
@@ -1041,12 +1229,16 @@ PYEOF
             echo "  sync-db             - Check database status and rating counts"
             echo "  recommend --prod    - Generate recommendations using prod models"
             echo "  recommend --prod --low-rating-ratio 0.1  - Include 10% predicted dislikes"
+            echo "  recommend --prod --select-distant        - Re-rank high picks for diversity (cosine max-min)"
+            echo "  recommend --prod --select-distant-pool-factor N  - Candidate pool multiplier for --select-distant (default 5)"
             echo "  recommend --prod --genre rock           - Recommendations for rock songs only"
             echo "  recommend --error-playlist-size 0        - Skip false_positives/false_negatives playlists"
+            echo "  rag-query /Music/.../mix.xspf          - Similar songs (prod/embeddings.db; no --prod flag)"
             echo ""
             echo "Options:"
             echo "  --encoder-type TYPE        - Encoder: use TYPE (e.g. moco). Required for encoder/hpo-encoder if config has encoder_type: fingerprint_baseline"
             echo "  --reset-study             - HPO only: delete existing Optuna study and start fresh (tune-classifier / tune-encoder)"
+            echo "  --train-frac FRAC         - Encoder HPO only: use fraction of training data (e.g. 0.5); validation set stays full"
             echo "  --resume-checkpoint PATH   - Resume training from checkpoint"
             echo "  --best-params PATH         - Path to best params JSON (from HPO)"
             echo "  --mlflow-run-id ID         - Classifier: load hyperparameters from MLflow run (e.g. HPO parent run ID)"
@@ -1061,6 +1253,11 @@ PYEOF
             echo "                               Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world"
             echo "  --random-init              - Use random init instead of loading from prod model (default: prod init)"
             echo "  --vault-size N             - Number of ratings to reserve for A/B testing (default: 1000)"
+            echo "  --rag-top-n N              - rag-query: number of similar tracks (default: 50)"
+            echo "  --rag-num-pc N             - rag-query: PCA dimensions for tie-break (default: 5)"
+            echo "  --rag-unrated-only         - rag-query: candidate pool = unrated songs only"
+            echo "  --rag-likes-only           - rag-query: rated = training-positive (config binary_positive_threshold);"
+            echo "                               unrated = pred>0.5, top max(100, rag-top-n×20) by pred, then cosine rank"
             echo "  --hpo                      - With 'all': run full HPO pipeline (build-cache, encoder/clf HPO + train with best, joint-finetune, recommend, promote)"
             echo ""
             echo "Environment Variables:"
@@ -1092,6 +1289,9 @@ PYEOF
             echo "  $0 encoder                              # Train encoder only"
             echo "  HPO_ENCODER_TRIALS=50 $0 hpo            # Run HPO with 50 encoder trials"
             echo "  EXPLR_HPO_DISABLE_CHROMAPRINT=1 EXPLR_HPO_DATALOADER_WORKERS=0 $0 hpo-encoder -N 30 --encoder-type moco --reset-study  # If malloc in first batch"
+            echo "  $0 rag-query /Music/playlists/mix.xspf --rag-top-n 50 --rag-num-pc 5"
+            echo "  $0 rag-query /Music/playlists/mix.xspf --rag-unrated-only"
+            echo "  $0 rag-query /Music/playlists/mix.xspf --rag-likes-only"
             echo "  $0 fingerprint --workers 8              # Fingerprint with 8 parallel workers"
             echo "  $0 fingerprint --workers 2 --all       # Fingerprint all missing songs (2 workers)"
             echo "  ACOUSTID_API_KEY=key $0 enrich          # Fingerprint + enrich + stats (10 songs)"

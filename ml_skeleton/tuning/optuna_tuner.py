@@ -80,28 +80,24 @@ class OptunaTuner(BaseTuner):
             space_type = space_def["type"]
 
             if space_type == "categorical":
-                # Optuna stores categoricals in JSON; tuples become lists on load. TPE's
-                # to_internal_repr requires the stored value to be in choices. Include tuple,
-                # list (JSON-deserialized form), and string so past trials match regardless of storage.
+                # Optuna SQL storage only supports categorical choices that are None, bool, int, float, str.
+                # For list/tuple choices (e.g. hidden_dims), use string form only to avoid
+                # "CategoricalDistribution does not support dynamic value space" and storage warnings.
                 choices = space_def["choices"]
-                choices_for_storage = []
-                for c in choices:
-                    if isinstance(c, list):
-                        choices_for_storage.append(tuple(c))
-                        choices_for_storage.append(list(c))  # DB gives list after JSON
-                        choices_for_storage.append(str(c))
-                    else:
-                        choices_for_storage.append(c)
-                choices_for_storage = tuple(choices_for_storage)
-                params[name] = trial.suggest_categorical(name, choices_for_storage)
-                # Normalize to list so config/downstream always get a list
-                val = params[name]
-                if isinstance(val, str) and val.startswith("["):
-                    params[name] = ast.literal_eval(val)
-                elif isinstance(val, tuple):
-                    params[name] = list(val)
-                elif isinstance(val, list) and val and isinstance(val[0], tuple):
-                    params[name] = [list(x) for x in val]
+                has_complex = any(isinstance(c, (list, tuple)) for c in choices)
+                if has_complex:
+                    choices_for_storage = tuple(str(c) for c in choices)
+                    params[name] = trial.suggest_categorical(name, choices_for_storage)
+                    val = params[name]
+                    params[name] = ast.literal_eval(val) if isinstance(val, str) and val.startswith("[") else list(val) if isinstance(val, tuple) else val
+                else:
+                    choices_for_storage = tuple(choices)
+                    params[name] = trial.suggest_categorical(name, choices_for_storage)
+                    val = params[name]
+                    if isinstance(val, tuple):
+                        params[name] = list(val)
+                    elif isinstance(val, list) and val and isinstance(val[0], tuple):
+                        params[name] = [list(x) for x in val]
 
             elif space_type == "int":
                 params[name] = trial.suggest_int(

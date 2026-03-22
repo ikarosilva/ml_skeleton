@@ -174,7 +174,8 @@ class TrainingManifest:
                 print(f"  Rolling vault update:")
                 print(f"    New ratings added to vault: {len(new_files)}")
                 if pushed_out:
-                    # Split pushed files 80/20 between training and validation
+                    # Split pushed files 80/20 between training and validation (seeded for reproducibility)
+                    random.seed(seed + 2)
                     random.shuffle(pushed_out)
                     split_idx = int(len(pushed_out) * train_ratio)
                     pushed_to_train = pushed_out[:split_idx]

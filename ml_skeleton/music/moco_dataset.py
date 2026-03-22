@@ -28,6 +28,8 @@ from ml_skeleton.music.chunk_fingerprinter import fingerprint_to_bits, CHROMAPRI
 from ml_skeleton.music.chunk_cache import (
     load_cached_chunk,
     get_cached_songs,
+    chunks_per_song_distribution,
+    set_chunk_cache_short_song_ids,
     DEFAULT_CACHE_DIR,
     DEFAULT_NUM_CHUNKS,
     DEFAULT_SAMPLE_RATE
@@ -225,6 +227,7 @@ class MoCoDataset(Dataset):
         crop_duration: Fixed crop duration (random if None)
         fp_db: Optional FingerprintDB for chromaprint regularization (loads full-file chromaprint per song)
         chromaprint_chunk_idx: Chunk index to load chromaprint from (0 = full-file from CLI fingerprint)
+        min_chunks: Minimum chunk files per song to include (default 2 excludes single-chunk songs for MoCo)
     """
 
     def __init__(
@@ -241,9 +244,12 @@ class MoCoDataset(Dataset):
         fp_db: Optional[object] = None,
         chromaprint_chunk_idx: int = 0,
         preload_chromaprint: bool = True,
+        chunk_indices: Optional[List[int]] = None,
+        min_chunks: int = 1,
     ):
         self.cache_dir = cache_dir
         self.num_chunks = num_chunks
+        self._chunk_indices = chunk_indices if chunk_indices is not None else list(range(num_chunks))
         self.sample_rate = sample_rate
         self.same_album_prob = same_album_prob
         self.far_chunk_prob = far_chunk_prob
@@ -252,11 +258,22 @@ class MoCoDataset(Dataset):
         self.fp_db = fp_db
         self.chromaprint_chunk_idx = chromaprint_chunk_idx
 
-        # Filter to songs with complete cache
-        self.songs = get_cached_songs(songs, cache_dir, num_chunks)
+        # Filter to songs with at least min_chunks cached (e.g. 3 to exclude 1–2 chunk songs for MoCo)
+        self.songs = get_cached_songs(songs, cache_dir, num_chunks, min_chunks=min_chunks)
 
         if len(self.songs) < len(songs):
-            print(f"MoCoDataset: {len(self.songs)}/{len(songs)} songs have complete cache")
+            print(f"MoCoDataset: {len(self.songs)}/{len(songs)} songs have at least {min_chunks} chunk(s) cached")
+
+        # Prioritize short songs (≤5 chunks) in LRU: never evict their chunks; evict from long songs first
+        per_song = chunks_per_song_distribution(cache_dir, return_per_song=True)
+        short_song_ids = set()
+        for sid, count in per_song.items():
+            if count <= 5:
+                try:
+                    short_song_ids.add(int(sid))
+                except (ValueError, TypeError):
+                    pass
+        set_chunk_cache_short_song_ids(short_song_ids)
 
         # Create augmentor
         self.augmentor = augmentor or AudioAugmentor(sample_rate=sample_rate)
@@ -415,7 +432,7 @@ class MoCoDataset(Dataset):
             return None
 
         other_idx = random.choice(other_songs)
-        chunk_idx = random.randint(0, self.num_chunks - 1)
+        chunk_idx = random.choice(self._chunk_indices)
 
         return (other_idx, chunk_idx)
 
@@ -434,8 +451,8 @@ class MoCoDataset(Dataset):
         """
         song = self.songs[idx]
 
-        # Load query chunk (random chunk from this song)
-        query_chunk_idx = random.randint(0, self.num_chunks - 1)
+        # Load query chunk (random chunk from this song; use only chunk_indices when set, e.g. HPO with 4 chunks)
+        query_chunk_idx = random.choice(self._chunk_indices)
         query_waveform = self._load_chunk(idx, query_chunk_idx)
 
         if query_waveform is None:
@@ -458,8 +475,8 @@ class MoCoDataset(Dataset):
                 use_same_album = False
 
         if not use_same_album:
-            # Same-song positive: different chunk from same song
-            available_chunks = [i for i in range(self.num_chunks) if i != query_chunk_idx]
+            # Same-song positive: different chunk from same song (only from allowed indices)
+            available_chunks = [i for i in self._chunk_indices if i != query_chunk_idx]
             # Optionally force far-apart chunks (e.g. verse vs chorus) 20–50% of the time
             if (
                 available_chunks

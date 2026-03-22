@@ -21,7 +21,7 @@ for key, value in stats.items():
 
 # Check a few specific embeddings
 from ml_skeleton.music.clementine_db import load_all_songs
-songs = load_all_songs("/Music/database/clementine_backup_2026-01.db")
+songs = load_all_songs("/Music/database/clementine_backup_2026-03.db")
 rated_songs = [s for s in songs if s.is_rated][:10]
 
 print("\nSample embeddings:")

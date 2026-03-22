@@ -16,6 +16,14 @@ Usage:
     python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml
     python examples/music_recommendation.py --stage recommend --config configs/music_recommendation.yaml
 
+    # Backfill val P@5/P@20 in training_manifest.json without retraining (needs classifier_best.pt + manifest):
+    python examples/music_recommendation.py --stage refresh-val-precision --config configs/music_recommendation.yaml
+
+    # RAG-style query: similar songs from an XSPF (writes rag_<stem>.xspf; uses prod/embeddings.db by default):
+    ./run_music_pipeline.sh rag-query /path/to/playlist.xspf --rag-top-n 50 --rag-num-pc 5
+    # Unrated candidates only: add --rag-unrated-only
+    # Likes-only pool: --rag-likes-only (training-positive rated + unrated pred>0.5, top cap by score)
+
     # Hyperparameter tuning (uses search space from YAML config):
     python examples/music_recommendation.py --stage tune-encoder --config configs/music_recommendation.yaml --n-trials 30
     python examples/music_recommendation.py --stage tune-classifier --config configs/music_recommendation.yaml --n-trials 20
@@ -37,6 +45,7 @@ Usage:
 """
 
 import argparse
+import ast
 import json
 import os
 import shutil
@@ -68,11 +77,13 @@ from ml_skeleton.music.encoder_factory import (
     get_chunk_cache_dir,
     get_mlflow_tags
 )
-from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier
+from ml_skeleton.music.chunk_cache import ChunkCacheFlagWrapper
+from ml_skeleton.music.baseline_classifier import SimpleRatingClassifier, AttentionRatingClassifier
 from ml_skeleton.music.xspf_playlist import generate_human_feedback_playlists, export_to_xspf
 from ml_skeleton.training.encoder_trainer import EncoderTrainer
 from ml_skeleton.training.classifier_trainer import (
     ClassifierTrainer,
+    get_classifier_versions_from_checkpoint,
     get_encoder_version_from_checkpoint,
     validate_model_compatibility
 )
@@ -91,6 +102,26 @@ from ml_skeleton import TrainingContext, TrainingResult, ExperimentConfig, run_e
 from ml_skeleton.core.config import TunerType
 from ml_skeleton.tracking import ExplrTracker, MLflowServer
 from ml_skeleton.utils.memory import cleanup_memory, limit_gpu_memory
+
+
+def _persist_ab_test_to_manifest(manifest: TrainingManifest, ab_result: dict) -> None:
+    """Record A/B test on success; clear stale ab_test_result when test is skipped or fails."""
+    if ab_result.get("error"):
+        manifest.metadata.pop("ab_test_result", None)
+        manifest.save()
+        return
+    manifest.set_metadata(
+        "ab_test_result",
+        {
+            "n_samples": int(ab_result.get("n_samples", 0)),
+            "new_accuracy": float(ab_result.get("new_accuracy", 0)),
+            "prod_accuracy": float(ab_result.get("prod_accuracy", 0)),
+            "improvement": float(ab_result.get("improvement", 0)),
+            "p_value": float(ab_result.get("p_value", 1.0)),
+            "significant": bool(ab_result.get("significant", False)),
+        },
+    )
+    manifest.save()
 
 
 def load_config(config_path: str) -> dict:
@@ -181,17 +212,27 @@ def load_classifier_params_from_mlflow_run(tracking_uri: str, run_id: str) -> tu
 def get_hpo_val_roc_auc(config: dict, tracking_uri: Optional[str] = None) -> Optional[float]:
     """Get HPO best val ROC AUC from config (from best params JSON) or from MLflow.
 
-    Tries in order: (1) config key hpo_val_roc_auc, (2) run metric best_val_roc_auc,
-    (3) max roc_auc among child runs, (4) run's own roc_auc (when run_id is a trial run).
+    Tries in order:
+      (1) config key hpo_val_roc_auc
+      (2) best-trial ROC AUC from MLflow (when best_trial_number is available)
+      (3) run metric best_val_roc_auc (if logged by tuner)
+      (4) max ROC AUC among child runs (legacy fallback; can be misleading when HPO objective != ROC AUC)
+      (5) run's own roc_auc (when run_id is a trial run)
     Returns None if not available.
     """
     clf = config.get("classifier", {})
     v = clf.get("hpo_val_roc_auc")
     if v is not None:
         return float(v)
-    run_id = clf.get("hpo_mlflow_run_id")
+    # Prefer explicit HPO parent run id; fall back to best-params JSON key.
+    run_id = clf.get("hpo_mlflow_run_id") or clf.get("mlflow_parent_run_id")
     if not run_id:
         return None
+    best_trial_number = clf.get("best_trial_number")
+    try:
+        best_trial_number = int(best_trial_number) if best_trial_number is not None else None
+    except Exception:
+        best_trial_number = None
     uri = tracking_uri or config.get("mlflow", {}).get("tracking_uri", "http://localhost:5000")
     err_msg = None
     try:
@@ -201,6 +242,35 @@ def get_hpo_val_roc_auc(config: dict, tracking_uri: Optional[str] = None) -> Opt
         client = MlflowClient(tracking_uri=uri)
         run = client.get_run(run_id)
         m = run.data.metrics or {}
+
+        # Prefer ROC AUC from the best HPO trial (by the HPO objective), if we know the trial number.
+        # Note: MLflow filter strings are limited; avoid OR/parentheses and filter in Python.
+        if best_trial_number is not None:
+            from mlflow.entities import ViewType
+            child_runs_for_trial = client.search_runs(
+                experiment_ids=[run.info.experiment_id],
+                filter_string=f'tags."mlflow.parentRunId" = "{run_id}"',
+                run_view_type=ViewType.ALL,
+                max_results=500,
+            )
+            roc_aucs_for_best_trial: list[float] = []
+            for r in child_runs_for_trial:
+                tags = (r.data.tags or {})
+                tnum = tags.get("trial_number", tags.get("trial"))
+                try:
+                    tnum_i = int(tnum) if tnum is not None else None
+                except Exception:
+                    tnum_i = None
+                if tnum_i != best_trial_number:
+                    continue
+                mm = r.data.metrics or {}
+                roc = mm.get("val_roc_auc", mm.get("roc_auc"))
+                if roc is not None:
+                    roc_aucs_for_best_trial.append(float(roc))
+            if roc_aucs_for_best_trial:
+                # If multiple seeds/runs exist under the same trial number, use the best ROC AUC among them.
+                return max(roc_aucs_for_best_trial)
+
         v = m.get("best_val_roc_auc")
         if v is not None:
             return float(v)
@@ -214,13 +284,14 @@ def get_hpo_val_roc_auc(config: dict, tracking_uri: Optional[str] = None) -> Opt
         )
         roc_aucs = []
         for r in child_runs:
-            roc = (r.data.metrics or {}).get("roc_auc")
+            mm = r.data.metrics or {}
+            roc = mm.get("val_roc_auc", mm.get("roc_auc"))
             if roc is not None:
                 roc_aucs.append(float(roc))
         if roc_aucs:
             return max(roc_aucs)
         # Fallback: run_id may be a trial run (no children); use this run's roc_auc
-        v = m.get("roc_auc")
+        v = m.get("val_roc_auc", m.get("roc_auc"))
         if v is not None:
             return float(v)
         return None
@@ -321,6 +392,8 @@ _hpo_classifier_best_value: float = float('inf')
 _hpo_classifier_best_trial: int = -1
 # Per-trial best init seed when reps > 1 (trial_number -> seed)
 _trial_best_reps_seed: dict = {}
+# Recall below this: treat trial as collapsed (predict-all-negative), penalize HPO objective
+MIN_RECALL_FOR_HPO = 0.05
 
 
 def create_encoder_training_fn(base_config: dict, n_trials: int = None, hpo_runs: int = 1):
@@ -569,13 +642,19 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
             hpo_metric = config.get('classifier', {}).get('hpo_metric', 'val_roc_auc')
             use_f1_for_best = (hpo_metric == 'val_f1')
             use_roc_auc_for_best = (hpo_metric == 'val_roc_auc')
+            use_ppv_for_best = (hpo_metric == 'val_ppv')
+            use_ppv_recall_for_best = (hpo_metric == 'val_ppv_recall')
             run_maes = []
             run_f1s = []
             run_roc_aucs = []
+            run_ppvs = []
+            run_ppv_recalls = []
             best_run_idx = 0
             best_run_mae = float('inf')
             best_run_f1 = -1.0
             best_run_roc_auc = -1.0
+            best_run_ppv = -1.0
+            best_run_ppv_recall = -1.0
             best_run_model_card = None
 
             for run_idx in range(hpo_runs):
@@ -600,17 +679,32 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
                 run_mae = classifier_stats.get('val_mae', classifier_stats.get('val_loss', float('inf')))
                 run_f1 = classifier_stats.get('val_f1') or 0.0
                 run_roc_auc = classifier_stats.get('val_roc_auc') or 0.0
+                run_ppv = classifier_stats.get('val_precision') or 0.0
+                clf_cfg = config.get('classifier', {})
+                w_ppv = clf_cfg.get('hpo_metric_ppv_weight', 0.75)
+                w_recall = clf_cfg.get('hpo_metric_recall_weight', 0.25)
+                total_w = w_ppv + w_recall
+                if total_w > 0:
+                    w_ppv, w_recall = w_ppv / total_w, w_recall / total_w
+                run_recall = classifier_stats.get('val_recall') or 0.0
+                run_ppv_recall = w_ppv * run_ppv + w_recall * run_recall
                 run_maes.append(run_mae)
                 run_f1s.append(run_f1)
                 run_roc_aucs.append(run_roc_auc)
+                run_ppvs.append(run_ppv)
+                run_ppv_recalls.append(run_ppv_recall)
                 if use_f1_for_best:
                     print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_f1={run_f1:.6f}")
                 elif use_roc_auc_for_best:
                     print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_roc_auc={run_roc_auc:.6f}")
+                elif use_ppv_for_best:
+                    print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_ppv={run_ppv:.6f}")
+                elif use_ppv_recall_for_best:
+                    print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_ppv_recall={run_ppv_recall:.6f}")
                 else:
                     print(f"    Rep {run_idx + 1}/{hpo_runs} (seed={training_seed}): val_mae={run_mae:.6f}")
 
-                # Track best run by hpo_metric (max F1, max ROC AUC, or min MAE)
+                # Track best run by hpo_metric (max F1, ROC AUC, PPV, PPV_recall, or min MAE)
                 if use_f1_for_best:
                     if run_f1 > best_run_f1:
                         best_run_f1 = run_f1
@@ -619,6 +713,16 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
                 elif use_roc_auc_for_best:
                     if run_roc_auc > best_run_roc_auc:
                         best_run_roc_auc = run_roc_auc
+                        best_run_idx = run_idx
+                        best_run_model_card = model_card
+                elif use_ppv_for_best:
+                    if run_ppv > best_run_ppv:
+                        best_run_ppv = run_ppv
+                        best_run_idx = run_idx
+                        best_run_model_card = model_card
+                elif use_ppv_recall_for_best:
+                    if run_ppv_recall > best_run_ppv_recall:
+                        best_run_ppv_recall = run_ppv_recall
                         best_run_idx = run_idx
                         best_run_model_card = model_card
                 else:
@@ -635,6 +739,10 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
                 print(f"    Best: val_f1={best_run_f1:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean F1: {np.mean(run_f1s):.6f} +/- {np.std(run_f1s):.6f}")
             elif use_roc_auc_for_best:
                 print(f"    Best: val_roc_auc={best_run_roc_auc:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_roc_aucs):.6f} +/- {np.std(run_roc_aucs):.6f}")
+            elif use_ppv_for_best:
+                print(f"    Best: val_ppv={best_run_ppv:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_ppvs):.6f} +/- {np.std(run_ppvs):.6f}")
+            elif use_ppv_recall_for_best:
+                print(f"    Best: val_ppv_recall={best_run_ppv_recall:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_ppv_recalls):.6f} +/- {np.std(run_ppv_recalls):.6f}")
             else:
                 print(f"    Best: {best_val_mae:.6f} (rep {best_run_idx + 1}, init_seed={best_seed}), Mean: {np.mean(run_maes):.6f} +/- {np.std(run_maes):.6f}")
             _global_model_card = best_run_model_card if best_run_model_card is not None else model_card
@@ -663,6 +771,9 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
             best_val_roc_auc = classifier_stats.get('val_roc_auc')
             best_val_rating_mse = classifier_stats.get('val_rating_mse')
             best_val_rating_corr = classifier_stats.get('val_rating_corr')
+
+        best_val_precision = classifier_stats.get('val_precision')  # PPV
+        best_val_recall = classifier_stats.get('val_recall')
 
         # HPO objective: configurable via classifier.hpo_metric (default val_roc_auc)
         hpo_metric = config.get('classifier', {}).get('hpo_metric', 'val_roc_auc')
@@ -727,11 +838,45 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
             primary_metric_name = 'optuna_objective'
             minimize = True
             best_display = best_val_f1
+        elif hpo_metric == 'val_ppv' and best_val_precision is not None:
+            # Maximize PPV (precision): Optuna minimizes, so primary_metric = 1 - PPV.
+            primary_metric = 1.0 - best_val_precision
+            primary_metric_name = 'optuna_objective'
+            minimize = True
+            best_display = best_val_precision
+        elif hpo_metric == 'val_ppv_recall':
+            # Composite: maximize (w_ppv * PPV + w_recall * recall). Default 0.75 PPV, 0.25 recall (PPV 3x recall).
+            clf_cfg = config.get('classifier', {})
+            w_ppv = clf_cfg.get('hpo_metric_ppv_weight', 0.75)
+            w_recall = clf_cfg.get('hpo_metric_recall_weight', 0.25)
+            total_w = w_ppv + w_recall
+            if total_w > 0:
+                w_ppv, w_recall = w_ppv / total_w, w_recall / total_w
+            ppv_val = best_val_precision if best_val_precision is not None else 0.0
+            recall_val = best_val_recall if best_val_recall is not None else 0.0
+            combined = w_ppv * ppv_val + w_recall * recall_val
+            primary_metric = 1.0 - combined
+            primary_metric_name = 'optuna_objective'
+            minimize = True
+            best_display = combined
         else:
             primary_metric = best_val_mae
             primary_metric_name = 'val_mae'
             minimize = True
             best_display = best_val_mae
+
+        # Penalize collapsed trials (predict-all-negative): never select as best
+        hpo_collapsed_penalized = False
+        if best_val_recall is not None and best_val_recall < MIN_RECALL_FOR_HPO:
+            hpo_collapsed_penalized = True
+            if primary_metric_name == 'optuna_objective' or hpo_metric in (
+                'val_roc_auc', 'val_f1', 'val_rating_corr', 'val_rating_corr_and_f1',
+                'val_ppv', 'val_ppv_recall',
+            ):
+                primary_metric = 1.0  # worst when minimizing (1 - metric)
+            else:
+                primary_metric = 1e10  # worst when minimizing loss/MSE/MAE
+            print(f"  Trial collapsed (recall < {MIN_RECALL_FOR_HPO:.0%}): penalizing HPO objective.")
 
         # Track and report new best trials (compare using same metric we optimize)
         global _hpo_classifier_best_value, _hpo_classifier_best_trial
@@ -768,6 +913,8 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
             ctx.tracker.log_metric('val_rating_corr_and_f1', best_display)
         ctx.tracker.log_metric('epochs_run', classifier_stats.get('epochs_run', 0))
         ctx.tracker.log_metric('training_time', classifier_stats.get('training_time_seconds', 0))
+        if hpo_collapsed_penalized:
+            ctx.tracker.log_metric('hpo_collapsed_penalized', 1)
 
         # Only include numeric metrics (MLflow rejects None)
         metrics_dict = {
@@ -795,6 +942,14 @@ def create_classifier_training_fn(base_config: dict, n_trials: int = None, hpo_r
         if roc_auc is not None:
             ctx.tracker.log_metric('roc_auc', roc_auc)
             metrics_dict['roc_auc'] = roc_auc
+        p5 = classifier_stats.get('val_precision_at_5')
+        if p5 is not None and not (isinstance(p5, float) and np.isnan(p5)):
+            ctx.tracker.log_metric('val_precision_at_5', p5)
+            metrics_dict['val_precision_at_5'] = p5
+        p20 = classifier_stats.get('val_precision_at_20')
+        if p20 is not None and not (isinstance(p20, float) and np.isnan(p20)):
+            ctx.tracker.log_metric('val_precision_at_20', p20)
+            metrics_dict['val_precision_at_20'] = p20
         if best_val_f1 is not None:
             metrics_dict['val_f1'] = best_val_f1
         if best_val_rating_mse is not None:
@@ -1200,6 +1355,21 @@ def train_encoder(
     # MoCo uses MoCoDataset (created by factory)
     if use_moco:
         from ml_skeleton.music.moco_dataset import MoCoDataset
+        # HPO only: use fewer chunks (e.g. 4) maximally spread to fit in RAM
+        chunk_indices_override = None
+        if trial_info is not None:
+            hpo_num_chunks = config.get('tuning', {}).get('hpo_num_chunks')
+            if hpo_num_chunks is not None:
+                num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
+                if 1 <= hpo_num_chunks <= num_chunks:
+                    if hpo_num_chunks == 1:
+                        chunk_indices_override = [0]
+                    else:
+                        chunk_indices_override = [
+                            int(round(i * (num_chunks - 1) / (hpo_num_chunks - 1)))
+                            for i in range(hpo_num_chunks)
+                        ]
+                    print(f"  HPO: using {hpo_num_chunks} chunks (indices {chunk_indices_override}) for RAM fit", flush=True)
         if trial_info is not None:
             print("[HPO] Creating MoCo dataset...", flush=True)
         full_dataset = create_dataset(
@@ -1207,7 +1377,8 @@ def train_encoder(
             songs=all_songs,
             album_to_idx=album_to_idx,
             filename_to_albums=filename_to_albums,
-            is_training=True
+            is_training=True,
+            chunk_indices_override=chunk_indices_override
         )
         if trial_info is not None:
             print("[HPO] MoCo dataset created.", flush=True)
@@ -1403,6 +1574,19 @@ def train_encoder(
         generator=torch.Generator().manual_seed(split_seed)
     )
 
+    # HPO: use only a fraction of training indices (val stays full for fair comparison)
+    if trial_info is not None:
+        tuning = config.get('tuning', {})
+        hpo_frac = tuning.get('hpo_train_fraction', 1.0)
+        if hpo_frac < 1.0:
+            train_indices = list(train_dataset.indices)
+            rng = random.Random(split_seed)
+            keep = max(1, int(len(train_indices) * hpo_frac))
+            train_indices_sub = rng.sample(train_indices, keep)
+            train_dataset = torch.utils.data.Subset(full_dataset, train_indices_sub)
+            if verbose:
+                print(f"  HPO: train on {len(train_dataset)}/{len(train_indices)} samples ({hpo_frac:.0%}); val full ({len(val_dataset)} samples)", flush=True)
+
     if verbose:
         print(f"  Train: {len(train_dataset)} songs")
         print(f"  Val: {len(val_dataset)} songs")
@@ -1416,6 +1600,22 @@ def train_encoder(
             num_workers = int(_hpo_workers)
             if verbose:
                 print(f"  HPO: dataloader_workers overridden to {num_workers} (EXPLR_HPO_DATALOADER_WORKERS)")
+
+    # In-process chunk LRU: total budget max_cache_gb, divided across (1 + num_workers) processes.
+    chunk_cache_cfg = music_config.get('chunk_cache', {})
+    max_gb = chunk_cache_cfg.get('max_cache_gb', 100)
+    if 'CHUNK_CACHE_MAX_GB' not in os.environ:
+        os.environ['CHUNK_CACHE_MAX_GB'] = str(max_gb)
+    else:
+        max_gb = int(float(os.environ['CHUNK_CACHE_MAX_GB']))
+    if 'CHUNK_CACHE_NUM_WORKERS' not in os.environ:
+        os.environ['CHUNK_CACHE_NUM_WORKERS'] = str(num_workers)
+    if verbose:
+        print(f"  Chunk cache RAM limit: {max_gb} GB (LRU per process)")
+
+    # Wrap so train uses in-process chunk LRU cache; val never cached
+    train_dataset = ChunkCacheFlagWrapper(train_dataset, use_cache=True)
+    val_dataset = ChunkCacheFlagWrapper(val_dataset, use_cache=False)
 
     # Worker initialization function for reproducible DataLoader workers (use model_seed)
     def worker_init_fn(worker_id):
@@ -1518,7 +1718,8 @@ def train_encoder(
     scheduler = None
     scheduler_type = encoder_config.get('scheduler', 'cosine')
     if scheduler_type == 'cosine':
-        t_max = encoder_config.get('cosine_t_max', num_epochs)
+        # Final training: one full cosine decay over all epochs; HPO trials use cosine_t_max=epochs (e.g. 25)
+        t_max = num_epochs if final_training else encoder_config.get('cosine_t_max', num_epochs)
         eta_min = encoder_config.get('cosine_eta_min', 1e-6)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -1788,6 +1989,50 @@ def _effective_classifier_batch_size(classifier_config: dict, encoder_version: s
     return classifier_config["batch_size"]
 
 
+def _create_rating_classifier(
+    embedding_dim: int,
+    classifier_config: dict,
+    checkpoint: dict = None,
+) -> nn.Module:
+    """Create SimpleRatingClassifier or AttentionRatingClassifier from config or checkpoint."""
+    ck = checkpoint or {}
+    use_genre = ck.get("use_genre", classifier_config.get("use_genre", False))
+    hidden_dims = ck.get("hidden_dims") or classifier_config.get("hidden_dims", [512, 256, 128])
+    # Best-params JSON / Optuna categorical may store hidden_dims as string "[1024, 512, 256, 128]"
+    if isinstance(hidden_dims, str):
+        hidden_dims = ast.literal_eval(hidden_dims)
+    hidden_dims = list(hidden_dims)
+    dropout = classifier_config.get("dropout", 0.3)
+    use_batch_norm = ck.get("use_batch_norm", classifier_config.get("use_batch_norm", False))
+    use_residual = ck.get("use_residual", classifier_config.get("use_residual", False))
+    classifier_type = ck.get("classifier_type") or classifier_config.get("classifier_type", "mlp")
+    if classifier_type == "AttentionRatingClassifier" or classifier_config.get("classifier_type") == "attention":
+        d_model = ck.get("d_model") or classifier_config.get("attention_d_model", 512)
+        num_heads = ck.get("num_heads") or classifier_config.get("attention_num_heads", 4)
+        max_chunks = ck.get("max_chunks") or classifier_config.get("attention_max_chunks", 16)
+        use_pos_encoding = ck.get("use_pos_encoding", True)
+        return AttentionRatingClassifier(
+            embedding_dim=embedding_dim,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            use_genre=use_genre,
+            use_batch_norm=use_batch_norm,
+            use_residual=use_residual,
+            d_model=d_model,
+            num_heads=num_heads,
+            max_chunks=max_chunks,
+            use_pos_encoding=use_pos_encoding,
+        )
+    return SimpleRatingClassifier(
+        embedding_dim=embedding_dim,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        use_genre=use_genre,
+        use_batch_norm=use_batch_norm,
+        use_residual=use_residual,
+    )
+
+
 class NoisyEmbeddingWrapper(Dataset):
     """Wraps a dataset and adds Gaussian noise N(0, variance) to the 'embedding' field in __getitem__.
 
@@ -1889,6 +2134,11 @@ def _perform_classifier_training_run(
         torch.cuda.manual_seed_all(run_seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    if hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
 
     # Train/val split with this run's seed
     train_split = music_config.get('train_split', 0.8)
@@ -1964,14 +2214,7 @@ def _perform_classifier_training_run(
     )
 
     # Create model
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=classifier_config['hidden_dims'],
-        dropout=classifier_config['dropout'],
-        use_genre=use_genre,
-        use_batch_norm=classifier_config.get('use_batch_norm', False),
-        use_residual=classifier_config.get('use_residual', False),
-    )
+    classifier = _create_rating_classifier(embedding_dim, classifier_config)
 
     # Try to initialize from production model if requested
     prod_checkpoint_path = Path("prod") / "classifier_best.pt"
@@ -2057,6 +2300,7 @@ def _perform_classifier_training_run(
         training_label_noise=classifier_config.get('training_label_noise', 0),
         hpo_mlflow_run_id=classifier_config.get('hpo_mlflow_run_id'),
         hpo_mlflow_run_name=classifier_config.get('hpo_mlflow_run_name'),
+        binary_positive_threshold=float(classifier_config.get('binary_positive_threshold', 4.0)),
     )
 
     # Train (use HPO metric for early stop/checkpoint when set)
@@ -2078,6 +2322,12 @@ def _perform_classifier_training_run(
         train_kwargs['monitor_metric'] = 'val_f1'
     elif hpo_metric == 'val_roc_auc':
         train_kwargs['monitor_metric'] = 'val_roc_auc'
+    elif hpo_metric == 'val_ppv':
+        train_kwargs['monitor_metric'] = 'val_ppv'
+    elif hpo_metric == 'val_ppv_recall':
+        train_kwargs['monitor_metric'] = 'val_ppv_recall'
+        train_kwargs['hpo_metric_ppv_weight'] = classifier_config.get('hpo_metric_ppv_weight', 0.75)
+        train_kwargs['hpo_metric_recall_weight'] = classifier_config.get('hpo_metric_recall_weight', 0.25)
     training_start_time = time.time()
     history = trainer.train(**train_kwargs)
     training_time = time.time() - training_start_time
@@ -2110,6 +2360,115 @@ def _perform_classifier_training_run(
         'checkpoint_path': checkpoint_path,
         'training_time': training_time
     }
+
+
+def refresh_val_precision_manifest(config: dict) -> None:
+    """Validate checkpoints/classifier_best.pt on manifest val split; write P@5/P@20 to training_manifest.json."""
+    import torch
+    from torch.utils.data import DataLoader
+    from ml_skeleton.music.training_manifest import TrainingManifest
+    from ml_skeleton.music.clementine_db import ClementineDB
+    from ml_skeleton.music.embedding_store import EmbeddingStore
+    from ml_skeleton.music.dataset import EmbeddingDataset
+    from ml_skeleton.music.ab_testing import load_classifier_from_checkpoint
+    from ml_skeleton.training.classifier_trainer import ClassifierTrainer
+    from ml_skeleton.music.losses import BinaryRatingLoss, RatingLoss
+    import torch.optim as optim
+
+    music_config = config["music"]
+    classifier_config = config["classifier"]
+    device = config.get("device", "cuda" if torch.cuda.is_available() else "cpu")
+    checkpoint_dir = Path(config["checkpoint_dir"])
+    ckpt_path = checkpoint_dir / "classifier_best.pt"
+    manifest_path = checkpoint_dir / "training_manifest.json"
+    if not ckpt_path.exists():
+        raise SystemExit(f"Missing classifier checkpoint: {ckpt_path}")
+    if not manifest_path.exists():
+        raise SystemExit(f"Missing training manifest: {manifest_path}")
+
+    print("Refresh val P@5 / P@20: loading data and classifier...")
+    db = ClementineDB(music_config["database_path"])
+    all_songs = [s for s in db.get_all_songs() if s.is_rated]
+    embedding_store = EmbeddingStore(music_config["embedding_db_path"])
+    num_chunks = music_config.get("chunk_cache", {}).get("num_chunks", 8)
+    enc_v = music_config["encoder_version"]
+    filenames = [s.filename for s in all_songs]
+    embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
+        filenames, model_version=enc_v, num_chunks=num_chunks
+    )
+    if not embeddings_dict:
+        embeddings_dict = embedding_store.get_embeddings_batch(filenames, model_version=enc_v)
+    if enc_v == "fingerprint_baseline" and classifier_config.get("normalize_fingerprint_embeddings", True):
+        embeddings_dict = _zscore_normalize_embeddings(embeddings_dict)
+
+    use_genre = classifier_config.get("use_genre", False)
+    genre_centroids = None
+    if use_genre:
+        from ml_skeleton.music.genre_centroids import compute_genre_centroids
+        genre_centroids = compute_genre_centroids(
+            embeddings_dict, all_songs, encoder_version=enc_v,
+        )
+    classification_mode = classifier_config.get("classification_mode", "binary")
+    full_dataset = EmbeddingDataset(
+        embeddings=embeddings_dict,
+        songs=all_songs,
+        only_rated=True,
+        classification_mode=classification_mode,
+        binary_positive_threshold=classifier_config.get("binary_positive_threshold", 4.0),
+        binary_negative_threshold=classifier_config.get("binary_negative_threshold", 2.0),
+        use_genre=use_genre,
+        genre_centroids=genre_centroids,
+        genre_impute_top_k=classifier_config.get("genre_impute_top_k", 2),
+        genre_impute_min_votes=classifier_config.get("genre_impute_min_votes", 1),
+        binary_include_middle=classifier_config.get("binary_include_middle", False),
+        replace_embeddings_with_noise=classifier_config.get("replace_embeddings_with_noise", False),
+        noise_seed=config.get("seed", 42),
+    )
+
+    manifest = TrainingManifest(str(manifest_path))
+    manifest.load()
+    train_files = list(manifest.training_files)
+    val_files = list(manifest.validation_files)
+    if not val_files:
+        raise SystemExit("Manifest has no validation_files")
+    _, val_dataset = full_dataset.split_by_filenames(train_files, val_files)
+    batch_size = _effective_classifier_batch_size(classifier_config, enc_v)
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True,
+    )
+
+    ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    embedding_dim = int(ck.get("embedding_dim", 0))
+    if embedding_dim <= 0:
+        raise SystemExit("Checkpoint missing embedding_dim")
+    classifier, _ = load_classifier_from_checkpoint(str(ckpt_path), embedding_dim, device)
+    if classification_mode == "binary":
+        loss_fn = BinaryRatingLoss(pos_weight=1.0, middle_weight=classifier_config.get("binary_middle_loss_weight", 0.1))
+    else:
+        loss_fn = RatingLoss()
+    optimizer = optim.Adam(classifier.parameters(), lr=1e-3)
+    enc_ver = music_config.get("encoder_version", "v1")
+    clf_ver = music_config.get("classifier_version", "v1")
+    trainer = ClassifierTrainer(
+        classifier=classifier,
+        device=device,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        encoder_version=enc_ver,
+        classifier_version=clf_ver,
+        classification_mode=classification_mode,
+        genre_centroids=genre_centroids,
+        chunk_aggregation=classifier_config.get("chunk_aggregation", "mean"),
+        binary_positive_threshold=float(classifier_config.get("binary_positive_threshold", 4.0)),
+    )
+    vm = trainer.validate(val_loader)
+    p5, p20 = vm.get("precision_at_5"), vm.get("precision_at_20")
+    if p5 is not None and not (isinstance(p5, float) and np.isnan(p5)):
+        manifest.set_metadata("val_precision_at_5", float(p5))
+    if p20 is not None and not (isinstance(p20, float) and np.isnan(p20)):
+        manifest.set_metadata("val_precision_at_20", float(p20))
+    manifest.save()
+    print(f"  Wrote to {manifest_path}: val_precision_at_5={p5}, val_precision_at_20={p20}")
 
 
 def train_classifier(
@@ -2151,6 +2510,9 @@ def train_classifier(
     import random
     import numpy as np
 
+    # Required for deterministic CuBLAS when use_deterministic_algorithms(True) is used below
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     # Ensure clean memory state at start of stage
     cleanup_memory()
 
@@ -2169,6 +2531,12 @@ def train_classifier(
         # Make CuDNN deterministic (may reduce performance slightly)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    # Full algo determinism so same seed reproduces HPO best run when using --best-params
+    if hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
 
     print("=" * 80)
     if trial_info:
@@ -2264,22 +2632,27 @@ def train_classifier(
         print("\n[2/6] Loading embeddings...")
     embedding_store = EmbeddingStore(music_config['embedding_db_path'])
 
-    # Get embeddings for all songs (num_chunks per song, default 8, for classifier average)
-    num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
+    # Get embeddings for all songs: prefer all num_chunks per song so classifier uses every chunk
+    num_chunks_config = music_config.get('chunk_cache', {}).get('num_chunks', 8)
     filenames = [s.filename for s in all_songs]
+    encoder_version = music_config['encoder_version']
     embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
-        model_version=music_config['encoder_version'],
-        num_chunks=num_chunks
+        model_version=encoder_version,
+        num_chunks=num_chunks_config
     )
+    used_all_chunks = bool(embeddings_dict)
     if not embeddings_dict:
         embeddings_dict = embedding_store.get_embeddings_batch(
             filenames,
-            model_version=music_config['encoder_version']
+            model_version=encoder_version
         )
+        if verbose:
+            print("  Fallback: using single vector per song (embedding_chunks not populated for this version)")
 
     if verbose:
         print(f"  Loaded {len(embeddings_dict)} embeddings")
+    print(f"  Using embeddings: model_version={encoder_version!r}")
 
     # For fingerprint baseline: z-score normalize (noise is added only to training data in the train step)
     encoder_version_for_norm = music_config.get("encoder_version", "v1")
@@ -2288,12 +2661,15 @@ def train_classifier(
         if verbose:
             print("  Fingerprint embeddings: z-score normalized (per dimension)")
 
-    # Check embedding dimension (support (4, D) per song)
+    # Check embedding dimension and actual chunks per song from loaded data
     first_embedding = next(iter(embeddings_dict.values()))
     arr = np.asarray(first_embedding)
     embedding_dim = int(arr.shape[-1]) if arr.ndim > 1 else len(arr)
+    chunks_per_song = int(arr.shape[0]) if arr.ndim == 2 else 1
     if verbose:
-        print(f"  Embedding dimension: {embedding_dim} (chunks per song: {num_chunks})")
+        print(f"  Embedding dimension: {embedding_dim} (chunks per song: {chunks_per_song})")
+        if used_all_chunks and chunks_per_song > 1:
+            print(f"  Using all {chunks_per_song} chunks per song for classifier")
 
     # Create dataset
     if verbose:
@@ -2337,15 +2713,16 @@ def train_classifier(
         noise_seed=config.get('seed', 42),
     )
 
-    # Get version information (needed for multi-run and checkpoint)
-    # When using fingerprint_baseline there is no encoder checkpoint; always use config so HPO works.
+    # Get version information (needed for multi-run and checkpoint).
+    # Use config encoder_version so it matches the embeddings we loaded above; only fall back to
+    # encoder checkpoint when config does not set it (e.g. legacy configs).
     encoder_checkpoint_path = Path(config['checkpoint_dir']) / "encoder_best.pt"
-    if music_config.get('encoder_version') == 'fingerprint_baseline':
-        encoder_version = 'fingerprint_baseline'
-    elif encoder_checkpoint_path.exists():
-        encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
-    else:
-        encoder_version = music_config.get('encoder_version', 'v1')
+    encoder_version = music_config.get('encoder_version')
+    if encoder_version is None or encoder_version == '':
+        if encoder_checkpoint_path.exists():
+            encoder_version = get_encoder_version_from_checkpoint(str(encoder_checkpoint_path))
+        else:
+            encoder_version = 'v1'
 
     classifier_version = classifier_version_override if classifier_version_override else music_config.get('classifier_version', 'v1')
 
@@ -2505,16 +2882,10 @@ def train_classifier(
                     device=device,
                     verbose=True
                 )
-                manifest.set_metadata('ab_test_result', {
-                    'n_samples': int(ab_result.get('n_samples', 0)),
-                    'new_accuracy': float(ab_result.get('new_accuracy', 0)),
-                    'prod_accuracy': float(ab_result.get('prod_accuracy', 0)),
-                    'improvement': float(ab_result.get('improvement', 0)),
-                    'p_value': float(ab_result.get('p_value', 1.0)),
-                    'significant': bool(ab_result.get('significant', False))
-                })
-                manifest.save()
-                if classifier_mlflow_run_id:
+                if ab_result.get("error"):
+                    print(f"  Skipping A/B test: {ab_result.get('error')}")
+                _persist_ab_test_to_manifest(manifest, ab_result)
+                if not ab_result.get("error") and classifier_mlflow_run_id:
                     from mlflow.tracking import MlflowClient
                     tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
                     client = MlflowClient(tracking_uri=tracking_uri)
@@ -2523,6 +2894,8 @@ def train_classifier(
             else:
                 print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
                 print(f"  Rate more songs to build up a stable A/B test vault")
+                manifest.metadata.pop("ab_test_result", None)
+                manifest.save()
         elif verbose and len(vault_files) == 0:
             print(f"\n  No vault files available for A/B testing")
             print(f"  Need at least {vault_size} rated files to create vault")
@@ -2647,19 +3020,14 @@ def train_classifier(
     # Create model
     if verbose:
         print("\n[4/6] Creating classifier model...")
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=classifier_config['hidden_dims'],
-        dropout=classifier_config['dropout'],
-        use_genre=use_genre,
-        use_batch_norm=classifier_config.get('use_batch_norm', False),
-        use_residual=classifier_config.get('use_residual', False),
-    )
+    classifier = _create_rating_classifier(embedding_dim, classifier_config)
 
     if verbose:
         print(f"  Embedding dim: {embedding_dim}")
         print(f"  Use genre: {use_genre}")
         print(f"  Hidden dims: {classifier_config['hidden_dims']}")
+        if isinstance(classifier, AttentionRatingClassifier):
+            print(f"  Attention: d_model={classifier.d_model}, num_heads={classifier.num_heads}, pos_encoding={classifier.use_pos_encoding}")
         print(f"  Dropout: {classifier_config['dropout']}")
 
     # Create loss function based on classification mode
@@ -2730,6 +3098,7 @@ def train_classifier(
         training_label_noise=classifier_config.get('training_label_noise', 0),
         hpo_mlflow_run_id=classifier_config.get('hpo_mlflow_run_id'),
         hpo_mlflow_run_name=classifier_config.get('hpo_mlflow_run_name'),
+        binary_positive_threshold=float(classifier_config.get('binary_positive_threshold', 4.0)),
     )
 
     # Train with time tracking and MLflow logging
@@ -2756,6 +3125,12 @@ def train_classifier(
         train_kwargs['monitor_metric'] = 'val_f1'
     elif hpo_metric == 'val_roc_auc':
         train_kwargs['monitor_metric'] = 'val_roc_auc'
+    elif hpo_metric == 'val_ppv':
+        train_kwargs['monitor_metric'] = 'val_ppv'
+    elif hpo_metric == 'val_ppv_recall':
+        train_kwargs['monitor_metric'] = 'val_ppv_recall'
+        train_kwargs['hpo_metric_ppv_weight'] = classifier_config.get('hpo_metric_ppv_weight', 0.75)
+        train_kwargs['hpo_metric_recall_weight'] = classifier_config.get('hpo_metric_recall_weight', 0.25)
 
     # When tracker was passed from HPO (mlflow_tracker), we're already inside that run; don't start another
     tracker_already_active = mlflow_tracker is not None
@@ -2874,6 +3249,22 @@ def train_classifier(
         classifier_stats['val_recall'] = max(history['val_recall'])
     else:
         classifier_stats['val_recall'] = None
+
+    # Composite metric used by HPO/early stopping in this pipeline (precision-heavy):
+    # val_ppv_recall = w_ppv * PPV + w_recall * recall
+    try:
+        w_ppv = float(classifier_config.get('hpo_metric_ppv_weight', 0.75))
+        w_recall = float(classifier_config.get('hpo_metric_recall_weight', 0.25))
+        prec_hist = history.get('val_precision') or []
+        rec_hist = history.get('val_recall') or []
+        n = min(len(prec_hist), len(rec_hist))
+        if n > 0:
+            vals = [w_ppv * float(prec_hist[i]) + w_recall * float(rec_hist[i]) for i in range(n)]
+            classifier_stats['val_ppv_recall'] = max(vals)
+        else:
+            classifier_stats['val_ppv_recall'] = None
+    except Exception:
+        classifier_stats['val_ppv_recall'] = None
     if history.get('val_f1'):
         classifier_stats['val_f1'] = max(history['val_f1'])
         if config.get('classifier', {}).get('hpo_metric') == 'val_f1':
@@ -2886,6 +3277,28 @@ def train_classifier(
         classifier_stats['val_roc_auc'] = max(history['val_roc_auc'])
     else:
         classifier_stats['val_roc_auc'] = None
+    p5_saved = history.get('val_precision_at_5_saved')
+    if p5_saved is None or (isinstance(p5_saved, float) and np.isnan(p5_saved)):
+        p5_hist = [
+            x for x in (history.get('val_precision_at_5') or [])
+            if x is not None and not (isinstance(x, float) and np.isnan(x))
+        ]
+        p5_saved = max(p5_hist) if p5_hist else None
+    if p5_saved is not None and not (isinstance(p5_saved, float) and np.isnan(p5_saved)):
+        classifier_stats['val_precision_at_5'] = float(p5_saved)
+    else:
+        classifier_stats['val_precision_at_5'] = None
+    p20_saved = history.get('val_precision_at_20_saved')
+    if p20_saved is None or (isinstance(p20_saved, float) and np.isnan(p20_saved)):
+        p20_hist = [
+            x for x in (history.get('val_precision_at_20') or [])
+            if x is not None and not (isinstance(x, float) and np.isnan(x))
+        ]
+        p20_saved = max(p20_hist) if p20_hist else None
+    if p20_saved is not None and not (isinstance(p20_saved, float) and np.isnan(p20_saved)):
+        classifier_stats['val_precision_at_20'] = float(p20_saved)
+    else:
+        classifier_stats['val_precision_at_20'] = None
     if history.get('best_epoch') is not None:
         classifier_stats['best_epoch'] = history['best_epoch']  # Epoch when best checkpoint was saved
     elif history.get('val_roc_auc') and config.get('classifier', {}).get('hpo_metric') == 'val_roc_auc':
@@ -2908,7 +3321,32 @@ def train_classifier(
     classifier_stats['train_prevalence'] = train_pos / len(train_files) if train_files else 0.0
     classifier_stats['val_prevalence'] = val_pos / len(val_files) if val_files else 0.0
     classifier_stats['training_seed'] = model_seed
+    # Backfill P@20 if history never stored it (e.g. old trainer) — before model card + manifest
+    if (
+        verbose
+        and classification_mode == "binary"
+        and val_loader is not None
+        and len(val_dataset) >= 20
+    ):
+        p20b = classifier_stats.get("val_precision_at_20")
+        if p20b is None or (isinstance(p20b, float) and np.isnan(p20b)):
+            vm_bf = trainer.validate(val_loader)
+            p20x = vm_bf.get("precision_at_20")
+            if p20x is not None and not (isinstance(p20x, float) and np.isnan(p20x)):
+                classifier_stats["val_precision_at_20"] = float(p20x)
+                print(f"  (Backfilled val P@20: {float(p20x):.4f})")
     model_card.set_classifier_stats(classifier_stats)
+
+    if verbose:
+        p5v = classifier_stats.get('val_precision_at_5')
+        p20v = classifier_stats.get('val_precision_at_20')
+        parts = []
+        if p5v is not None and not (isinstance(p5v, float) and np.isnan(p5v)):
+            parts.append(f"P@5={float(p5v):.4f}")
+        if p20v is not None and not (isinstance(p20v, float) and np.isnan(p20v)):
+            parts.append(f"P@20={float(p20v):.4f}")
+        if parts:
+            print(f"Val precision (saved checkpoint): {', '.join(parts)}")
 
     # Generate model card (only during final training, not HPO)
     if verbose:
@@ -2923,6 +3361,14 @@ def train_classifier(
     # Save training manifest (tracks which files were used for training)
     manifest.set_metadata('val_loss', best_val_loss)
     manifest.set_metadata('val_mae', best_val_mae)
+    # Raw metrics for reporting (more interpretable than composite)
+    manifest.set_metadata('val_ppv', classifier_stats.get('val_ppv'))
+    manifest.set_metadata('val_recall', classifier_stats.get('val_recall'))
+    manifest.set_metadata('val_precision_at_5', classifier_stats.get('val_precision_at_5'))
+    manifest.set_metadata('val_precision_at_20', classifier_stats.get('val_precision_at_20'))
+    manifest.set_metadata('val_roc_auc', classifier_stats.get('val_roc_auc'))
+    # Keep composite too (used by HPO/early stopping), but summaries can ignore it
+    manifest.set_metadata('val_ppv_recall', classifier_stats.get('val_ppv_recall'))
     manifest.set_metadata('training_time_seconds', training_time)
     manifest.set_metadata('epochs_run', epochs_run)
     manifest.set_metadata('train_size', len(train_dataset))
@@ -2972,19 +3418,10 @@ def train_classifier(
                 device=device,
                 verbose=True
             )
-
-            # Store A/B test result in manifest (include accuracies for debugging)
-            manifest.set_metadata('ab_test_result', {
-                'n_samples': int(ab_result.get('n_samples', 0)),
-                'new_accuracy': float(ab_result.get('new_accuracy', 0)),
-                'prod_accuracy': float(ab_result.get('prod_accuracy', 0)),
-                'improvement': float(ab_result.get('improvement', 0)),
-                'p_value': float(ab_result.get('p_value', 1.0)),
-                'significant': bool(ab_result.get('significant', False))
-            })
-            manifest.save()
-            # Log A/B test metrics to MLflow (classifier run) if we have a run id
-            if classifier_mlflow_run_id:
+            if ab_result.get("error"):
+                print(f"  Skipping A/B test: {ab_result.get('error')}")
+            _persist_ab_test_to_manifest(manifest, ab_result)
+            if not ab_result.get("error") and classifier_mlflow_run_id:
                 from mlflow.tracking import MlflowClient
                 tracking_uri = config.get('mlflow', {}).get('tracking_uri', 'http://localhost:5000')
                 client = MlflowClient(tracking_uri=tracking_uri)
@@ -2993,6 +3430,8 @@ def train_classifier(
         else:
             print(f"  Skipping A/B test: only {len(test_dataset)} samples in vault (need >= 10)")
             print(f"  Rate more songs to build up a stable A/B test vault")
+            manifest.metadata.pop("ab_test_result", None)
+            manifest.save()
     elif verbose and len(vault_files) == 0:
         print(f"\n  No vault files available for A/B testing")
         print(f"  Need at least {vault_size} rated files to create vault")
@@ -3136,28 +3575,19 @@ def train_joint_finetune(
     encoder.load_state_dict(enc_ckpt["model_state_dict"])
     encoder_version = enc_ckpt.get("encoder_version", music_config.get("encoder_version", "v1"))
 
-    # Load classifier
+    # Load classifier (same architecture as saved checkpoint: MLP or Attention)
     clf_ckpt = torch.load(classifier_path, map_location="cpu", weights_only=False)
     state_dict = clf_ckpt["model_state_dict"]
     embedding_dim = int(clf_ckpt.get("embedding_dim", 2048))
-    hidden_dims = clf_ckpt.get("hidden_dims", classifier_config.get("hidden_dims", [512, 256, 128]))
-    dropout = classifier_config.get("dropout", 0.3)
-    use_genre = clf_ckpt.get("use_genre", False)
-    use_batch_norm = clf_ckpt.get("use_batch_norm", False)
-    use_residual = clf_ckpt.get("use_residual", False)
+    arch_ck = {k: v for k, v in clf_ckpt.items() if k != "model_state_dict" and k != "optimizer_state_dict"}
+    if arch_ck.get("hidden_dims") is None:
+        arch_ck["hidden_dims"] = clf_ckpt.get("hidden_dims", classifier_config.get("hidden_dims", [512, 256, 128]))
+    classifier = _create_rating_classifier(embedding_dim, classifier_config, checkpoint=arch_ck)
+    classifier.load_state_dict(state_dict)
+    use_genre = clf_ckpt.get("use_genre", getattr(classifier, "use_genre", False))
     genre_centroids = clf_ckpt.get("genre_centroids")
     classifier_version = clf_ckpt.get("classifier_version", "v1")
     classification_mode = classifier_config.get("classification_mode", "regression")
-
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=hidden_dims,
-        dropout=dropout,
-        use_genre=use_genre,
-        use_batch_norm=use_batch_norm,
-        use_residual=use_residual,
-    )
-    classifier.load_state_dict(state_dict)
 
     # Genre dict for train+val (from current embeddings + centroids)
     genre_dict = {}
@@ -3361,17 +3791,13 @@ def train_joint_finetune(
                     verbose=True,
                     prod_test_dataset=prod_test_dataset,
                 )
-                manifest.set_metadata("ab_test_result", {
-                    "n_samples": int(ab_result.get("n_samples", 0)),
-                    "new_accuracy": float(ab_result.get("new_accuracy", 0)),
-                    "prod_accuracy": float(ab_result.get("prod_accuracy", 0)),
-                    "improvement": float(ab_result.get("improvement", 0)),
-                    "p_value": float(ab_result.get("p_value", 1.0)),
-                    "significant": bool(ab_result.get("significant", False)),
-                })
-                manifest.save()
+                if ab_result.get("error") and verbose:
+                    print(f"  Skipping A/B test: {ab_result.get('error')}")
+                _persist_ab_test_to_manifest(manifest, ab_result)
             else:
                 print(f"  Skipping A/B test: only {len(test_dataset_new)} samples in vault (need >= 10)")
+                manifest.metadata.pop("ab_test_result", None)
+                manifest.save()
         else:
             print("  Skipping A/B test: could not load vault embeddings")
     elif verbose and len(vault_files) == 0:
@@ -3389,7 +3815,9 @@ def generate_recommendations(
     prod_dir: str = None,
     low_rating_ratio: float = 0.0,
     genre_filter: str = None,
-    error_playlist_size: int = None
+    error_playlist_size: int = None,
+    select_distant: bool = False,
+    select_distant_pool_factor: float = 5.0,
 ):
     """Generate recommendations for unrated songs.
 
@@ -3441,12 +3869,30 @@ def generate_recommendations(
     encoder_checkpoint = model_dir / "encoder_best.pt"
     classifier_checkpoint = model_dir / "classifier_best.pt"
 
-    if encoder_checkpoint.exists() and classifier_checkpoint.exists():
+    if classifier_checkpoint.exists():
         print("\n[0/5] Validating model compatibility...")
-        validate_model_compatibility(
-            str(encoder_checkpoint),
-            str(classifier_checkpoint)
-        )
+        embedding_version = music_config.get('encoder_version', music_config.get('model_version', 'v1'))
+        _cls_ver, classifier_encoder_version = get_classifier_versions_from_checkpoint(str(classifier_checkpoint))
+        if classifier_encoder_version != embedding_version:
+            raise ValueError(
+                f"\n{'='*60}\n"
+                f"MODEL VERSION MISMATCH - DEPLOYMENT BLOCKED\n"
+                f"{'='*60}\n"
+                f"Classifier trained with encoder version: {classifier_encoder_version}\n"
+                f"Config embedding version (for recommendations): {embedding_version}\n"
+                f"Classifier version: {_cls_ver}\n"
+                f"\n"
+                f"Set music.encoder_version in config to {classifier_encoder_version!r} or retrain the classifier.\n"
+                f"{'='*60}"
+            )
+        # For prod recommend we use classifier + embeddings only; encoder checkpoint is for A/B etc.
+        if encoder_checkpoint.exists() and not prod_dir:
+            validate_model_compatibility(
+                str(encoder_checkpoint),
+                str(classifier_checkpoint)
+            )
+        else:
+            print(f"  Classifier version: {_cls_ver}, trained with encoder: {classifier_encoder_version} ✓")
     else:
         if not encoder_checkpoint.exists():
             print(f"\n  WARNING: Encoder checkpoint not found: {encoder_checkpoint}")
@@ -3490,21 +3936,27 @@ def generate_recommendations(
     embedding_store = EmbeddingStore(str(embeddings_db_path))
 
     filenames = [s.filename for s in unrated_songs]
-    # Use encoder_version for embedding lookup (with fallback to model_version for backwards compatibility)
+    # Prefer all num_chunks per song so classifier uses every chunk (same as training)
     encoder_version = music_config.get('encoder_version', music_config.get('model_version', 'v1'))
-    num_chunks = music_config.get('chunk_cache', {}).get('num_chunks', 8)
+    num_chunks_config = music_config.get('chunk_cache', {}).get('num_chunks', 8)
     embeddings_dict = embedding_store.get_embeddings_batch_all_chunks(
         filenames,
         model_version=encoder_version,
-        num_chunks=num_chunks
+        num_chunks=num_chunks_config
     )
+    used_all_chunks_rec = bool(embeddings_dict)
     if not embeddings_dict:
         embeddings_dict = embedding_store.get_embeddings_batch(
             filenames,
             model_version=encoder_version
         )
-
+        print("  Fallback: using single vector per song (embedding_chunks not populated for this version)")
     print(f"  Loaded {len(embeddings_dict)} embeddings")
+    if used_all_chunks_rec and embeddings_dict:
+        _first = np.asarray(next(iter(embeddings_dict.values())))
+        _c = _first.shape[0] if _first.ndim == 2 else 1
+        if _c > 1:
+            print(f"  Using all {_c} chunks per song for predictions")
 
     if len(embeddings_dict) == 0:
         print("  No embeddings found! Run encoder training first.")
@@ -3574,20 +4026,13 @@ def generate_recommendations(
                     hidden_dims.append(out_features)
                 layer_idx += 3
 
-    dropout = config['classifier'].get('dropout', 0.3)  # Dropout doesn't affect loading
-    use_batch_norm_ck = checkpoint.get('use_batch_norm', False)
-    use_residual_ck = checkpoint.get('use_residual', False)
-    print(f"  Inferred architecture from checkpoint: hidden_dims={hidden_dims}, use_genre={use_genre_ck}")
+    dropout = config['classifier'].get('dropout', 0.3)
+    arch_ck = dict(checkpoint)
+    if arch_ck.get("hidden_dims") is None:
+        arch_ck["hidden_dims"] = hidden_dims
+    print(f"  Inferred architecture from checkpoint: hidden_dims={arch_ck['hidden_dims']}, use_genre={use_genre_ck}")
 
-    classifier = SimpleRatingClassifier(
-        embedding_dim=embedding_dim,
-        hidden_dims=hidden_dims,
-        dropout=dropout,
-        use_genre=use_genre_ck,
-        use_batch_norm=use_batch_norm_ck,
-        use_residual=use_residual_ck,
-    )
-
+    classifier = _create_rating_classifier(embedding_dim, config['classifier'], checkpoint=arch_ck)
     classifier.load_state_dict(state_dict)
     classifier = classifier.to(device)
 
@@ -3647,13 +4092,92 @@ def generate_recommendations(
     # Get top-N with optional low-rating ratio
     top_n = rec_config.get('top_n', 100)
 
+    def _aggregate_song_embedding_for_distance(emb: np.ndarray) -> np.ndarray:
+        """Reduce stored embedding array to one vector for diversity selection."""
+        x = np.asarray(emb)
+        if x.ndim == 1:
+            return x.astype(np.float32, copy=False)
+        if x.ndim == 2:
+            if chunk_aggregation == "max":
+                return x.max(axis=0).astype(np.float32, copy=False)
+            return x.mean(axis=0).astype(np.float32, copy=False)
+        return x.reshape(-1).astype(np.float32, copy=False)
+
+    def _select_diverse_by_cosine_maxmin(
+        candidates: list[tuple[float, str]],
+        k: int,
+        pool_factor: float,
+    ) -> list[tuple[float, str]]:
+        """Greedy max-min diversity selection in cosine distance space."""
+        if k <= 0 or not candidates:
+            return []
+        if len(candidates) <= k:
+            return list(candidates)
+
+        k = int(k)
+        pool_size = int(np.ceil(k * float(pool_factor)))
+        pool_size = max(pool_size, k)
+        pool_size = min(pool_size, len(candidates))
+        pool = candidates[:pool_size]  # candidates are already sorted high->low
+
+        pool_items: list[tuple[float, str]] = []
+        vecs: list[np.ndarray] = []
+        for pred, filename in pool:
+            emb = embeddings_dict.get(filename)
+            if emb is None:
+                continue
+            v = _aggregate_song_embedding_for_distance(emb)
+            norm = float(np.linalg.norm(v))
+            if not np.isfinite(norm) or norm < 1e-12:
+                continue
+            vecs.append((v / norm).astype(np.float32, copy=False))
+            pool_items.append((pred, filename))
+
+        if len(pool_items) < k:
+            # Not enough valid vectors for the requested k: fall back to top-k by score.
+            return list(candidates[:k])
+        if len(pool_items) == k:
+            return list(pool_items)
+
+        V = np.vstack(vecs)  # (N, D), normalized -> cosine sim = V @ V.T
+        dist = 1.0 - (V @ V.T)  # cosine distance
+
+        selected_idx: list[int] = [0]  # start from best-scoring candidate
+        remaining = np.arange(1, dist.shape[0], dtype=int)
+        min_dist = dist[remaining, selected_idx[0]].copy()
+
+        while len(selected_idx) < k and remaining.size > 0:
+            pick_pos = int(np.argmax(min_dist))
+            pick = int(remaining[pick_pos])
+            selected_idx.append(pick)
+
+            remaining = np.delete(remaining, pick_pos)
+            if remaining.size == 0:
+                break
+            min_dist = np.delete(min_dist, pick_pos)
+            d_new = dist[remaining, pick]
+            min_dist = np.minimum(min_dist, d_new)
+
+        selected = [pool_items[i] for i in selected_idx[:k]]
+        # Keep "best first" ordering in the output.
+        selected.sort(key=lambda x: x[0], reverse=True)
+        return selected
+
     if low_rating_ratio > 0.0:
         # Include some predicted "dislikes" for A/B testing balance
         n_low = int(top_n * low_rating_ratio)
         n_high = top_n - n_low
 
         # High-predicted songs (above threshold)
-        high_results = [(r, f) for r, f in results if r >= min_threshold][:n_high]
+        high_candidates = [(r, f) for r, f in results if r >= min_threshold]
+        if select_distant and n_high > 0:
+            high_results = _select_diverse_by_cosine_maxmin(
+                candidates=high_candidates,
+                k=n_high,
+                pool_factor=select_distant_pool_factor,
+            )
+        else:
+            high_results = high_candidates[:n_high]
 
         # Low-predicted songs (from the bottom, below threshold preferred)
         results_sorted_low = sorted(results, key=lambda x: x[0])  # Lowest first
@@ -3671,7 +4195,15 @@ def generate_recommendations(
         low_filenames = {f for _, f in low_results}
         results = final_results
     else:
-        results = [(r, f) for r, f in results if r >= min_threshold][:top_n]
+        high_candidates = [(r, f) for r, f in results if r >= min_threshold]
+        if select_distant:
+            results = _select_diverse_by_cosine_maxmin(
+                candidates=high_candidates,
+                k=top_n,
+                pool_factor=select_distant_pool_factor,
+            )
+        else:
+            results = high_candidates[:top_n]
         low_filenames = set()
 
     print(f"  Generated {len(results)} recommendations (top {top_n})")
@@ -3726,13 +4258,18 @@ def generate_recommendations(
     print("GENERATING HUMAN FEEDBACK PLAYLISTS")
     print("=" * 80)
 
-    # Prepare full list of songs and predictions for playlist generation
-    full_predictions = [r for r, _ in results]
-    full_songs = []
-    for _, filename in results:
-        song = next((s for s in unrated_songs if s.filename == filename), None)
-        if song:
-            full_songs.append(song)
+    # Full scored unrated pool (same order as classifier predict). Help/best XSPFs use
+    # this pool so recommender_help can be high-uncertainty globally while staying
+    # disjoint from recommender_best (best = top scores; help excludes those paths).
+    filename_to_unrated = {s.filename: s for s in unrated_songs}
+    feedback_songs: list = []
+    feedback_preds: list = []
+    for pred, fn in zip(predictions, pred_filenames):
+        song = filename_to_unrated.get(fn)
+        if song is not None:
+            feedback_songs.append(song)
+            feedback_preds.append(pred)
+    print(f"  Human-feedback pool: {len(feedback_songs)} scored unrated songs (embeddings present)")
 
     # Generate both uncertainty and best-predictions playlists
     top_n_uncertain = rec_config.get('human_feedback_uncertain', 100)
@@ -3740,8 +4277,8 @@ def generate_recommendations(
     playlist_output_dir = Path(rec_config.get('output_dir', './'))
 
     playlist_stats = generate_human_feedback_playlists(
-        songs=full_songs,
-        predictions=full_predictions,
+        songs=feedback_songs,
+        predictions=feedback_preds,
         output_dir=playlist_output_dir,
         top_n_uncertain=top_n_uncertain,
         top_n_best=top_n_best,
@@ -3870,8 +4407,8 @@ def generate_recommendations(
     print("=" * 80)
     print(f"\nGenerated files:")
     print(f"  - {output_path} (text recommendations)")
-    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_help.xspf'} (high uncertainty - maximize learning)")
-    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_best.xspf'} (top predictions - validate quality)")
+    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_help.xspf'} (most uncertain scored unrated; excludes tracks in recommender_best)")
+    print(f"  - {playlist_output_dir / f'{filename_prefix}recommender_best.xspf'} (top predicted scores among all scored unrated)")
     if effective_error_size > 0:
         print(f"  - {playlist_output_dir / f'{filename_prefix}false_positives.xspf'} (worst false positives - true dislike, predicted like)")
         print(f"  - {playlist_output_dir / f'{filename_prefix}false_negatives.xspf'} (worst false negatives - true like, predicted dislike)")
@@ -3916,6 +4453,7 @@ def build_waveform_cache(config: dict, overwrite: Optional[bool] = None):
         num_workers = chunk_cache_config.get('num_workers', None)  # None = 80% CPU
         sample_rate = music_config.get('sample_rate', 16000)
         max_duration = music_config.get('max_duration', 900.0)
+        use_16bit = chunk_cache_config.get('use_16bit', True)
 
         print(f"\n[2/3] MoCo Chunk Cache configuration:")
         print(f"  Cache dir: {cache_dir}")
@@ -3924,6 +4462,7 @@ def build_waveform_cache(config: dict, overwrite: Optional[bool] = None):
         print(f"  Sample rate: {sample_rate} Hz")
         print(f"  Max file duration: {max_duration}s")
         print(f"  Workers: {num_workers if num_workers else 'auto (80% CPU)'}")
+        print(f"  Format: {'int16 (2 bytes/sample)' if use_16bit else 'float32 (4 bytes/sample)'}")
 
         overwrite_val = overwrite if overwrite is not None else chunk_cache_config.get('overwrite', False)
         if overwrite_val:
@@ -3938,7 +4477,8 @@ def build_waveform_cache(config: dict, overwrite: Optional[bool] = None):
             max_duration=max_duration,
             num_workers=num_workers,
             overwrite=overwrite_val,
-            show_progress=True
+            show_progress=True,
+            use_16bit=use_16bit
         )
 
         # Show final stats
@@ -4372,7 +4912,7 @@ def main():
         '--stage',
         type=str,
         required=True,
-        choices=['encoder', 'classifier', 'joint-finetune', 'recommend', 'all', 'tune-encoder', 'tune-classifier', 'build-cache', 'clear-chunk-cache', 'fingerprint', 'enrich-metadata', 'backfill-fingerprint-bits', 'init-baseline', 'generate-model-card'],
+        choices=['encoder', 'classifier', 'joint-finetune', 'recommend', 'rag-query', 'all', 'tune-encoder', 'tune-classifier', 'build-cache', 'chunk-cache-stats', 'prune-chunk-cache', 'convert-cache-to-16bit', 'clear-chunk-cache', 'fingerprint', 'enrich-metadata', 'backfill-fingerprint-bits', 'init-baseline', 'generate-model-card', 'refresh-val-precision'],
         help='Training stage, recommendation generation, cache building, fingerprinting, metadata enrichment, or hyperparameter tuning'
     )
     parser.add_argument(
@@ -4405,6 +4945,14 @@ def main():
         action='store_true',
         dest='reset_study',
         help='Delete existing Optuna study from storage before running (fresh HPO run); only applies when optuna_storage is set'
+    )
+    parser.add_argument(
+        '--train-frac',
+        type=float,
+        default=None,
+        dest='train_frac',
+        metavar='FRAC',
+        help='Encoder HPO only: use this fraction of training data (e.g. 0.5 = 50%%); validation set stays full. Overrides tuning.hpo_train_fraction.'
     )
     parser.add_argument(
         '--final-training',
@@ -4501,6 +5049,46 @@ def main():
              'Useful for A/B testing to ensure negative labels and force careful listening.'
     )
     parser.add_argument(
+        '--select-distant',
+        action='store_true',
+        dest='select_distant',
+        help='Re-rank only the high-predicted songs to be far apart in embedding space (cosine max-min diversity).'
+    )
+    parser.add_argument(
+        '--select-distant-pool-factor',
+        type=float,
+        default=5.0,
+        dest='select_distant_pool_factor',
+        help='Candidate pool multiplier for --select-distant (pool_size ~= high_count * factor, capped by available high candidates).'
+    )
+    parser.add_argument(
+        '--rag-num-pc',
+        type=int,
+        default=5,
+        dest='rag_num_pc',
+        help='rag-query: number of PCA directions for tie-break (max ≤ embedding dim; capped by playlist size).'
+    )
+    parser.add_argument(
+        '--rag-top-n',
+        type=int,
+        default=50,
+        dest='rag_top_n',
+        help='rag-query: how many similar songs to write (excluding playlist tracks).'
+    )
+    parser.add_argument(
+        '--rag-unrated-only',
+        action='store_true',
+        dest='rag_unrated_only',
+        help='rag-query: only consider unrated library songs as candidates.'
+    )
+    parser.add_argument(
+        '--rag-likes-only',
+        action='store_true',
+        dest='rag_likes_only',
+        help='rag-query: candidate pool = rated songs with training-positive label (classifier.binary_positive_threshold) '
+             'OR unrated with prediction>0.5 (top max(100, rag-top-n×20) by score, then cosine rank). Needs prod classifier.',
+    )
+    parser.add_argument(
         '--genre',
         type=str,
         default=None,
@@ -4536,8 +5124,29 @@ def main():
         dest='overwrite_cache',
         help='With build-cache: overwrite existing chunk files (use when changing num_chunks).'
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        dest='dry_run',
+        help='With prune-chunk-cache: only report what would be deleted, do not remove files.'
+    )
+    parser.add_argument(
+        'rag_playlist',
+        nargs='?',
+        default=None,
+        metavar='PLAYLIST.xspf',
+        help='--stage rag-query only: input XSPF path.',
+    )
 
     args = parser.parse_args()
+
+    if args.stage != 'rag-query' and args.rag_playlist:
+        parser.error(f"Unexpected argument {args.rag_playlist!r} (PLAYLIST.xspf is only for --stage rag-query)")
+
+    if args.stage == 'rag-query' and '--prod' in sys.argv:
+        parser.error(
+            "--prod is not used with --stage rag-query (use ./run_music_pipeline.sh rag-query PLAYLIST.xspf; embeddings are from prod/)"
+        )
 
     # Handle backwards compatibility for --model-version
     if args.model_version and not args.encoder_version:
@@ -4627,6 +5236,11 @@ def main():
         )
         cleanup_memory()
         print("\nNext step: Run with --stage classifier to train the rating predictor")
+        print("  Or run full HPO from classifier onward: ./run_music_pipeline.sh hpo --from-step 3")
+
+    elif args.stage == 'refresh-val-precision':
+        refresh_val_precision_manifest(config)
+        cleanup_memory()
 
     elif args.stage == 'classifier':
         # Use same seed as winning HPO run: from MLflow (best_training_seed), JSON (best_reps_seed), or config (init_seed)
@@ -4665,7 +5279,25 @@ def main():
             prod_dir=args.prod_dir,
             low_rating_ratio=args.low_rating_ratio,
             genre_filter=args.genre,
-            error_playlist_size=args.error_playlist_size
+            error_playlist_size=args.error_playlist_size,
+            select_distant=getattr(args, "select_distant", False),
+            select_distant_pool_factor=getattr(args, "select_distant_pool_factor", 5.0),
+        )
+        cleanup_memory()
+
+    elif args.stage == 'rag-query':
+        from ml_skeleton.music.rag_query import run_rag_query
+
+        if not args.rag_playlist:
+            parser.error("--stage rag-query requires PLAYLIST.xspf (path to input .xspf)")
+        run_rag_query(
+            config=config,
+            xspf_path=args.rag_playlist,
+            num_pc=args.rag_num_pc,
+            top_n=args.rag_top_n,
+            unrated_only=args.rag_unrated_only,
+            likes_only=args.rag_likes_only,
+            prod_dir=args.prod_dir or "prod",
         )
         cleanup_memory()
 
@@ -4681,6 +5313,114 @@ def main():
         build_waveform_cache(config, overwrite=args.overwrite_cache)
         cleanup_memory()
         print("\nCache build complete! Training will now have consistent speed.")
+
+    elif args.stage == 'chunk-cache-stats':
+        # Distribution of chunks stored in cache per song (from scanning cache files only)
+        from ml_skeleton.music.chunk_cache import chunks_per_song_distribution, get_cache_stats
+
+        cache_dir = os.path.abspath(os.environ.get('CHUNK_CACHE_DIR') or get_chunk_cache_dir(config))
+        print("\n" + "=" * 60)
+        print("CHUNK CACHE: CHUNKS STORED PER SONG")
+        print("=" * 60)
+        print(f"  Cache dir: {cache_dir}")
+        dist = chunks_per_song_distribution(cache_dir)
+        if not dist:
+            print("  No cache found or empty.")
+        else:
+            total_songs = sum(dist.values())
+            total_chunks = sum(k * v for k, v in dist.items())
+            print(f"  Total songs: {total_songs}")
+            print(f"  Total chunk files: {total_chunks}")
+            print("\n  Frequency count (chunks stored in cache per song, from cache scan):")
+            print("    chunks  count")
+            for num_chunks, count in sorted(dist.items()):
+                print(f"    {num_chunks:>6}  {count}")
+            print("")
+        stats = get_cache_stats(cache_dir)
+        if stats.get("exists"):
+            print(f"  Cache size: {stats['size_gb']:.1f} GB, files: {stats['num_files']}")
+
+    elif args.stage == 'prune-chunk-cache':
+        # Delete chunks with index >= N per song (N = effective chunks from duration) to save space
+        from ml_skeleton.music.chunk_cache import prune_cache_by_duration, get_cache_stats
+
+        cache_dir = os.path.abspath(os.environ.get('CHUNK_CACHE_DIR') or get_chunk_cache_dir(config))
+        music_config = config.get('music', {})
+        chunk_config = music_config.get('chunk_cache', {})
+        num_chunks = chunk_config.get('num_chunks', 8)
+        chunk_duration = chunk_config.get('chunk_duration', 30.0)
+        db_path = os.getenv('CLEMENTINE_DB_PATH') or music_config.get('database_path') or music_config.get('clementine_db_path')
+        dry_run = getattr(args, 'dry_run', False)
+
+        print("\n" + "=" * 60)
+        print("PRUNE CHUNK CACHE (remove redundant chunks for short songs)")
+        print("=" * 60)
+        print(f"  Cache dir: {cache_dir}")
+        print(f"  Keeps chunks 0..N-1 per song, N = min({num_chunks}, floor(duration/{chunk_duration:.0f}s))")
+        if dry_run:
+            print("  DRY RUN: no files will be deleted")
+        if not db_path or not Path(db_path).exists():
+            print("  ERROR: Need Clementine DB (CLEMENTINE_DB_PATH or music.database_path). Skipping.")
+        else:
+            from ml_skeleton.music.clementine_db import ClementineDB
+            clementine_db = ClementineDB(db_path)
+            all_songs = clementine_db.get_all_songs()
+            song_id_to_duration = {s.rowid: s.duration_seconds for s in all_songs}
+            result = prune_cache_by_duration(
+                cache_dir=cache_dir,
+                song_id_to_duration_seconds=song_id_to_duration,
+                num_chunks=num_chunks,
+                chunk_duration=chunk_duration,
+                dry_run=dry_run,
+            )
+            print(f"  Chunks deleted: {result['num_deleted']}")
+            print(f"  Songs trimmed: {result['num_songs_trimmed']}")
+            print(f"  Space freed: {result['bytes_freed'] / (1024**3):.2f} GB")
+            if not dry_run and result['num_deleted']:
+                stats = get_cache_stats(cache_dir)
+                if stats.get("exists"):
+                    print(f"  Cache size after: {stats['size_gb']:.1f} GB, files: {stats['num_files']}")
+        print("")
+
+    elif args.stage == 'convert-cache-to-16bit':
+        # Convert existing float32 chunk .npy files to int16 in place (faster than clear + rebuild)
+        from ml_skeleton.music.chunk_cache import convert_cache_to_16bit, get_cache_stats
+
+        cache_dir = os.path.abspath(os.environ.get('CHUNK_CACHE_DIR') or get_chunk_cache_dir(config))
+        music_config = config.get('music', {})
+        chunk_config = music_config.get('chunk_cache', {})
+        if os.environ.get("CONVERT_CACHE_NUM_WORKERS") is not None:
+            try:
+                num_workers = int(os.environ["CONVERT_CACHE_NUM_WORKERS"])
+            except ValueError:
+                num_workers = chunk_config.get('num_workers', None)
+        else:
+            num_workers = chunk_config.get('num_workers', None)
+
+        max_files = None
+        if os.environ.get("CONVERT_CACHE_MAX_FILES"):
+            try:
+                max_files = int(os.environ["CONVERT_CACHE_MAX_FILES"])
+            except ValueError:
+                pass
+        print("\n" + "=" * 60)
+        print("CONVERT CHUNK CACHE TO 16-BIT")
+        print("=" * 60)
+        print(f"  Cache dir: {cache_dir}")
+        print("  Converts float32 .npy → int16 in place (skips already int16).")
+        if max_files:
+            print(f"  (Limiting to first {max_files} files for diagnostics.)")
+        print("")
+
+        result = convert_cache_to_16bit(
+            cache_dir=cache_dir,
+            num_workers=num_workers,
+            show_progress=True,
+            max_files=max_files,
+        )
+        stats = get_cache_stats(cache_dir)
+        if stats.get("exists"):
+            print(f"\n  Cache size after: {stats['size_gb']:.1f} GB ({stats['num_files']} files)")
 
     elif args.stage == 'clear-chunk-cache':
         # Remove only chunk cache directory; preserve fingerprint DB (same DB for encoder/classifier/fingerprint)
@@ -4783,59 +5523,100 @@ def main():
         print("HYPERPARAMETER TUNING: ENCODER")
         print("=" * 80)
 
+        # CLI override for HPO train fraction
+        if getattr(args, 'train_frac', None) is not None:
+            config.setdefault('tuning', {})['hpo_train_fraction'] = args.train_frac
+            print(f"  Train fraction (HPO): {args.train_frac} (from --train-frac)")
+
         # Create ExperimentConfig manually (our music config has custom structure)
         from ml_skeleton.core.config import TuningConfig, SearchSpaceConfig, MLflowConfig
 
         # Extract tuning config
         tuning_dict = config.get('tuning', {})
-        n_trials = args.n_trials if args.n_trials else tuning_dict.get('n_trials', 30)
+        # --n-trials 0: load existing study and save best params only (no new trials)
+        if args.n_trials is not None and args.n_trials == 0:
+            import optuna
+            study_name = f"{config.get('name', 'music_recommendation_encoder')}_optuna"
+            storage = tuning_dict.get('optuna_storage')
+            if not storage:
+                print("ERROR: --n-trials 0 requires tuning.optuna_storage in config (e.g. sqlite:///optuna_study.db)")
+                sys.exit(1)
+            try:
+                study = optuna.load_study(study_name=study_name, storage=storage)
+            except KeyError:
+                print(f"ERROR: No study '{study_name}' in storage {storage}. Run at least one HPO trial first.")
+                sys.exit(1)
+            n_completed = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+            if n_completed == 0:
+                print("ERROR: Study has no completed trials. Run at least one HPO trial first.")
+                sys.exit(1)
+            results = {
+                "best_params": study.best_params,
+                "best_value": study.best_value,
+                "mlflow_parent_run_id": None,
+            }
+            exp_config = ExperimentConfig(
+                name=config.get('name', 'music_recommendation_encoder'),
+                framework=config.get('framework', 'pytorch'),
+                hyperparameters=config['encoder'].copy(),
+                seed=config.get('seed', 42),
+                checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
+                artifact_dir=config.get('artifact_dir', './artifacts'),
+                tags=config.get('tags', {}),
+            )
+            if 'mlflow' in config:
+                from ml_skeleton.core.config import MLflowConfig
+                exp_config.mlflow = MLflowConfig(**config['mlflow'])
+            print(f"Loaded existing study '{study_name}' ({n_completed} completed trials). Saving best params only (no new trials).")
+        else:
+            n_trials = args.n_trials if args.n_trials else tuning_dict.get('n_trials', 30)
 
-        # Create experiment config
-        exp_config = ExperimentConfig(
-            name=config.get('name', 'music_recommendation_encoder'),
-            framework=config.get('framework', 'pytorch'),
-            hyperparameters=config['encoder'].copy(),
-            seed=config.get('seed', 42),
-            checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
-            artifact_dir=config.get('artifact_dir', './artifacts'),
-            tags=config.get('tags', {}),
-        )
-
-        # Configure MLflow
-        if 'mlflow' in config:
-            exp_config.mlflow = MLflowConfig(**config['mlflow'])
-
-        # Configure tuning (optuna_storage for persistence; reset_study for fresh HPO)
-        exp_config.tuning = TuningConfig(
-            tuner_type=TunerType.OPTUNA if args.tuner == 'optuna' else TunerType.RAY_TUNE,
-            n_trials=n_trials,
-            timeout=args.timeout,
-            sampler=tuning_dict.get('sampler', 'TPESampler'),
-            pruner=tuning_dict.get('pruner', 'MedianPruner'),
-            optuna_storage=tuning_dict.get('optuna_storage'),
-            reset_study=getattr(args, 'reset_study', False),
-        )
-
-        # Set encoder search space
-        if 'encoder_search_space' in tuning_dict:
-            exp_config.tuning.search_space = SearchSpaceConfig(
-                parameters=tuning_dict['encoder_search_space']['parameters']
+            # Create experiment config
+            exp_config = ExperimentConfig(
+                name=config.get('name', 'music_recommendation_encoder'),
+                framework=config.get('framework', 'pytorch'),
+                hyperparameters=config['encoder'].copy(),
+                seed=config.get('seed', 42),
+                checkpoint_dir=config.get('checkpoint_dir', './checkpoints'),
+                artifact_dir=config.get('artifact_dir', './artifacts'),
+                tags=config.get('tags', {}),
             )
 
-        tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
-        print(f"MLflow UI: {tracking_uri}")
-        print(f"Tuner: {args.tuner}")
-        print(f"Trials: {n_trials}")
-        if args.num_runs > 1:
-            print(f"Runs per trial: {args.num_runs} (min loss used as objective)")
-        print(f"Search space parameters: {list(exp_config.tuning.search_space.parameters.keys())}")
-        print("")
+            # Configure MLflow
+            if 'mlflow' in config:
+                exp_config.mlflow = MLflowConfig(**config['mlflow'])
 
-        # Create training function (pass n_trials for progress logging)
-        train_fn = create_encoder_training_fn(config, n_trials=n_trials, hpo_runs=args.num_runs)
+            # Configure tuning (optuna_storage for persistence; reset_study for fresh HPO)
+            exp_config.tuning = TuningConfig(
+                tuner_type=TunerType.OPTUNA if args.tuner == 'optuna' else TunerType.RAY_TUNE,
+                n_trials=n_trials,
+                timeout=args.timeout,
+                sampler=tuning_dict.get('sampler', 'TPESampler'),
+                pruner=tuning_dict.get('pruner', 'MedianPruner'),
+                optuna_storage=tuning_dict.get('optuna_storage'),
+                reset_study=getattr(args, 'reset_study', False),
+            )
 
-        # Run hyperparameter tuning
-        results = run_experiment(train_fn, exp_config, tune=True)
+            # Set encoder search space
+            if 'encoder_search_space' in tuning_dict:
+                exp_config.tuning.search_space = SearchSpaceConfig(
+                    parameters=tuning_dict['encoder_search_space']['parameters']
+                )
+
+            tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
+            print(f"MLflow UI: {tracking_uri}")
+            print(f"Tuner: {args.tuner}")
+            print(f"Trials: {n_trials}")
+            if args.num_runs > 1:
+                print(f"Runs per trial: {args.num_runs} (min loss used as objective)")
+            print(f"Search space parameters: {list(exp_config.tuning.search_space.parameters.keys())}")
+            print("")
+
+            # Create training function (pass n_trials for progress logging)
+            train_fn = create_encoder_training_fn(config, n_trials=n_trials, hpo_runs=args.num_runs)
+
+            # Run hyperparameter tuning
+            results = run_experiment(train_fn, exp_config, tune=True)
 
         print("\n" + "=" * 80)
         print("ENCODER TUNING COMPLETE")
@@ -4846,7 +5627,6 @@ def main():
             print(f"  {key}: {value}")
 
         # Save best parameters to file for automated pipeline
-        import json
         checkpoint_dir = Path(config.get('checkpoint_dir', './checkpoints'))
         best_params_file = checkpoint_dir / 'best_encoder_params.json'
         best_params_file.parent.mkdir(parents=True, exist_ok=True)
@@ -4977,7 +5757,6 @@ def main():
             print(f"  {key}: {value}")
 
         # Save best parameters, seed, and best trial number (so you can find the run in MLflow: parent -> trial N -> seed_*)
-        import json
         best_params_file = Path(config.get('checkpoint_dir', './checkpoints')) / 'best_classifier_params.json'
         best_params_file.parent.mkdir(parents=True, exist_ok=True)
         to_save = dict(results['best_params'])
@@ -5002,8 +5781,10 @@ def main():
             torch.save(checkpoint, checkpoint_path)
             print(f"  MLflow HPO parent run ID saved to checkpoint: {checkpoint_path}")
 
-        print("\nUpdate your config file with these parameters and run:")
-        print("  python examples/music_recommendation.py --stage classifier --config configs/music_recommendation.yaml --final-training")
+        print("\nNext steps — run final training with best parameters:")
+        print(f"  python examples/music_recommendation.py --stage classifier --config {args.config} --final-training --best-params {best_params_file}")
+        print("  ./run_music_pipeline.sh classifier --final-training --best-params checkpoints/best_classifier_params.json")
+        print("\nOr update your config file with the parameters above and run without --best-params.")
 
         if results.get('mlflow_parent_run_id'):
             tracking_uri = exp_config.mlflow.tracking_uri if exp_config.mlflow else "http://localhost:5000"
@@ -5225,7 +6006,6 @@ def main():
     elif args.stage == 'generate-model-card':
         # Generate production model card with A/B test results
         from datetime import datetime
-        import json
 
         print("\n" + "=" * 80)
         print("GENERATING PRODUCTION MODEL CARD")
@@ -5340,6 +6120,40 @@ def main():
 
         # Get vault size from manifest
         n_vault = len(manifest_data.get('vault_files', []))
+        md = manifest_data.get('metadata') or {}
+
+        # classifier_stats for A/B history table (PPV, Rec, P@5 from last classifier train)
+        classifier_stats_json = {
+            'train_size': n_train,
+            'val_size': n_val,
+            'vault_size': n_vault,
+            'train_prevalence': md.get('train_prevalence'),
+            'val_prevalence': md.get('val_prevalence'),
+            'val_ppv': md.get('val_ppv'),
+            'val_recall': md.get('val_recall'),
+            'val_precision_at_5': md.get('val_precision_at_5'),
+            'val_precision_at_20': md.get('val_precision_at_20'),
+            'val_roc_auc': md.get('val_roc_auc'),
+            'val_ppv_recall': md.get('val_ppv_recall'),
+            'val_loss': md.get('val_loss'),
+            'val_mae': md.get('val_mae'),
+            'epochs_run': md.get('epochs_run'),
+            'metadata': {'ab_test_result': ab_result},
+        }
+        ckpt_mc_path = checkpoint_dir / 'model_card.json'
+        if ckpt_mc_path.exists():
+            try:
+                with open(ckpt_mc_path) as f:
+                    ckpt_mc = json.load(f)
+                cs = ckpt_mc.get('classifier_stats') or {}
+                for k in (
+                    'val_ppv', 'val_recall', 'val_precision_at_5', 'val_precision_at_20', 'val_roc_auc',
+                    'val_ppv_recall', 'val_loss', 'val_mae', 'epochs_run',
+                ):
+                    if cs.get(k) is not None:
+                        classifier_stats_json[k] = cs[k]
+            except Exception:
+                pass
 
         # Also save as JSON for programmatic access
         model_card_json = {
@@ -5360,17 +6174,7 @@ def main():
                 'total': n_train + n_val,
             },
             'ab_test': ab_result,
-            # classifier_stats format for A/B history display compatibility
-            'classifier_stats': {
-                'train_size': n_train,
-                'val_size': n_val,
-                'vault_size': n_vault,
-                'train_prevalence': manifest_data.get('metadata', {}).get('train_prevalence'),
-                'val_prevalence': manifest_data.get('metadata', {}).get('val_prevalence'),
-                'metadata': {
-                    'ab_test_result': ab_result
-                }
-            }
+            'classifier_stats': classifier_stats_json,
         }
 
         model_card_json_path = prod_dir / "model_card.json"

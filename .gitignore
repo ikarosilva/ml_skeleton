@@ -145,6 +145,7 @@ data/
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 *~
@@ -166,5 +167,8 @@ temp/
 cache/
 *.db
 embeddings.db
+musicbrainz_metadata.db
 recommendations.txt
+# Genre / local recommendation dumps (often contain personal file:// paths)
+*_recommendations.txt
 recommender_*.xspf

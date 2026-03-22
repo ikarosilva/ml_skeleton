@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 import json
+import math
 
 
 class ModelCardGenerator:
@@ -358,6 +359,10 @@ Songs were excluded based on the following criteria:
             f"- **Final training loss (MSE):** {stats.get('final_train_loss', 'N/A'):.6f}",
             f"- **Final validation loss (MSE):** {stats.get('final_val_loss', 'N/A'):.6f}",
             f"- **Validation loss (saved checkpoint):** {stats.get('val_loss', stats.get('best_val_loss', 'N/A')):.6f} (epoch {stats.get('best_epoch', 'N/A')})",
+            f"- **Best val precision (PPV):** {stats.get('val_ppv', 'N/A') if stats.get('val_ppv') is not None else 'N/A'}",
+            f"- **Best val recall:** {stats.get('val_recall', 'N/A') if stats.get('val_recall') is not None else 'N/A'}",
+            f"- **Val precision@5:** {(_p5 := stats.get('val_precision_at_5')) is not None and not (isinstance(_p5, float) and math.isnan(_p5)) and f'{float(_p5):.4f}' or 'N/A (need ≥5 val samples)'}",
+            f"- **Val precision@20:** {(_p20 := stats.get('val_precision_at_20')) is not None and not (isinstance(_p20, float) and math.isnan(_p20)) and f'{float(_p20):.4f}' or 'N/A (need ≥20 val samples)'}",
             "",
             "### Training Data Statistics (Rated Songs Only)",
             "",
@@ -481,8 +486,8 @@ print(f"Predicted rating: {rating:.2f} / 5.0")
 python examples/music_recommendation.py --stage recommend --config configs/music_recommendation.yaml
 
 # Output: recommendations.txt (sorted by predicted rating)
-# Output: recommender_best.xspf (top predictions playlist)
-# Output: recommender_help.xspf (uncertain predictions for labeling)
+# Output: recommender_best.xspf (top predicted scores among all scored unrated)
+# Output: recommender_help.xspf (most uncertain among scored unrated, excludes best playlist paths)
 ```
 """
 

@@ -1,8 +1,8 @@
 # MoCo v2 + Genre BCE Music Encoder Configuration
 #
 # Architecture:
-#   Audio → 16kHz .npy cache (4 chunks/song) → nnAudio CQT → ResNet-50 2D → 2048-dim
-#   ├── MoCo v2 contrastive head (queue=4096, τ=0.07)
+#   Audio → 16kHz .npy cache (num_chunks/song, default 8) → nnAudio CQT → ResNet-50 2D → 4096-dim
+#   ├── MoCo v2 contrastive head (queue=4096, projection 1024-dim, τ=0.07)
 #   └── Genre BCE head (7 categories)
 #
 # Training:
@@ -15,48 +15,101 @@ framework: "pytorch"
 
 tags:
   project: "music_recommendation"
-  version: "2.0"
+  version: "v0"
   encoder: "moco_v2"
 
 # Music-specific configuration (matches existing script expectations)
 music:
+  # Root for all cache stores (fingerprints DB, chunk cache). Use one root so everything lives under it.
+  cache_root: "/music-cache"   # or "/data/cache" / "./cache" for local
+
   # Clementine database path
-  database_path: "/Music/database/clementine_backup_2026-01.db"
+  database_path: "/Music/database/clementine_backup_2026-03.db"
 
   # Embedding storage (SQLite)
   embedding_db_path: "./embeddings.db"
 
-  # Model versioning
+  # Model versioning (encoder_version = which embeddings the classifier uses; use "v1" for MoCo after training)
   encoder_version: "v1"
   classifier_version: "v1"
 
   # Audio loading parameters
   sample_rate: 16000
-  audio_duration: 30.0  # 30s chunks (4 per song)
+  audio_duration: 30.0  # 30s chunks (num_chunks per song, default 8)
   crop_position: "center"  # Not used for MoCo (chunks are evenly spaced)
   normalize: true
   max_duration: 900.0  # Skip files >15 minutes
 
-  # Chunk cache configuration (NEW: 4 chunks per song)
+  # Chunk cache configuration (NEW: 4 chunks per song). Path under cache_root when relative.
   chunk_cache:
     enabled: true
-    directory: "./cache/chunks"
-    num_chunks: 4
+    directory: "./chunks"  # Relative to music.cache_root; e.g. ./cache/chunks
+    num_chunks: 8   # 8 chunks for ~4.7 min avg length (finer section coverage, better far-apart pairs)
     chunk_duration: 30.0
-    num_workers: 4  # Reduced for lower CPU usage
+    min_chunks_for_training: 3   # Exclude songs with 1–2 chunks from encoder/HPO (MoCo benefits from multiple chunks)
+    num_workers: 10
+    use_16bit: true   # Store chunks as int16 (half size); load path supports both int16 and float32. Set false to keep float32.
+    max_cache_gb: 75   # LRU budget per process (~headroom on 128GB host). Set lower for less RAM; Env CHUNK_CACHE_MAX_GB overrides.
 
   # Waveform caching (legacy, kept for compatibility)
-  waveform_cache_dir: "./cache/chunks"
+  waveform_cache_dir: "./chunks"  # Relative to music.cache_root
   waveform_cache_max_gb: 40
 
   # Multiprocessing
   num_workers: 4  # For cache building (keep moderate)
-  dataloader_workers: 8  # Increased for faster HPO training
+  dataloader_workers: 1  # Single worker gets full max_cache_gb; prefetches while main trains
 
   # Dataset filtering
   only_rated: false
   train_split: 0.8
   skip_unknown_metadata: true
+
+# Acoustic fingerprinting and metadata enrichment (disabled for encoder; optional for enrich stage)
+fingerprinting:
+  enabled: false  # Set true only if you run fingerprint/enrich stages; encoder does not use fingerprint data
+  # Single fingerprint DB under music.cache_root (e.g. ./cache/fingerprints.db)
+  fingerprint_db_path: "./fingerprints.db"  # Relative to music.cache_root
+  use_cached_chunks: true  # Use existing 30s chunk cache (must run build-cache first)
+  chunk_for_fingerprinting: 0  # One chromaprint per song (stored at this chunk index). Must match fingerprint stage. 0=first.
+  # NOTE: Use chunk 0 (first) for AcoustID matching - their database expects song beginnings
+
+  # Fingerprinting parameters
+  num_workers: 8  # Parallel workers for fingerprint extraction
+  skip_existing: true  # Skip songs that already have fingerprints
+  prioritize_missing_metadata: true  # Process songs with incomplete metadata first
+  max_songs: 500  # Max songs to process per run (for free tier: 500/day limit). Set null or very high to fingerprint all missing in one go (no API used here).
+  max_duration: null  # No limit (fingerprint all lengths). Set to e.g. 900 to skip tracks longer than 15 min.
+
+  # Duplicate detection (Phase 2 - not yet implemented)
+  deduplicate: false  # Enable duplicate detection via fingerprint similarity
+  similarity_threshold: 0.95  # Chromaprint similarity threshold for duplicates
+  duplicate_selection: "rated_recent"  # Keep most recent rated version
+  remove_non_canonical: true  # Remove duplicates from training datasets
+
+  # External metadata enrichment (AcoustID + MusicBrainz)
+  enable_external_lookup: true  # Enable external API lookups
+  acoustid_api_key: "${ACOUSTID_API_KEY}"  # Set via environment variable
+  acoustid_tier: "free"  # "free" (500/day) or "paid" ($10/year, unlimited)
+
+  # MusicBrainz database (separate from Clementine DB)
+  musicbrainz_db_path: "./musicbrainz_metadata.db"  # SQLite DB for enriched metadata
+
+  # Rate limits (free tier: 3 req/s AcoustID, 1 req/s MusicBrainz)
+  acoustid_rate_limit: 3.0  # Requests per second for AcoustID API
+  musicbrainz_rate_limit: 1.0  # Requests per second for MusicBrainz API
+
+  # Metadata source configuration
+  metadata_source: "both"  # "clementine", "musicbrainz", or "both"
+  prefer_musicbrainz_if_confidence_above: 0.90  # Override Clementine if MB confidence > 0.90
+  # NOTE: Based on corrected confidence calculation (Hot Rocks test average: 0.988)
+  # Typical AcoustID scores: High matches 0.95-0.99, Medium 0.70-0.95, Low 0.50-0.70
+
+  # Genre taxonomy
+  genre_system: "7categories"  # "7categories" (existing) or "30genres" (new MB-based)
+  genre_mapping_7to30: true  # Provide backward compatibility mapping
+
+  # Loss weighting (Phase 4 - not yet implemented)
+  weight_loss_by_confidence: false  # Downweight low-confidence metadata in training
 
 # CQT transform configuration (nnAudio)
 cqt:
@@ -64,36 +117,45 @@ cqt:
   fmin: 32.7          # C1
   hop_length: 512
 
-# Stage 1: MoCo v2 + Genre BCE Encoder
+# Stage 1: MoCo v2 Encoder (contrastive only; no genre/fingerprint loss)
 encoder:
-  encoder_type: "moco"  # Changed from "simsiam" to "moco"
+  encoder_type: "moco"  # "moco" | "fingerprint_baseline" (ablation; chromaprint-only, not used by default)
+
+  # Fingerprint-baseline (when encoder_type: fingerprint_baseline): chromaprints as "embeddings"
+  # Run fingerprint stage first. Then run encoder stage to extract; then train classifier with encoder_version: "fingerprint_baseline"
+  fingerprint_baseline:
+    encoder_version: "fingerprint_baseline"
+    project_dim: 4096  # Match main encoder dim so classifier input unchanged; omit for 256-dim
 
   # Backbone
   backbone: "resnet50"
   pretrained_backbone: true
-  embedding_dim: 2048
+  embedding_dim: 4096
 
   # MoCo v2 settings
   moco:
     queue_size: 4096
     momentum: 0.999
     temperature: 0.07
-    projection_dim: 128
+    projection_dim: 1024
 
   # Genre head
   genre:
     num_categories: 7
     # Categories: rock, pop, electronic, hiphop, jazz_classical, country, latin_world
 
-  # Loss weights
+  # Loss weights (genre_bce=0: no genre loss; use only MoCo contrastive + optional chromaprint)
   loss_weights:
-    moco: 0.6
-    genre_bce: 0.4
+    moco: 1.0
+    genre_bce: 0.0
+
+  # Chromaprint regularization: disabled (no fingerprint/chromaprint data in encoder loss)
+  chromaprint_loss_weight: 0
 
   # Training
   epochs: 25  # Balanced for HPO trials (use final_training_epochs for full training)
-  final_training_epochs: 70  # Full training after HPO finds best params
-  batch_size: 96  # Larger batch for faster HPO (32GB RTX 5090 can handle it)
+  final_training_epochs: 200  # Full training after HPO finds best params
+  batch_size: 64  # Use 64–96 for full training
   learning_rate: 0.0003
 
   # Optimizer
@@ -122,7 +184,9 @@ encoder:
     noise_snr_max: 30.0  # Decreased from 35.0
     mixup_prob: 0.6    # Increased from 0.5
     mixup_alpha: 0.2   # Increased from 0.1 (stronger mixup)
-    same_album_positive_prob: 0.3
+    same_album_positive_prob: 0.0   # 0 = disabled (many albums missing in metadata)
+    far_chunk_prob: 0.35             # 20–50%: force key chunk far from query (verse vs chorus)
+    min_chunk_distance: 4           # min |key_idx - query_idx| when far_chunk_prob (e.g. 4 for 8 chunks = first vs second half)
 
   # Legacy settings (kept for compatibility)
   base_channels: 32
@@ -133,28 +197,101 @@ encoder:
 
 # Stage 2: Classifier training
 classifier:
+  # Best from fingerprint-baseline classifier HPO (val_roc_auc objective 0.372485, best init seed 2042)
   hidden_dims: [512, 256, 128]
-  dropout: 0.3
-  use_batch_norm: false
+  dropout: 0.4123206532618726
+  use_batch_norm: true
+  use_residual: true
 
-  epochs: 100
-  final_training_epochs: 200
-  batch_size: 128 #TODO
-  learning_rate: 0.001
+  # Genre as input (7-dim multi-hot; missing imputed from embedding centroids)
+  use_genre: false
+  genre_impute_top_k: 2
+  genre_impute_min_votes: 1
+
+  epochs: 200
+  final_training_epochs: 200   # Full training after HPO
+  batch_size: 64   # smaller batches can help with collapse / gradient noise
+  # When training on fingerprint_baseline (chromaprint) embeddings only; omit to use batch_size / epochs above
+  fingerprint_baseline_batch_size: 64
+  fingerprint_baseline_epochs: 200
+  fingerprint_baseline_final_training_epochs: 400
+  learning_rate: 0.0008403604888695196
 
   optimizer: "adam"
   scheduler: "cosine"
-  adam_weight_decay: 0.0001
-  adam_betas: [0.9, 0.999]
-  adam_eps: 1.0e-08
+  adam_weight_decay: 3.905441275210791e-05
+  adam_beta1: 0.562463923382663
+  adam_beta2: 0.617366175755764
+  adam_eps: 4.7129737561107815e-07
+  adam_amsgrad: true   # Fixed true (associated with non-collapsed runs)
+  adam_decoupled_weight_decay: true   # Fixed true (AdamW-style; only in OK runs in collapse analysis)
 
   early_stopping_patience: 10
   early_stopping_min_delta: 0.0001
 
-  loss_type: "mse"
+  # Classification mode: "regression" (0-1 continuous) or "binary" (like/dislike)
+  classification_mode: "binary"
+
+  # Binary classification: 0 = rating < 4, 1 = rating >= 4 (no middle band; plain BCE)
+  binary_positive_threshold: 4   # Rating >= 4 → label 1
+  binary_negative_threshold: 3   # Rating <= 3 → label 0
+  binary_include_middle: false   # No middle; all songs are 0 or 1
+  binary_middle_loss_weight: 0.05  # Unused when include_middle false
+  binary_use_pos_weight: false   # Fixed false to reduce recall=1 collapse (predict-all-positive)
+  binary_pos_weight: null       # If set, use this for BCE; else use binary_use_pos_weight (computed or 1.0)
+
+  loss_type: "mse"  # Used for regression mode; binary uses BCE
 
   # Rating normalization: 0-5 → 0-1
   rating_scale: 5.0
+
+  # Class weighting: fixed "none" to reduce collapse (inverse/sqrt_inverse associated with recall=1)
+  class_weight_strategy: "none"
+
+  # Chunk aggregation: fixed "mean" (max was strongly associated with recall=1 collapse)
+  chunk_aggregation: "mean"
+
+  # Classifier architecture: "mlp" (default) or "attention" (attention over chunks)
+  classifier_type: "attention"
+  # Attention classifier only (when classifier_type: "attention"):
+  attention_d_model: 512
+  attention_num_heads: 4
+  attention_max_chunks: 16
+  attention_use_pos_encoding: true
+
+  # HPO objective: val_loss, val_mae, val_f1, val_roc_auc, val_ppv (PPV only), val_ppv_recall (composite)
+  # val_ppv_recall = PPV * w_ppv + recall * w_recall (default 0.75/0.25 so PPV 3x recall)
+  hpo_metric: "val_ppv_recall"
+  hpo_metric_ppv_weight: 0.75
+  hpo_metric_recall_weight: 0.25
+
+  # Gradient clipping: fixed true (clip_grad=false was strongly associated with collapse); norm tuned by HPO
+  clip_grad: true
+  clip_grad_norm: 0.75
+
+  # Debug: replace embeddings with N(0,1) noise (labels unchanged). If recall==1 with noise, collapse is from training/loss.
+  replace_embeddings_with_noise: false
+
+  # Training label noise (label smoothing): soften 0/1 to reduce loss bias toward positives. 0 = none; 10 = 10%.
+  training_label_noise: 10
+
+  # Fingerprint baseline: add Gaussian noise (variance 0.1) to binary 0/1, then z-score normalize.
+  fingerprint_noise_variance: 100
+  normalize_fingerprint_embeddings: true
+
+  # Model init/training seed (HPO can suggest; train/val split always uses top-level seed). Best from HPO: 1042 (roc_auc 0.6686)
+  init_seed: 1042
+
+# Joint fine-tune (optional): unfreeze encoder + classifier, train on audio → rating
+# Run after classifier to push accuracy further. Requires encoder_type: moco.
+joint_finetune:
+  enabled: true
+  epochs: 5
+  encoder_lr: 1.0e-5    # Lower LR for encoder to avoid forgetting
+  classifier_lr: 1.0e-4
+  batch_size: 32
+  early_stopping_patience: 3
+  early_stopping_min_delta: 0.0
 
 # MLflow configuration
 mlflow:
@@ -167,11 +304,18 @@ mlflow:
 # Hyperparameter tuning
 tuning:
   tuner_type: "optuna"
-  n_trials: 100
+  n_trials: 800
+  reps: 1  # Classifier HPO: repetitions per trial with different init seeds; best (min) value and seed reported
   timeout: null
   sampler: "TPESampler"
   pruner: "MedianPruner"
   optuna_storage: "sqlite:///optuna_study.db"  # Persistent storage for resumable HPO
+
+  # Use subset of training data for encoder HPO (faster trials); final training always uses full data
+  hpo_train_fraction: 0.5  # 1.0 = full data; 0.5 = 50% for HPO only
+
+  # Encoder HPO only: use 4 chunks per song (maximally spread from 8) so training fits in RAM
+  hpo_num_chunks: 4  # 4 from 8 -> indices [0, 2, 4, 6]; full training still uses 8
 
   # Search space for encoder
   encoder_search_space:
@@ -197,13 +341,6 @@ tuning:
         low: 0.99
         high: 0.9999
 
-      # Loss weights for MoCo + Genre BCE
-      loss_weights_moco:
-        type: "float"
-        low: 0.4
-        high: 0.8
-        step: 0.05
-
       # Augmentation strength
       gain_db_max:
         type: "float"
@@ -221,23 +358,30 @@ tuning:
         high: 0.4
         step: 0.05
 
-  # Search space for classifier
+  # Search space for classifier (chunk_aggregation=mean, clip_grad=true, class_weight_strategy=none,
+  # binary_use_pos_weight=false, adam_amsgrad/decoupled=true fixed to reduce recall=1 collapse)
   classifier_search_space:
     parameters:
       learning_rate:
         type: "loguniform"
         low: 0.0005
-        high: 0.01
+        high: 0.002
       batch_size:
         type: "categorical"
-        choices: [128,]
+        choices: [64,]
+      # Lower bound 0.01 to reduce collapse (very low dropout was associated with recall=1)
       dropout:
         type: "loguniform"
-        low: 0.0001
-        high: 0.1
+        low: 0.01
+        high: 0.5
       hidden_dims:
         type: "categorical"
-        choices: [[1024, 512, 256, 128],]
+        choices: [[1024, 512, 256, 128], [512, 256, 128], [256, 128]]
+
+      # Weight for middle-rated (2 < x < 4) penalty toward 0.5 (only when binary_include_middle: true)
+      binary_middle_loss_weight:
+        type: "categorical"
+        choices: [0, 0.05, 0.1, 0.2]
 
       # Adam optimizer parameters (all tunable)
       adam_beta1:
@@ -256,12 +400,15 @@ tuning:
         type: "loguniform"
         low: 1.0e-07
         high: 1.0e-01
-      adam_amsgrad:
-        type: "categorical"
-        choices: [false, true]
-      adam_decoupled_weight_decay:
-        type: "categorical"
-        choices: [false, true]
+
+      # clip_grad fixed true; tune gradient clip norm (0.25–2.0)
+      clip_grad_norm:
+        type: "float"
+        low: 0.25
+        high: 2.0
+        step: 0.25
+
+      # init_seed removed from search space; use --reps N to run N inits per trial (best by hpo_metric)
 
 # Reproducibility
 seed: 42
@@ -282,6 +429,7 @@ recommendations:
   output_format: "xspf"
   output_path: "./recommendations.txt"
   output_dir: "/Music/recommendations"
-  min_rating_threshold: 0.6
+  min_rating_threshold: 0.0
   human_feedback_uncertain: 100
   human_feedback_best: 50
+  error_playlist_size: 100  # Max songs per false_positives / false_negatives playlist

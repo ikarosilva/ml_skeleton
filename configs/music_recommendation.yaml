@@ -40,7 +40,7 @@ music:
 
   # Clementine database path
   # IMPORTANT: Update this path to match your Clementine database location
-  database_path: "/Music/database/clementine_backup_2026-01.db"
+  database_path: "/Music/database/clementine_backup_2026-03.db"
 
   # Embedding storage (SQLite)
   embedding_db_path: "./embeddings.db"
@@ -102,6 +102,7 @@ music:
     directory: "./chunks"  # Relative to music.cache_root; use /music-cache/chunks for mounted volume
     num_chunks: 8  # Number of chunks per song (evenly spaced; match encoder/chunk_cache)
     chunk_duration: 30.0  # Duration of each chunk in seconds
+    use_16bit: true  # Store as int16 (half size); load supports int16 and float32
 
 # Acoustic fingerprinting and metadata enrichment
 fingerprinting:

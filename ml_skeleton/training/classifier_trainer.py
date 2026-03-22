@@ -122,6 +122,7 @@ class ClassifierTrainer:
         training_label_noise: float = 0.0,
         hpo_mlflow_run_id: Optional[str] = None,
         hpo_mlflow_run_name: Optional[str] = None,
+        binary_positive_threshold: float = 4.0,
     ):
         self.classifier = classifier.to(device)
         self.device = device
@@ -144,6 +145,8 @@ class ClassifierTrainer:
         self.classifier_version = classifier_version  # This classifier's version
         self.hpo_mlflow_run_id = hpo_mlflow_run_id  # HPO run params were loaded from (traceability)
         self.hpo_mlflow_run_name = hpo_mlflow_run_name  # HPO parent run display name
+        # P@5: top-5 by pred score; count as hit if true rating (1–5) >= this threshold
+        self._p5_pos_rating_norm = float(binary_positive_threshold) / 5.0
 
         # GPU monitoring (samples utilization during training)
         self.gpu_monitor = GPUMonitor() if device == "cuda" else None
@@ -157,6 +160,8 @@ class ClassifierTrainer:
         self.best_precision = 0.0
         self.best_roc_auc = 0.0
         self.roc_auc_at_best_checkpoint: Optional[float] = None  # ROC AUC of the saved best model (early stopping)
+        self.precision_at_5_at_best_checkpoint: Optional[float] = None
+        self.precision_at_20_at_best_checkpoint: Optional[float] = None
         self.best_epoch_saved: Optional[int] = None  # Epoch (1-based) when best checkpoint was saved
         self.best_correlation = 0.0
         self.history = {
@@ -168,6 +173,8 @@ class ClassifierTrainer:
             "val_recall": [],  # Binary only: recall per epoch
             "val_f1": [],  # Binary only: F1 per epoch
             "val_roc_auc": [],  # Binary only: ROC AUC (probs vs binary labels)
+            "val_precision_at_5": [],
+            "val_precision_at_20": [],
             "val_rating_mse": [],  # Binary: MSE(pred_prob, normalized 1-5 rating)
             "val_rating_corr": [],  # Binary: correlation(pred_prob, normalized 1-5 rating)
         }
@@ -211,22 +218,20 @@ class ClassifierTrainer:
             if genre is not None:
                 genre = genre.to(self.device)
 
-            # Forward pass (all chunks per song: (B, C, D) -> predict per chunk, average to one rating)
-            if embeddings.dim() == 3:
+            # Forward pass: (B, C, D) -> one rating per song (attention classifier) or per-chunk then aggregate
+            if embeddings.dim() == 3 and getattr(self.classifier, "handles_chunk_sequence", False):
+                predictions = self.classifier(embeddings, genre)
+            elif embeddings.dim() == 3:
                 B, C, D = embeddings.shape
                 emb_flat = embeddings.view(B * C, D)
                 if genre is not None:
-                    # One genre vector per song; repeat for each chunk
                     genre_flat = genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, genre.size(-1))
                     pred_chunks = self.classifier(emb_flat, genre_flat)
                 else:
                     pred_chunks = self.classifier(emb_flat)
                 predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
             else:
-                if genre is not None:
-                    predictions = self.classifier(embeddings, genre)
-                else:
-                    predictions = self.classifier(embeddings)
+                predictions = self.classifier(embeddings, genre) if genre is not None else self.classifier(embeddings)
 
             # Compute loss (predictions are already (batch_size,))
             if isinstance(self.loss_fn, BinaryRatingLoss) and "is_middle" in batch:
@@ -300,8 +305,10 @@ class ClassifierTrainer:
                 if genre is not None:
                     genre = genre.to(self.device)
 
-                # Forward pass (all chunks per song: (B, C, D) -> average predictions)
-                if embeddings.dim() == 3:
+                # Forward pass: (B, C, D) -> one rating per song (attention) or per-chunk then aggregate
+                if embeddings.dim() == 3 and getattr(self.classifier, "handles_chunk_sequence", False):
+                    predictions = self.classifier(embeddings, genre)
+                elif embeddings.dim() == 3:
                     B, C, D = embeddings.shape
                     emb_flat = embeddings.view(B * C, D)
                     if genre is not None:
@@ -311,10 +318,7 @@ class ClassifierTrainer:
                         pred_chunks = self.classifier(emb_flat)
                     predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
                 else:
-                    if genre is not None:
-                        predictions = self.classifier(embeddings, genre)
-                    else:
-                        predictions = self.classifier(embeddings)
+                    predictions = self.classifier(embeddings, genre) if genre is not None else self.classifier(embeddings)
 
                 # Compute loss (predictions are already (batch_size,))
                 # Use unweighted BCE for validation so val_loss does not reward collapse (predict-all-1)
@@ -378,28 +382,45 @@ class ClassifierTrainer:
             self.history["val_mae"].append(1.0 - accuracy)  # For compatibility, store error rate
             self.history["val_f1"].append(f1)
 
-            # ROC AUC: use only binary (0/1) labels, exclude middle-rated
+            # Precision@K: top-K by pred score; hit = true rating >= positive threshold (same as P@5).
+            precision_at_5 = float("nan")
+            precision_at_20 = float("nan")
+            n_pred = len(all_predictions)
+            if n_pred >= 5 and len(all_targets) == n_pred:
+                pa = np.asarray(all_predictions, dtype=np.float64)
+                thr = self._p5_pos_rating_norm
+                if len(all_rating_continuous) == n_pred:
+                    hit = np.asarray(all_rating_continuous, dtype=np.float64) >= thr - 1e-9
+                else:
+                    hit = np.asarray(all_targets, dtype=np.float64) > 0.75
+                order = np.argsort(pa)[::-1]
+                precision_at_5 = float(hit[order[:5]].astype(np.float64).sum() / 5.0)
+                if n_pred >= 20:
+                    precision_at_20 = float(hit[order[:20]].astype(np.float64).sum() / 20.0)
+
+            # ROC AUC: strict like/dislike only (exclude middle-rated)
             roc_auc = 0.5
             if all_predictions and all_targets:
                 pred_arr = np.array(all_predictions)
                 tgt_arr = np.array(all_targets)
-                # Exclude middle: keep only strict 0 and 1
                 binary_mask = (tgt_arr < 0.25) | (tgt_arr > 0.75)
                 if binary_mask.sum() > 0:
                     y_score = pred_arr[binary_mask]
-                    y_true = (tgt_arr[binary_mask] > 0.5).astype(np.float64)
-                    n_pos = int(y_true.sum())
-                    n_neg = len(y_true) - n_pos
+                    y_true_bin = (tgt_arr[binary_mask] > 0.5).astype(np.float64)
+                    n_pos = int(y_true_bin.sum())
+                    n_neg = len(y_true_bin) - n_pos
                     if n_pos > 0 and n_neg > 0:
                         order = np.argsort(y_score)[::-1]
-                        y_true = np.take(y_true, order)
-                        ranks = np.arange(1, len(y_true) + 1, dtype=np.float64)
+                        y_sorted = np.take(y_true_bin, order)
+                        ranks = np.arange(1, len(y_sorted) + 1, dtype=np.float64)
                         roc_auc = float(
-                            (np.sum(ranks * y_true) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
+                            (np.sum(ranks * y_sorted) - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg)
                         )
                     if roc_auc > self.best_roc_auc:
                         self.best_roc_auc = roc_auc
             self.history["val_roc_auc"].append(roc_auc)
+            self.history["val_precision_at_5"].append(precision_at_5)
+            self.history["val_precision_at_20"].append(precision_at_20)
 
             # Rating MSE/correlation: predicted prob vs original 1-5 (normalized)
             rating_mse = None
@@ -430,6 +451,8 @@ class ClassifierTrainer:
                 "recall": recall,
                 "f1": f1,
                 "roc_auc": roc_auc,
+                "precision_at_5": precision_at_5,
+                "precision_at_20": precision_at_20,
                 "mae": 1.0 - accuracy,  # Error rate for compatibility
                 "num_batches": num_batches
             }
@@ -510,6 +533,8 @@ class ClassifierTrainer:
         monitor_metric: Optional[str] = None,
         hpo_metric_corr_weight: float = 0.5,
         hpo_metric_f1_weight: float = 0.5,
+        hpo_metric_ppv_weight: float = 0.75,
+        hpo_metric_recall_weight: float = 0.25,
     ) -> dict:
         """Full training loop with optional early stopping.
 
@@ -522,11 +547,12 @@ class ClassifierTrainer:
             early_stopping_patience: Number of epochs to wait for improvement before stopping
                                      (None = no early stopping)
             early_stopping_min_delta: Minimum improvement to count as progress
-            monitor_metric: If 'val_rating_corr_and_f1', early stopping and best checkpoint
-                            use this composite (maximize) instead of val loss. Ensures the
-                            saved model matches the HPO objective.
+            monitor_metric: If 'val_rating_corr_and_f1', 'val_ppv', or 'val_ppv_recall', early
+                            stopping and best checkpoint use that metric (maximize) instead of val loss.
             hpo_metric_corr_weight: Weight for correlation in composite (when monitor_metric set).
             hpo_metric_f1_weight: Weight for F1 in composite (when monitor_metric set).
+            hpo_metric_ppv_weight: Weight for PPV in val_ppv_recall (default 0.75).
+            hpo_metric_recall_weight: Weight for recall in val_ppv_recall (default 0.25).
 
         Returns:
             Dictionary with training history
@@ -552,7 +578,24 @@ class ClassifierTrainer:
             and early_stopping_patience is not None
             and val_loader is not None
         )
-        use_max_metric = use_composite or use_f1_monitor or use_roc_auc_monitor
+        use_ppv_monitor = (
+            monitor_metric == "val_ppv"
+            and self.classification_mode == "binary"
+            and early_stopping_patience is not None
+            and val_loader is not None
+        )
+        total_pr = hpo_metric_ppv_weight + hpo_metric_recall_weight
+        if total_pr > 0:
+            w_ppv, w_recall = hpo_metric_ppv_weight / total_pr, hpo_metric_recall_weight / total_pr
+        else:
+            w_ppv, w_recall = 0.75, 0.25
+        use_ppv_recall_monitor = (
+            monitor_metric == "val_ppv_recall"
+            and self.classification_mode == "binary"
+            and early_stopping_patience is not None
+            and val_loader is not None
+        )
+        use_max_metric = use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor
 
         # Initialize early stopping if enabled
         early_stop = None
@@ -576,6 +619,16 @@ class ClassifierTrainer:
             elif use_roc_auc_monitor:
                 print(
                     f"Early stopping enabled (monitor=val_roc_auc): "
+                    f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
+                )
+            elif use_ppv_monitor:
+                print(
+                    f"Early stopping enabled (monitor=val_ppv): "
+                    f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
+                )
+            elif use_ppv_recall_monitor:
+                print(
+                    f"Early stopping enabled (monitor=val_ppv_recall, PPV weight={w_ppv:.2f}, recall weight={w_recall:.2f}): "
                     f"patience={early_stopping_patience}, min_delta={early_stopping_min_delta}"
                 )
             else:
@@ -610,7 +663,15 @@ class ClassifierTrainer:
                 print(f"  Val Loss: {val_metrics['loss']:.4f}")
                 if self.classification_mode == "binary":
                     print(f"  Val Accuracy: {val_metrics['accuracy']:.4f}")
-                    print(f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}, F1: {val_metrics['f1']:.4f}, ROC AUC: {val_metrics.get('roc_auc', 0.5):.4f}")
+                    p5 = val_metrics.get("precision_at_5")
+                    p20 = val_metrics.get("precision_at_20")
+                    p5_str = f"{p5:.4f}" if p5 is not None and not (isinstance(p5, float) and np.isnan(p5)) else "n/a"
+                    p20_str = f"{p20:.4f}" if p20 is not None and not (isinstance(p20, float) and np.isnan(p20)) else "n/a"
+                    print(
+                        f"  Val Precision: {val_metrics['precision']:.4f}, Recall: {val_metrics['recall']:.4f}, "
+                        f"F1: {val_metrics['f1']:.4f}, ROC AUC: {val_metrics.get('roc_auc', 0.5):.4f}, "
+                        f"P@5: {p5_str}, P@20: {p20_str}"
+                    )
                     if "rating_mse" in val_metrics:
                         rc_str = f"{val_metrics['rating_corr']:.4f}" if "rating_corr" in val_metrics and not np.isnan(val_metrics["rating_corr"]) else "nan"
                         print(f"  Val Rating MSE: {val_metrics['rating_mse']:.4f}, Corr(prob,1-5): {rc_str}")
@@ -646,6 +707,12 @@ class ClassifierTrainer:
                 monitored_value = val_metrics.get('f1')
             elif use_roc_auc_monitor and val_metrics:
                 monitored_value = val_metrics.get('roc_auc')
+            elif use_ppv_monitor and val_metrics:
+                monitored_value = val_metrics.get('precision')
+            elif use_ppv_recall_monitor and val_metrics:
+                prec = val_metrics.get('precision', 0.0) or 0.0
+                rec = val_metrics.get('recall', 0.0) or 0.0
+                monitored_value = w_ppv * prec + w_recall * rec
             else:
                 monitored_value = current_loss
 
@@ -658,7 +725,7 @@ class ClassifierTrainer:
             current_precision = val_metrics.get("precision", 0.0) if val_metrics and self.classification_mode == "binary" else 1.0
             recall_acceptable = current_recall >= MIN_RECALL_FOR_BEST and current_precision >= MIN_PRECISION_FOR_BEST
             composite_acceptable = (
-                (use_composite or use_f1_monitor or use_roc_auc_monitor)
+                (use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor)
                 and monitored_value is not None
                 and not (isinstance(monitored_value, float) and np.isnan(monitored_value))
                 and monitored_value > MIN_MAX_METRIC_THRESHOLD
@@ -680,6 +747,10 @@ class ClassifierTrainer:
                                 print(f"Best val_f1: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
                             elif use_roc_auc_monitor:
                                 print(f"Best val_roc_auc: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            elif use_ppv_monitor:
+                                print(f"Best val_ppv: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
+                            elif use_ppv_recall_monitor:
+                                print(f"Best val_ppv_recall: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
                             else:
                                 print(f"Best validation loss: {early_stop.get_best_score():.6f} at epoch {early_stop.get_best_epoch() + 1}")
                             break
@@ -687,14 +758,22 @@ class ClassifierTrainer:
             if save_best_only:
                 # Save best model: by composite when acceptable, else by loss (fallback when model is collapsed)
                 should_save = False
-                if (use_composite or use_f1_monitor or use_roc_auc_monitor) and composite_acceptable:
+                if (use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor) and composite_acceptable:
                     should_save = early_stop and early_stop.should_save_checkpoint()
-                elif not (use_composite or use_f1_monitor or use_roc_auc_monitor):
+                elif not (use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor):
                     should_save = (early_stop and early_stop.should_save_checkpoint()) or (not early_stop and current_loss < self.best_loss)
                 if should_save:
                     self.best_loss = current_loss
                     if val_metrics and "roc_auc" in val_metrics:
                         self.roc_auc_at_best_checkpoint = val_metrics["roc_auc"]
+                    if val_metrics and "precision_at_5" in val_metrics:
+                        p5 = val_metrics["precision_at_5"]
+                        if p5 is not None and not (isinstance(p5, float) and np.isnan(p5)):
+                            self.precision_at_5_at_best_checkpoint = p5
+                    if val_metrics and "precision_at_20" in val_metrics:
+                        p20 = val_metrics["precision_at_20"]
+                        if p20 is not None and not (isinstance(p20, float) and np.isnan(p20)):
+                            self.precision_at_20_at_best_checkpoint = p20
                     self.best_epoch_saved = epoch + 1
                     self.save_checkpoint(
                         checkpoint_dir / "classifier_best.pt",
@@ -711,11 +790,15 @@ class ClassifierTrainer:
                         print(f"  Saved best model (val_f1: {monitored_value:.4f})")
                     elif use_roc_auc_monitor:
                         print(f"  Saved best model (val_roc_auc: {monitored_value:.4f})")
+                    elif use_ppv_monitor:
+                        print(f"  Saved best model (val_ppv: {monitored_value:.4f})")
+                    elif use_ppv_recall_monitor:
+                        print(f"  Saved best model (val_ppv_recall: {monitored_value:.4f})")
                     else:
                         print(f"  Saved best model (loss: {current_loss:.4f})")
-                elif ((use_composite or use_f1_monitor or use_roc_auc_monitor) or not early_stop) and current_loss < self.best_loss:
+                elif ((use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor) or not early_stop) and current_loss < self.best_loss:
                     # Fallback: save by loss only if recall is acceptable (never save collapsed model as best)
-                    if (use_composite or use_f1_monitor or use_roc_auc_monitor) and not recall_acceptable:
+                    if (use_composite or use_f1_monitor or use_roc_auc_monitor or use_ppv_monitor or use_ppv_recall_monitor) and not recall_acceptable:
                         if current_recall < 0.02:
                             print(f"  Skipping save by loss (recall={current_recall:.2%} < 5%, avoid predict-all-negative)")
                         elif current_precision < MIN_PRECISION_FOR_BEST:
@@ -724,6 +807,14 @@ class ClassifierTrainer:
                         self.best_loss = current_loss
                         if val_metrics and "roc_auc" in val_metrics:
                             self.roc_auc_at_best_checkpoint = val_metrics["roc_auc"]
+                        if val_metrics and "precision_at_5" in val_metrics:
+                            p5 = val_metrics["precision_at_5"]
+                            if p5 is not None and not (isinstance(p5, float) and np.isnan(p5)):
+                                self.precision_at_5_at_best_checkpoint = p5
+                        if val_metrics and "precision_at_20" in val_metrics:
+                            p20 = val_metrics["precision_at_20"]
+                            if p20 is not None and not (isinstance(p20, float) and np.isnan(p20)):
+                                self.precision_at_20_at_best_checkpoint = p20
                         self.best_epoch_saved = epoch + 1
                         self.save_checkpoint(
                             checkpoint_dir / "classifier_best.pt",
@@ -740,6 +831,10 @@ class ClassifierTrainer:
                             print(f"  Saved best model by loss (val_f1 still below threshold, loss: {current_loss:.4f})")
                         elif use_roc_auc_monitor:
                             print(f"  Saved best model by loss (val_roc_auc still below threshold, loss: {current_loss:.4f})")
+                        elif use_ppv_monitor:
+                            print(f"  Saved best model by loss (val_ppv still below threshold, loss: {current_loss:.4f})")
+                        elif use_ppv_recall_monitor:
+                            print(f"  Saved best model by loss (val_ppv_recall still below threshold, loss: {current_loss:.4f})")
                         else:
                             print(f"  Saved best model (loss: {current_loss:.4f})")
             else:
@@ -761,6 +856,22 @@ class ClassifierTrainer:
             self.history["roc_auc"] = max(self.history["val_roc_auc"])
         else:
             self.history["roc_auc"] = None
+        if self.precision_at_5_at_best_checkpoint is not None:
+            self.history["val_precision_at_5_saved"] = self.precision_at_5_at_best_checkpoint
+        else:
+            p5_hist = [
+                x for x in self.history.get("val_precision_at_5", [])
+                if x is not None and not (isinstance(x, float) and np.isnan(x))
+            ]
+            self.history["val_precision_at_5_saved"] = max(p5_hist) if p5_hist else None
+        if self.precision_at_20_at_best_checkpoint is not None:
+            self.history["val_precision_at_20_saved"] = self.precision_at_20_at_best_checkpoint
+        else:
+            p20_hist = [
+                x for x in self.history.get("val_precision_at_20", [])
+                if x is not None and not (isinstance(x, float) and np.isnan(x))
+            ]
+            self.history["val_precision_at_20_saved"] = max(p20_hist) if p20_hist else None
         if self.best_epoch_saved is not None:
             self.history["best_epoch"] = self.best_epoch_saved
 
@@ -781,6 +892,16 @@ class ClassifierTrainer:
                     roc_auc_saved = max(self.history["val_roc_auc"])
                 if roc_auc_saved is not None:
                     self.tracker.log_metric('roc_auc', roc_auc_saved)
+                p5_saved = self.precision_at_5_at_best_checkpoint
+                if p5_saved is None and self.history.get("val_precision_at_5_saved") is not None:
+                    p5_saved = self.history["val_precision_at_5_saved"]
+                if p5_saved is not None:
+                    self.tracker.log_metric('val_precision_at_5', p5_saved)
+                p20_saved = self.precision_at_20_at_best_checkpoint
+                if p20_saved is None and self.history.get("val_precision_at_20_saved") is not None:
+                    p20_saved = self.history["val_precision_at_20_saved"]
+                if p20_saved is not None:
+                    self.tracker.log_metric('val_precision_at_20', p20_saved)
             else:
                 self.tracker.log_metric('val_mae', self.best_mae)
                 self.tracker.log_metric('val_correlation', self.best_correlation)
@@ -821,7 +942,14 @@ class ClassifierTrainer:
             "hidden_dims": getattr(self.classifier, "hidden_dims", None),
             "use_batch_norm": getattr(self.classifier, "use_batch_norm", False),
             "use_residual": getattr(self.classifier, "use_residual", False),
+            "classifier_type": type(self.classifier).__name__,
         }
+        if checkpoint["classifier_type"] == "AttentionRatingClassifier":
+            checkpoint["d_model"] = getattr(self.classifier, "d_model", 512)
+            checkpoint["num_heads"] = getattr(self.classifier, "num_heads", 4)
+            pos_embed = getattr(self.classifier, "pos_embed", None)
+            checkpoint["max_chunks"] = pos_embed.shape[1] if pos_embed is not None else 16
+            checkpoint["use_pos_encoding"] = getattr(self.classifier, "use_pos_encoding", True)
 
         if metrics:
             checkpoint["metrics"] = metrics
@@ -896,8 +1024,10 @@ class ClassifierTrainer:
                 if genre is not None:
                     genre = genre.to(self.device)
 
-                # Predict (all chunks per song: (B, C, D) -> average to one rating per song)
-                if embeddings.dim() == 3:
+                # Predict: (B, C, D) -> one rating per song (attention) or per-chunk then aggregate
+                if embeddings.dim() == 3 and getattr(self.classifier, "handles_chunk_sequence", False):
+                    preds = self.classifier(embeddings, genre)
+                elif embeddings.dim() == 3:
                     B, C, D = embeddings.shape
                     emb_flat = embeddings.view(B * C, D)
                     if genre is not None:
@@ -907,10 +1037,7 @@ class ClassifierTrainer:
                         pred_chunks = self.classifier(emb_flat)
                     preds = self._aggregate_chunk_predictions(pred_chunks, B, C)
                 else:
-                    if genre is not None:
-                        preds = self.classifier(embeddings, genre)
-                    else:
-                        preds = self.classifier(embeddings)
+                    preds = self.classifier(embeddings, genre) if genre is not None else self.classifier(embeddings)
 
                 # For binary mode, apply sigmoid to get probabilities
                 if self.classification_mode == "binary":
@@ -945,8 +1072,10 @@ class ClassifierTrainer:
                 if genre is not None:
                     genre = genre.to(self.device)
 
-                # Predict (support num_chunks per song, default 8)
-                if embeddings.dim() == 3:
+                # Predict: (B, C, D) -> one per song (attention) or per-chunk then aggregate
+                if embeddings.dim() == 3 and getattr(self.classifier, "handles_chunk_sequence", False):
+                    predictions = self.classifier(embeddings, genre)
+                elif embeddings.dim() == 3:
                     B, C, D = embeddings.shape
                     emb_flat = embeddings.view(B * C, D)
                     if genre is not None:
@@ -956,10 +1085,7 @@ class ClassifierTrainer:
                         pred_chunks = self.classifier(emb_flat)
                     predictions = self._aggregate_chunk_predictions(pred_chunks, B, C)
                 else:
-                    if genre is not None:
-                        predictions = self.classifier(embeddings, genre)
-                    else:
-                        predictions = self.classifier(embeddings)
+                    predictions = self.classifier(embeddings, genre) if genre is not None else self.classifier(embeddings)
 
                 # Compute loss
                 loss = self.loss_fn(predictions, ratings)

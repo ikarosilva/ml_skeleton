@@ -6,13 +6,18 @@ on held-out new ratings.
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 from typing import Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .baseline_classifier import LegacySimpleRatingClassifier, SimpleRatingClassifier
+from .baseline_classifier import (
+    AttentionRatingClassifier,
+    LegacySimpleRatingClassifier,
+    SimpleRatingClassifier,
+)
 from .dataset import EmbeddingDataset
 from .losses import BinaryRatingLoss, RatingLoss
 
@@ -21,7 +26,7 @@ def load_classifier_from_checkpoint(
     checkpoint_path: str,
     embedding_dim: int,
     device: str = "cuda"
-) -> tuple[SimpleRatingClassifier | LegacySimpleRatingClassifier, dict]:
+) -> tuple[SimpleRatingClassifier | LegacySimpleRatingClassifier | AttentionRatingClassifier, dict]:
     """Load classifier from checkpoint, inferring architecture.
 
     Supports current format (blocks/skips/output) and legacy format (mlp.*).
@@ -48,7 +53,7 @@ def load_classifier_from_checkpoint(
         if "blocks.0.0.weight" in state_dict:
             i = 0
             while f"blocks.{i}.0.weight" in state_dict:
-                hidden_dims.append(state_dict[f"blocks.{i}.0.weight"].shape[0])
+                hidden_dims.append(int(state_dict[f"blocks.{i}.0.weight"].shape[0]))
                 i += 1
         else:
             layer_idx = 0
@@ -56,15 +61,41 @@ def load_classifier_from_checkpoint(
                 weight = state_dict[f"mlp.{layer_idx}.weight"]
                 out_features = weight.shape[0]
                 if out_features > 1:
-                    hidden_dims.append(out_features)
+                    hidden_dims.append(int(out_features))
                 layer_idx += 3
+    else:
+        if isinstance(hidden_dims, str):
+            hidden_dims = ast.literal_eval(hidden_dims)
+        hidden_dims = list(hidden_dims)
 
-    # Legacy checkpoints use a single 'mlp' Sequential; current use 'blocks'/'skips'/'output'
+    # Attention checkpoints (chunk_proj, pos_embed, query) vs MLP (blocks/skips from embedding)
+    is_attention = (
+        checkpoint.get("classifier_type") == "AttentionRatingClassifier"
+        or "chunk_proj.weight" in state_dict
+    )
+
     if "mlp.0.weight" in state_dict:
         classifier = LegacySimpleRatingClassifier(
             embedding_dim=embedding_dim,
             hidden_dims=hidden_dims,
             use_genre=use_genre,
+        )
+    elif is_attention:
+        d_model = checkpoint.get("d_model", 512)
+        num_heads = checkpoint.get("num_heads", 4)
+        max_chunks = checkpoint.get("max_chunks", 16)
+        use_pos_encoding = checkpoint.get("use_pos_encoding", True)
+        classifier = AttentionRatingClassifier(
+            embedding_dim=embedding_dim,
+            hidden_dims=hidden_dims,
+            dropout=0.0,
+            use_genre=use_genre,
+            use_batch_norm=use_batch_norm,
+            use_residual=use_residual,
+            d_model=d_model,
+            num_heads=num_heads,
+            max_chunks=max_chunks,
+            use_pos_encoding=use_pos_encoding,
         )
     else:
         classifier = SimpleRatingClassifier(
@@ -141,9 +172,19 @@ def run_ab_test(
     new_classifier, new_ckpt = load_classifier_from_checkpoint(
         new_classifier_path, embedding_dim, device
     )
-    prod_classifier, prod_ckpt = load_classifier_from_checkpoint(
-        prod_classifier_path, embedding_dim, device
-    )
+    try:
+        prod_classifier, prod_ckpt = load_classifier_from_checkpoint(
+            prod_classifier_path, embedding_dim, device
+        )
+    except RuntimeError as e:
+        # Common case: production classifier was trained on a different embedding_dim
+        # (e.g. 2048) than the current pipeline (e.g. 4096). In that case, we skip
+        # the A/B test rather than failing the whole training run.
+        return {
+            "error": "Production classifier incompatible with current embeddings (skipping A/B test)",
+            "details": str(e),
+            "n_samples": len(test_dataset),
+        }
     new_use_genre = new_ckpt.get('use_genre', False)
     prod_use_genre = prod_ckpt.get('use_genre', False)
     chunk_agg_new = new_ckpt.get('chunk_aggregation', 'mean')
@@ -191,21 +232,29 @@ def run_ab_test(
 
             new_genre = genre_new if new_use_genre else None
             prod_genre = genre_prod if prod_use_genre else None
-            # All chunks per song: (B, C, D) -> predict per chunk, then aggregate (mean/max) to one rating per song
+            # Chunked (B, C, D): attention classifier uses (B,C,D)->(B,); MLP uses flatten then aggregate
+            new_handles_chunks = getattr(new_classifier, "handles_chunk_sequence", False)
+            prod_handles_chunks = getattr(prod_classifier, "handles_chunk_sequence", False)
             if emb_new.dim() == 3:
                 B, C, D = emb_new.shape
-                emb_new_flat = emb_new.view(B * C, D)
-                if new_genre is not None:
-                    new_genre = new_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, new_genre.size(-1))
-                new_out = aggregate(new_classifier(emb_new_flat, new_genre).view(B, C)).cpu().numpy()
+                if new_handles_chunks:
+                    new_out = new_classifier(emb_new, new_genre).cpu().numpy()
+                else:
+                    emb_new_flat = emb_new.view(B * C, D)
+                    if new_genre is not None:
+                        new_genre = new_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, new_genre.size(-1))
+                    new_out = aggregate(new_classifier(emb_new_flat, new_genre).view(B, C)).cpu().numpy()
             else:
                 new_out = new_classifier(emb_new, new_genre).cpu().numpy()
             if emb_prod.dim() == 3:
                 B, C, D = emb_prod.shape
-                emb_prod_flat = emb_prod.view(B * C, D)
-                if prod_genre is not None:
-                    prod_genre = prod_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, prod_genre.size(-1))
-                prod_out = aggregate_prod(prod_classifier(emb_prod_flat, prod_genre).view(B, C)).cpu().numpy()
+                if prod_handles_chunks:
+                    prod_out = prod_classifier(emb_prod, prod_genre).cpu().numpy()
+                else:
+                    emb_prod_flat = emb_prod.view(B * C, D)
+                    if prod_genre is not None:
+                        prod_genre = prod_genre.unsqueeze(1).expand(-1, C, -1).reshape(B * C, prod_genre.size(-1))
+                    prod_out = aggregate_prod(prod_classifier(emb_prod_flat, prod_genre).view(B, C)).cpu().numpy()
             else:
                 prod_out = prod_classifier(emb_prod, prod_genre).cpu().numpy()
 
